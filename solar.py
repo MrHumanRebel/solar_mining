@@ -239,12 +239,12 @@ def fetch_current_data(access_token):
     print("Current data fetched successfully.")
     return response.json()
 
-def store_data(data, filename='solarman_data.json'):
+def store_data(data, filename=SOLARMAN_FILE):
     with open(filename, 'w') as f:
         json.dump(data, f, indent=4)
     print(f"Data stored to {filename}")
 
-def load_data(filename='solarman_data.json'):
+def load_data(filename=SOLARMAN_FILE):
     if os.path.exists(filename):
         with open(filename, 'r') as f:
             return json.load(f)
