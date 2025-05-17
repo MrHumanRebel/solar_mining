@@ -19,6 +19,11 @@ RUN apt-get update && apt-get install -y \
     i2c-tools \
     iputils-ping \
     tzdata \
+    libgl1-mesa-dev \
+    libffi-dev \
+    libusb-1.0-0-dev \
+    python3-dev \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
