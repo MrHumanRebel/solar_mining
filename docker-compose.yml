@@ -33,5 +33,5 @@ services:
     dns:
       - 172.31.0.100
 networks:
-  backend:
+  pihole_backend:
     external: true
