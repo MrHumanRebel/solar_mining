@@ -1,0 +1,44 @@
+name: Build and Push Docker image to GHCR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
+          labels: |
+            maintainer=solar_mining
+            org.opencontainers.image.source=https://github.com/MrHumanRebel/solar_mining
+            org.opencontainers.image.documentation=https://github.com/MrHumanRebel/solar_mining
+            org.opencontainers.image.url=https://github.com/MrHumanRebel/solar_mining
+            org.opencontainers.image.vendor="Danci"
+            org.opencontainers.image.description="SolarMining"
+            org.opencontainers.image.licenses=AGPL-3.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
