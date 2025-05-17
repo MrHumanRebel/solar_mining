@@ -556,7 +556,9 @@ def main_loop():
             used_quote = 0
             save_quote_usage(used_quote)
 
-        sunrise_start = sunrise - timedelta(minutes=30)
+        sunrise_ts = sunrise.timestamp()
+        sunrise_ts = sunrise_ts - 1800 # 30 perc levonása másodpercben
+        sunrise_start = datetime.fromtimestamp(sunrise_ts)
         print(f"Sunrise start: {sunrise_start}:00 | Sunset stop: {sunset}:00")
         if (sunrise_start.hour, sunrise_start.minute) <= (now.hour, now.minute) <= (sunset.hour, sunset.minute):
             try:
