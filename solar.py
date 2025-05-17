@@ -64,6 +64,7 @@ last_update_id = None
 prev_state = None
 state = None
 uptime = None
+budapest_tz = ZoneInfo("Europe/Budapest")
 
 oled = None
 image = None
@@ -131,7 +132,7 @@ def write_to_display(state_text, soc, solar_power, weather_condition, temperatur
     oled.show()
 
 def sleep_until_next_5min(offset_seconds=60):
-    now = datetime.now()
+    now = datetime.now(tz=budapest_tz)
     seconds_since_hour = now.minute * 60 + now.second
     next_5_min = ((seconds_since_hour // 300) + 1) * 300
     target_seconds = next_5_min + offset_seconds
@@ -284,7 +285,6 @@ def get_current_weather(api_key, location_lat, location_lon):
     sunrise_ts = data['sys']['sunrise']
     sunset_ts = data['sys']['sunset']
 
-    budapest_tz = ZoneInfo("Europe/Budapest")
     sunrise_dt = datetime.fromtimestamp(sunrise_ts, tz=ZoneInfo("UTC")).astimezone(budapest_tz)
     sunset_dt = datetime.fromtimestamp(sunset_ts, tz=ZoneInfo("UTC")).astimezone(budapest_tz)
 
@@ -400,7 +400,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         print(f"Current production: {current_power}W")
         print(f"Internal Power: {internal_power}W")
 
-        now = datetime.now()
+        now = datetime.now(tz=budapest_tz)
         
         # Ping the miner to check that it is turned on
         if is_rpi and (now - uptime) > timedelta(minutes=3):
@@ -547,7 +547,7 @@ def main_loop():
     sunrise = sunrise - timedelta(minutes=30)
 
     while True:
-        now = datetime.now()       
+        now = datetime.now(tz=budapest_tz)       
         # Normalize sunrise/sunset
         if isinstance(sunrise, (int, float)):
             sunrise = datetime.fromtimestamp(sunrise)
