@@ -28,7 +28,8 @@ services:
       - "/dev/i2c-1:/dev/i2c-1"
     privileged: true
     networks:
-      - backend
+      backend:
+        ipv4_address: 172.31.0.101
     dns:
       - 172.31.0.100
 networks:
