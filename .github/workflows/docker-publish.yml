@@ -37,6 +37,7 @@ jobs:
           context: .
           push: true
           tags: ghcr.io/${{ steps.lowercase_repo.outputs.repo }}:latest
+          platforms: linux/arm64
           labels: |
             maintainer=solar_mining
             org.opencontainers.image.source=https://github.com/MrHumanRebel/solar_mining
