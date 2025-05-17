@@ -24,7 +24,7 @@ APP_SECRET = os.environ['MY_APP_SECRET']
 EMAIL = os.environ['MY_EMAIL']
 PASSWORD = os.environ['MY_PASSWORD']
 DEVICE_SN = os.environ['MY_DEVICE_SN']
-QUOTE_LIMIT = os.environ['MY_QUOTE_LIMIT']
+QUOTE_LIMIT = int(os.getenv('MY_QUOTE_LIMIT', '200000'))
 QUOTE_FILE = os.environ['MY_QUOTE_FILE']
 STATE_FILE = os.environ['MY_STATE_FILE']
 SOLARMAN_FILE = os.environ['MY_SOLARMAN_FILE']
@@ -583,6 +583,7 @@ def main_loop():
                 print(f"HTTP error occurred: {http_err}")
             except Exception as err:
                 print(f"An unexpected error occurred: {err}")
+            used_quote = int(used_quote)
             percentage = (used_quote / QUOTE_LIMIT) * 100
             print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)")
             sleep_until_next_5min(offset_seconds=60)
