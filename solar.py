@@ -12,6 +12,7 @@ import re
 import math
 import subprocess
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 
 BOT_TOKEN = os.environ['MY_BOT_TOKEN']
@@ -283,12 +284,12 @@ def get_current_weather(api_key, location_lat, location_lon):
     sunrise_ts = data['sys']['sunrise']
     sunset_ts = data['sys']['sunset']
 
-    sunrise_dt = datetime.fromtimestamp(sunrise_ts)
-    sunrise_dt = sunrise_dt - timedelta(minutes=5)
-    sunset_dt = datetime.fromtimestamp(sunset_ts)
+    budapest_tz = ZoneInfo("Europe/Budapest")
+    sunrise_dt = datetime.fromtimestamp(sunrise_ts, tz=ZoneInfo("UTC")).astimezone(budapest_tz)
+    sunset_dt = datetime.fromtimestamp(sunset_ts, tz=ZoneInfo("UTC")).astimezone(budapest_tz)
 
-    #sunrise_hour = math.floor(sunrise_dt.hour + sunrise_dt.minute / 60)
-    #sunset_hour = math.ceil(sunset_dt.hour + sunset_dt.minute / 60)
+    # Levonjuk a 30 percet a sunrise időből, figyelembe véve a Budapest időzónát is
+    sunrise_dt = sunrise_dt - timedelta(minutes=30)
 
     ################################################
     # FUTURE WEATHER
