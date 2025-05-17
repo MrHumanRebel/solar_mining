@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     libatlas-base-dev \
     i2c-tools \
     iputils-ping \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
