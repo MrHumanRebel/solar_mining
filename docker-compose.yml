@@ -30,7 +30,7 @@ services:
     networks:
       - backend
     dns:
-      - 192.168.0.197
+      - 172.31.0.100
 networks:
   backend:
     external: true
