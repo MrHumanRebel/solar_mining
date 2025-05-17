@@ -10,7 +10,6 @@ Ez a projekt egy napelemes rendszer állapotának figyelésére, adatgyűjtésé
 - 🔋 **Valós idejű napelem adatok lekérése** (`solar.py`, `solarman.ipynb`)
 - 📊 **Adatok tárolása és elemzése** (`solarman_data.json`, `state.json`, `quote_usage.json`)
 - 🐳 **Könnyű telepítés Docker Compose segítségével**
-- ⚙️ **Automatikus függőség-telepítés HiveOS környezethez** (`install_dep_hiveos.sh`)
 - 🔐 `.env` támogatás környezeti változókhoz
 
 ---
@@ -26,7 +25,6 @@ Ez a projekt egy napelemes rendszer állapotának figyelésére, adatgyűjtésé
 | `quote_usage.json`     | API használat naplózása |
 | `docker-compose.yml`   | Docker Compose konfiguráció |
 | `dockerfile`           | Egyedi Docker image build fájl |
-| `install_dep_hiveos.sh`| HiveOS környezetre szabott telepítő szkript |
 | `requirements.txt`     | Python csomagok listája |
 | `.env`                 | Környezeti változók definíciója |
 | `README.md`            | Dokumentáció |
