@@ -550,9 +550,10 @@ def main_loop():
         now = datetime.now(tz=budapest_tz)       
         # Normalize sunrise/sunset
         if isinstance(sunrise, (int, float)):
-            sunrise = datetime.fromtimestamp(sunrise)
+            sunrise = datetime.fromtimestamp(sunrise, tz=budapest_tz)
         if isinstance(sunset, (int, float)):
-            sunset = datetime.fromtimestamp(sunset)       
+            sunset = datetime.fromtimestamp(sunset, tz=budapest_tz)
+     
 
         if now.month == 1 and now.day == 1 and used_quote != 0:
             print("January 1st detected ? resetting quote usage to 0.")
