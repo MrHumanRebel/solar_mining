@@ -284,7 +284,7 @@ def get_current_weather(api_key, location_lat, location_lon):
     sunset_ts = data['sys']['sunset']
 
     sunrise_dt = datetime.fromtimestamp(sunrise_ts)
-    sunrise_dt = sunrise_dt - timedelta(minutes=30)
+    sunrise_dt = sunrise_dt - timedelta(minutes=5)
     sunset_dt = datetime.fromtimestamp(sunset_ts)
 
     #sunrise_hour = math.floor(sunrise_dt.hour + sunrise_dt.minute / 60)
