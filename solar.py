@@ -258,12 +258,18 @@ def load_prev_state():
             data = json.load(f)
             prev_state = data.get('prev_state', None)
             uptime_str = data.get('uptime', None)
-            uptime = datetime.fromisoformat(uptime_str) if uptime_str else None
+            if uptime_str:
+                uptime = datetime.fromisoformat(uptime_str)
+                # If naive, localize to Budapest timezone
+                if uptime.tzinfo is None:
+                    uptime = uptime.replace(tzinfo=budapest_tz)
+            else:
+                uptime = None
             return prev_state, uptime
     return None, None
 
 def save_prev_state(state, uptime):
-    # Convert uptime to string if it's a datetime object
+    # Convert uptime to ISO string (with tz info if aware)
     uptime_str = uptime.isoformat() if isinstance(uptime, datetime) else uptime
     with open(STATE_FILE, 'w') as f:
         json.dump({'prev_state': state, 'uptime': uptime_str}, f, indent=4)
