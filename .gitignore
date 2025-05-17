@@ -1,3 +1,6 @@
 # Environment files
 .env
 token.txt
+state.json
+solarman_data.json
+quote_usage.json
