@@ -16,8 +16,12 @@ services:
       - MY_PASSWORD=${MY_PASSWORD}
       - MY_DEVICE_SN=${MY_DEVICE_SN}
       - MY_QUOTE_LIMIT=${MY_QUOTE_LIMIT}
-      - MY_QUOTE_FILE=${MY_QUOTE_FILE}
-      - MY_STATE_FILE=${MY_STATE_FILE}
+      - MY_QUOTE_FILE=/app/quote_usage.json
+      - MY_STATE_FILE=/app/state.json
+    volumes:
+      - ./state.json:/app/state.json
+      - ./solarman_data.json:/app/solarman_data.json
+      - ./quote_usage.json:/app/quote_usage.json
     devices:
       - "/dev/gpiomem:/dev/gpiomem"
       - "/dev/i2c-1:/dev/i2c-1"

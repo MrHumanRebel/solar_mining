@@ -20,11 +20,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the application code
-COPY solar.py .
+# Only copy the app code
+COPY solar.py ./
 
-# Entry point
+# Entrypoint
 CMD ["python", "solar.py"]
