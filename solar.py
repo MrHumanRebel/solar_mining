@@ -494,7 +494,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 print("Trying to press power button.")
                 uptime = now
                 if is_rpi:
-                    press_power_button(16, 0.5)
+                    press_power_button(16, 0.55)
         elif (
             battery_charge <= 90
             or current_power <= 450
@@ -532,7 +532,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 print("Trying to press power button.")
                 uptime = now
                 if is_rpi:
-                    press_power_button(16, 0.5)
+                    press_power_button(16, 10)
         else:
             print("No change!")
 
@@ -601,7 +601,7 @@ def main_loop():
                 print("Miner did not shut down correctly, shutting down...")
                 print("Trying to press power button.")
                 if is_rpi:
-                    press_power_button(16, 0.5)
+                    press_power_button(16, 10)
                 if state != prev_state:
                     prev_state = state
                     uptime = now
