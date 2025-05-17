@@ -13,6 +13,7 @@ import math
 import subprocess
 from datetime import datetime, timedelta
 
+
 BOT_TOKEN = os.environ['MY_BOT_TOKEN']
 CHAT_ID = os.environ['MY_CHAT_ID']
 WEATHER_API = os.environ['MY_WEATHER_API']
@@ -27,6 +28,7 @@ QUOTE_LIMIT = os.environ['MY_QUOTE_LIMIT']
 QUOTE_FILE = os.environ['MY_QUOTE_FILE']
 STATE_FILE = os.environ['MY_STATE_FILE']
 SOLARMAN_FILE = os.environ['MY_SOLARMAN_FILE']
+
 
 print(platform.machine())
 print(platform.system())
