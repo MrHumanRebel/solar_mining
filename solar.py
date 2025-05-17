@@ -284,6 +284,7 @@ def get_current_weather(api_key, location_lat, location_lon):
     sunset_ts = data['sys']['sunset']
 
     sunrise_dt = datetime.fromtimestamp(sunrise_ts)
+    sunrise_dt = sunrise - timedelta(minutes=30)
     sunset_dt = datetime.fromtimestamp(sunset_ts)
 
     #sunrise_hour = math.floor(sunrise_dt.hour + sunrise_dt.minute / 60)
@@ -542,6 +543,7 @@ def main_loop():
     global prev_state, state, used_quote, sunrise, sunset, uptime
     used_quote = load_quote_usage()
     current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
+    sunrise = sunrise - timedelta(minutes=30)
 
     while True:
         now = datetime.now()       
@@ -556,11 +558,8 @@ def main_loop():
             used_quote = 0
             save_quote_usage(used_quote)
 
-        sunrise_ts = sunrise.timestamp()
-        sunrise_ts = sunrise_ts - 1800 # 30 perc levonása másodpercben
-        sunrise_start = datetime.fromtimestamp(sunrise_ts)
-        print(f"Sunrise start: {sunrise_start}:00 | Sunset stop: {sunset}:00")
-        if (sunrise_start.hour, sunrise_start.minute) <= (now.hour, now.minute) <= (sunset.hour, sunset.minute):
+        print(f"Sunrise start: {sunrise}:00 | Sunset stop: {sunset}:00")
+        if (sunrise.hour, sunrise.minute) <= (now.hour, now.minute) <= (sunset.hour, sunset.minute):
             try:
                 used_quote += 1
                 save_quote_usage(used_quote)
