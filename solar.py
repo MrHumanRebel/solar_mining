@@ -557,7 +557,7 @@ def main_loop():
             save_quote_usage(used_quote)
 
         sunrise_start = sunrise - timedelta(minutes=30)
-        print("Sunrise start: {sunrise_start}:00 | Sunset stop: {sunset}:00")
+        print(f"Sunrise start: {sunrise_start}:00 | Sunset stop: {sunset}:00")
         if (sunrise_start.hour, sunrise_start.minute) <= (now.hour, now.minute) <= (sunset.hour, sunset.minute):
             try:
                 used_quote += 1
