@@ -356,7 +356,7 @@ def check_uptime(now, prev_state):
                 print(f"No reply from {miner_ip}. Attempting restart sequence...")
                 press_power_button(16, 10)
                 time.sleep(15)
-                press_power_button(16, 0.5)
+                press_power_button(16, 0.55)
                 print("Restart sequence completed.")
                 uptime = now
                 save_prev_state(prev_state, uptime)
@@ -426,7 +426,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                     uptime = now
                     save_prev_state(prev_state, uptime)
                 if is_rpi:
-                    press_power_button(16, 0.5)
+                    press_power_button(16, 0.55)
         elif (
             # 1H Conditions
             (
@@ -535,7 +535,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 print("Trying to press power button.")
                 uptime = now
                 if is_rpi:
-                    press_power_button(16, 10)
+                    press_power_button(16, 0.55)
         else:
             print("No change!")
 
@@ -604,7 +604,7 @@ def main_loop():
                 print("Miner did not shut down correctly, shutting down...")
                 print("Trying to press power button.")
                 if is_rpi:
-                    press_power_button(16, 10)
+                    press_power_button(16, 0.55)
                 if state != prev_state:
                     prev_state = state
                     uptime = now
