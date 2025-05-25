@@ -1,9 +1,11 @@
 version: "3.9"
+
 services:
   solar:
     image: ghcr.io/mrhumanrebel/solar_mining:latest
     container_name: solar_monitor
     restart: unless-stopped
+    entrypoint: ["/app/wait-for-dns.sh", "python", "solar.py"]
     environment:
       - MY_BOT_TOKEN=${MY_BOT_TOKEN}
       - MY_CHAT_ID=${MY_CHAT_ID}
@@ -20,6 +22,7 @@ services:
       - MY_STATE_FILE=/app/state.json
       - MY_SOLARMAN_FILE=/app/solarman_data.json
     volumes:
+      - ./wait-for-dns.sh:/app/wait-for-dns.sh
       - ./state.json:/app/state.json
       - ./solarman_data.json:/app/solarman_data.json
       - ./quote_usage.json:/app/quote_usage.json
@@ -32,6 +35,7 @@ services:
         ipv4_address: 172.31.0.101
     dns:
       - 172.31.0.100
+
 networks:
   pihole_backend:
     external: true
