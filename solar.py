@@ -13,10 +13,6 @@ import math
 import subprocess
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import adafruit_dht
-import board
-
-
 
 BOT_TOKEN = os.environ['MY_BOT_TOKEN']
 CHAT_ID = os.environ['MY_CHAT_ID']
@@ -53,6 +49,11 @@ if is_rpi:
         from PIL import Image, ImageDraw, ImageFont
         import adafruit_ssd1306
         import RPi.GPIO as GPIO
+        import adafruit_dht
+        import board
+        import atexit
+        dht_sensor = adafruit_dht.DHT11(board.D26)
+        atexit.register(dht_sensor.exit)
         print("Raspberry Pi OLED dependencies loaded.")
     except ImportError as e:
         print(f"Failed to import Raspberry Pi-specific modules: {e}")
@@ -107,19 +108,13 @@ def get_cpu_usage():
 
 def read_dht11():
     try:
-        # Temporarily suppress stderr (libgpiod/adafruit_dht uses C-level warnings)
-        sys.stderr = open(os.devnull, 'w')
-        sensor = adafruit_dht.DHT11(board.D26)
-        humidity = sensor.humidity
-        temperature = sensor.temperature
-        sys.stderr = sys.__stderr__  # Restore original stderr
-
+        temperature = dht_sensor.temperature
+        humidity = dht_sensor.humidity
         if humidity is not None and temperature is not None:
             return {'temperature': temperature, 'humidity': humidity}
         else:
             return {'temperature': 0, 'humidity': 0}
-    except:
-        sys.stderr = sys.__stderr__  # Ensure it's restored on error too
+    except Exception:
         return {'temperature': 0, 'humidity': 0}
 
 def clean_value(value):
