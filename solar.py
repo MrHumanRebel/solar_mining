@@ -106,13 +106,16 @@ def get_cpu_usage():
     return f"{psutil.cpu_percent(interval=1)}%"
 
 def read_dht11():
-    sensor = adafruit_dht.DHT11(board.D26)
+    try:
+        sensor = adafruit_dht.DHT11(board.D26)
+        humidity = sensor.humidity
+        temperature = sensor.temperature
 
-    humidity, temperature = sensor.temperature, sensor.humidity
-
-    if humidity is not None and temperature is not None:
-        return {'temperature': temperature, 'humidity': humidity}
-    else:
+        if humidity is not None and temperature is not None:
+            return {'temperature': temperature, 'humidity': humidity}
+        else:
+            return {'temperature': 0, 'humidity': 0}
+    except:
         return {'temperature': 0, 'humidity': 0}
 
 def clean_value(value):
