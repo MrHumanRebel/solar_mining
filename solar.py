@@ -106,16 +106,16 @@ def get_ram_usage():
 def get_cpu_usage():
     return f"{psutil.cpu_percent(interval=1)}%"
 
-def read_dht11():
+def read_dht11(prev_temperature, prev_humidity):
     try:
         temperature = dht_sensor.temperature
         humidity = dht_sensor.humidity
         if humidity is not None and temperature is not None:
             return {'temperature': temperature, 'humidity': humidity}
         else:
-            return {'temperature': 0, 'humidity': 0}
+            return {'temperature': prev_temperature, 'humidity': prev_humidity}
     except Exception:
-        return {'temperature': 0, 'humidity': 0}
+        return {'temperature': prev_temperature, 'humidity': prev_humidity}
 
 def clean_value(value):
     # Ensure the value is a string before applying re.sub
@@ -572,21 +572,23 @@ def main_loop():
     used_quote = load_quote_usage()
     current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
     prev_garage_temp = None
+    prev_garage_hum = None
 
     while True:
         now = datetime.now(tz=budapest_tz)    
-        garage_data = read_dht11()
+        garage_data = read_dht11(prev_garage_temp, prev_garage_hum)
         garage_temp = garage_data['temperature']
         garage_hum = garage_data['humidity']
 
-        if prev_garage_temp is not None:
-            if abs(garage_temp - prev_garage_temp) >= 5:
+        if prev_garage_temp is not None and garage_temp != prev_garage_temp:
+            if (abs(garage_temp - prev_garage_temp) >= 5):
                 if garage_temp > prev_garage_temp:
                     send_telegram_message(f"Garage temperature risen to: {garage_temp}C")
                 else:
                     send_telegram_message(f"Garage temperature fallen to: {garage_temp}C")
 
         prev_garage_temp = garage_temp
+        prev_garage_hum = garage_hum
 
         if now.month == 1 and now.day == 1 and used_quote != 0:
             print("January 1st detected ? resetting quote usage to 0.")
