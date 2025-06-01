@@ -610,8 +610,8 @@ def main_loop():
             used_quote = int(used_quote)
             percentage = (used_quote / QUOTE_LIMIT) * 100
             print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)")
-            print(f"Garage temperature:{garage_temp}C")
-            print(f"Garage humidity:{garage_hum}%")
+            print(f"Garage temperature: {garage_temp}C")
+            print(f"Garage humidity: {garage_hum}%")
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
@@ -636,8 +636,8 @@ def main_loop():
                         temperature=0,
                         humidity=0
                 )
-            print(f"Garage temperature:{garage_temp}C")
-            print(f"Garage humidity:{garage_hum}%")
+            print(f"Garage temperature: {garage_temp}C")
+            print(f"Garage humidity: {garage_hum}%")
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
 
