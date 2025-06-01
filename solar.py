@@ -572,7 +572,9 @@ def main_loop():
 
     while True:
         now = datetime.now(tz=budapest_tz)    
-        garage_temp, garage_hum = read_dht11()   
+        garage_data = read_dht11()
+        garage_temp = garage_data['temperature']
+        garage_hum = garage_data['humidity']
 
         if now.month == 1 and now.day == 1 and used_quote != 0:
             print("January 1st detected ? resetting quote usage to 0.")
