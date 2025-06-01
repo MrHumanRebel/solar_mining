@@ -13,7 +13,9 @@ import math
 import subprocess
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import Adafruit_DHT
+import adafruit_dht
+import board
+
 
 
 BOT_TOKEN = os.environ['MY_BOT_TOKEN']
@@ -104,10 +106,9 @@ def get_cpu_usage():
     return f"{psutil.cpu_percent(interval=1)}%"
 
 def read_dht11():
-    sensor = Adafruit_DHT.DHT11
-    gpio_pin = 26
+    sensor = adafruit_dht.DHT11(board.D26)
 
-    humidity, temperature = Adafruit_DHT.read_retry(sensor, gpio_pin)
+    humidity, temperature = sensor.temperature, sensor.humidity
 
     if humidity is not None and temperature is not None:
         return {'temperature': temperature, 'humidity': humidity}
