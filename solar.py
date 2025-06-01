@@ -594,7 +594,7 @@ def main_loop():
                 send_telegram_message(f"Warning! The average garage humidity is too high: {mean_hum:.1f}")
             if abs(garage_temp - mean_temp) > 5:
                 direction = "risen" if garage_temp > mean_temp else "fallen"
-                send_telegram_message(f"Garage temperature has {direction} to: {garage_temp}°C (mean was {mean_temp:.1f}C)")
+                send_telegram_message(f"Garage temperature has {direction} to: {garage_temp}C (mean was {mean_temp:.1f}C)")
 
         garage_temp_history.append(garage_temp)
         garage_hum_history.append(garage_hum)
