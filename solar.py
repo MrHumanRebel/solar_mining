@@ -581,7 +581,7 @@ def main_loop():
         garage_hum = garage_data['humidity']
 
         if prev_garage_temp is not None and garage_temp != prev_garage_temp:
-            if (abs(garage_temp - prev_garage_temp) >= 5):
+            if (abs(garage_temp - prev_garage_temp) >= 3):
                 if garage_temp > prev_garage_temp:
                     send_telegram_message(f"Garage temperature risen to: {garage_temp}C")
                 else:
