@@ -13,6 +13,7 @@ import math
 import subprocess
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import Adafruit_DHT
 
 
 BOT_TOKEN = os.environ['MY_BOT_TOKEN']
@@ -101,6 +102,17 @@ def get_ram_usage():
 
 def get_cpu_usage():
     return f"{psutil.cpu_percent(interval=1)}%"
+
+def read_dht11():
+    sensor = Adafruit_DHT.DHT11
+    gpio_pin = 26
+
+    humidity, temperature = Adafruit_DHT.read_retry(sensor, gpio_pin)
+
+    if humidity is not None and temperature is not None:
+        return {'temperature': temperature, 'humidity': humidity}
+    else:
+        return {'temperature': 0, 'humidity': 0}
 
 def clean_value(value):
     # Ensure the value is a string before applying re.sub
@@ -558,7 +570,8 @@ def main_loop():
     current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
     while True:
-        now = datetime.now(tz=budapest_tz)       
+        now = datetime.now(tz=budapest_tz)    
+        garage_temp, garage_hum = read_dht11()   
 
         if now.month == 1 and now.day == 1 and used_quote != 0:
             print("January 1st detected ? resetting quote usage to 0.")
@@ -594,6 +607,8 @@ def main_loop():
             used_quote = int(used_quote)
             percentage = (used_quote / QUOTE_LIMIT) * 100
             print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)")
+            print(f"Garage temperature:{garage_temp}C")
+            print(f"Garage humidity:{garage_hum}%")
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
@@ -618,6 +633,8 @@ def main_loop():
                         temperature=0,
                         humidity=0
                 )
+            print(f"Garage temperature:{garage_temp}C")
+            print(f"Garage humidity:{garage_hum}%")
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
 
