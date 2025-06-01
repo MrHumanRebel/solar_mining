@@ -29,13 +29,7 @@ RUN apt-get update && apt-get install -y \
 # Install Python dependencies
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Adafruit_DHT manually with --force-pi
-RUN git clone https://github.com/adafruit/Adafruit_Python_DHT.git && \
-    cd Adafruit_Python_DHT && \
-    python setup.py install --force-pi && \
-    cd .. && rm -rf Adafruit_Python_DHT
-    
+   
 # Copy the app code
 COPY solar.py ./
 
