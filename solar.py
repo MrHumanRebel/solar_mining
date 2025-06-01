@@ -571,12 +571,22 @@ def main_loop():
     global prev_state, state, used_quote, sunrise, sunset, uptime
     used_quote = load_quote_usage()
     current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
+    prev_garage_temp = None
 
     while True:
         now = datetime.now(tz=budapest_tz)    
         garage_data = read_dht11()
         garage_temp = garage_data['temperature']
         garage_hum = garage_data['humidity']
+
+        if prev_garage_temp is not None:
+            if abs(garage_temp - prev_garage_temp) >= 5:
+                if garage_temp > prev_garage_temp:
+                    send_telegram_message(f"Garage temperature risen to: {garage_temp}C")
+                else:
+                    send_telegram_message(f"Garage temperature fallen to: {garage_temp}C")
+
+        prev_garage_temp = garage_temp
 
         if now.month == 1 and now.day == 1 and used_quote != 0:
             print("January 1st detected ? resetting quote usage to 0.")
