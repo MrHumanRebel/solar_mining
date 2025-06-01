@@ -5,4 +5,3 @@ adafruit-circuitpython-ssd1306
 adafruit-circuitpython-busdevice
 RPi.GPIO
 Adafruit-Blinka
-Adafruit_DHT
