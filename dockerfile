@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
     libusb-1.0-0-dev \
     python3-dev \
     libc6-dev \
+    libgpiod2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
