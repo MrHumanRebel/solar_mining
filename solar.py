@@ -13,6 +13,8 @@ import math
 import subprocess
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from collections import deque
+import statistics
 
 BOT_TOKEN = os.environ['MY_BOT_TOKEN']
 CHAT_ID = os.environ['MY_CHAT_ID']
@@ -571,6 +573,8 @@ def main_loop():
     global prev_state, state, used_quote, sunrise, sunset, uptime
     used_quote = load_quote_usage()
     current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
+
+    garage_temp_history = deque(maxlen=12)
     prev_garage_temp = None
     prev_garage_hum = None
 
@@ -580,13 +584,13 @@ def main_loop():
         garage_temp = garage_data['temperature']
         garage_hum = garage_data['humidity']
 
-        if prev_garage_temp is not None and garage_temp != prev_garage_temp:
-            if (abs(garage_temp - prev_garage_temp) >= 3):
-                if garage_temp > prev_garage_temp:
-                    send_telegram_message(f"Garage temperature risen to: {garage_temp}C")
-                else:
-                    send_telegram_message(f"Garage temperature fallen to: {garage_temp}C")
+        if len(garage_temp_history) == 12:
+            mean_temp = statistics.mean(garage_temp_history)
+            if abs(garage_temp - mean_temp) > 5:
+                direction = "risen" if garage_temp > mean_temp else "fallen"
+                send_telegram_message(f"Garage temperature has {direction} to: {garage_temp}°C (mean was {mean_temp:.1f}°C)")
 
+        garage_temp_history.append(garage_temp)
         prev_garage_temp = garage_temp
         prev_garage_hum = garage_hum
 
