@@ -107,15 +107,19 @@ def get_cpu_usage():
 
 def read_dht11():
     try:
+        # Temporarily suppress stderr (libgpiod/adafruit_dht uses C-level warnings)
+        sys.stderr = open(os.devnull, 'w')
         sensor = adafruit_dht.DHT11(board.D26)
         humidity = sensor.humidity
         temperature = sensor.temperature
+        sys.stderr = sys.__stderr__  # Restore original stderr
 
         if humidity is not None and temperature is not None:
             return {'temperature': temperature, 'humidity': humidity}
         else:
             return {'temperature': 0, 'humidity': 0}
     except:
+        sys.stderr = sys.__stderr__  # Ensure it's restored on error too
         return {'temperature': 0, 'humidity': 0}
 
 def clean_value(value):
