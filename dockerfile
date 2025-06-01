@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
     libusb-1.0-0-dev \
     python3-dev \
     libc6-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -35,7 +36,7 @@ RUN git clone https://github.com/adafruit/Adafruit_Python_DHT.git && \
     cd Adafruit_Python_DHT && \
     python setup.py install --force-pi && \
     cd .. && rm -rf Adafruit_Python_DHT
-    
+
 # Copy the app code
 COPY solar.py ./
 
