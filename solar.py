@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
 import statistics
+from pytz import timezone
 
 BOT_TOKEN = os.environ['MY_BOT_TOKEN']
 CHAT_ID = os.environ['MY_CHAT_ID']

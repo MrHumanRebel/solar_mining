@@ -6,3 +6,4 @@ adafruit-circuitpython-busdevice
 RPi.GPIO
 Adafruit-Blinka
 adafruit-circuitpython-dht
+pytz
