@@ -160,9 +160,20 @@ def sleep_until_next_5min(offset_seconds=60):
     print(f"Sleeping for {sleep_seconds} seconds...")
     time.sleep(sleep_seconds)
 
-def send_telegram_message(message, max_retries=3):
+def send_telegram_message(message, max_retries=3, keyboard=True):
     url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
     payload = {'chat_id': CHAT_ID, 'text': message}
+
+    if keyboard:
+        payload['reply_markup'] = json.dumps({
+            "keyboard": [
+                ["/now"],
+                ["/start", "/stop"],
+                ["/force_stop"]
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": False
+        })
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -177,7 +188,7 @@ def send_telegram_message(message, max_retries=3):
             else:
                 print("All retry attempts failed.")
 
-def handle_telegram_messages():
+def handle_telegram_messages(battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum):
     global last_update_id
     try:
         url = f'https://api.telegram.org/bot{BOT_TOKEN}/getUpdates'
@@ -191,23 +202,35 @@ def handle_telegram_messages():
         for update in data.get('result', []):
             last_update_id = update['update_id']  # Update the last processed update ID
             if 'message' in update and 'text' in update['message']:
-                process_message(update['message']['text'], data)
+                process_message(update['message']['text'], battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum)
     except requests.exceptions.RequestException as e:
         print("Error while handling Telegram messages:", e)
 
-def process_message(message_text, data):
-    if message_text == "/stats":
-        if data:
-            # Search for BMS_SOC in the dataList
-            soc = next((item['value'] for item in data['dataList'] if item['name'] == 'BMS_SOC'), None)
-            # If BMS_SOC is not found, handle the case gracefully
-            if soc is None:
-                soc = "N/A"  # or another fallback value
-            # Extracting the solar power as an example
-            solar_power = next((item['value'] for item in data['dataList'] if item['name'] == 'Total Solar Power'), None)
-            if solar_power is None:
-                solar_power = "N/A"  # or another fallback value
-            message = f" Battery: {soc}%\n Solar: {solar_power}W"
+def process_message(message_text, battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum):
+    if message_text == "/now":
+        message = (
+            f"Battery: {battery}%\n"
+            f"Power: {power}W\n"
+            f"State: {state}\n"
+            f"Condition: {current_condition}\n"
+            f"Temperature: {temperature}°C\n"
+            f"Humidity: {humidity}%\n"
+            f"Sunrise: {sunrise.strftime('%H:%M')}\n"
+            f"Sunset: {sunset.strftime('%H:%M')}\n"
+            f"Clouds: {clouds}%\n"
+            f"Garage Temp: {garage_temp}°C\n"
+            f"Garage Humidity: {garage_hum}%"
+        )
+        send_telegram_message(message)
+    if message_text == "/start":
+        press_power_button(16, 0.55)
+        send_telegram_message("Crypto production started! Pressed power button.")
+    if message_text == "/stop":
+        press_power_button(16, 0.55)
+        send_telegram_message("Crypto production stopped! Pressed power button.")
+    if message_text == "/force_stop":
+        press_power_button(16, 10)
+        send_telegram_message("Crypto production force stopped! Pressed power button for 10 seconds.")
 
 def load_quote_usage():
     if os.path.exists(QUOTE_FILE):
@@ -632,6 +655,7 @@ def main_loop():
             print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)")
             print(f"Garage temperature: {garage_temp}C")
             print(f"Garage humidity: {garage_hum}%")
+            handle_telegram_messages(battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum)
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
