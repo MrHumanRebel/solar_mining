@@ -112,28 +112,13 @@ def get_cpu_usage():
 
 def get_temperatures():
     temps = {}
-    
-    # 1. CPU temp via vcgencmd (Raspberry Pi-specific)
     try:
         cpu_temp = os.popen("vcgencmd measure_temp").readline().strip()
         if cpu_temp.startswith("temp="):
-            temps["CPU"] = cpu_temp.replace("temp=", "")
+            # Extract only the numeric part with °C
+            temps["CPU"] = cpu_temp.replace("temp=", "").replace("'C", "C")
     except Exception:
         pass
-
-    # 2. Other thermal zones (system files)
-    thermal_zones = glob.glob('/sys/class/thermal/thermal_zone*/temp')
-    for zone in thermal_zones:
-        try:
-            zone_name_file = zone.replace("/temp", "/type")
-            with open(zone_name_file, 'r') as f:
-                name = f.read().strip()
-            with open(zone, 'r') as f:
-                raw_temp = int(f.read().strip())
-                temps[name] = f"{raw_temp / 1000:.1f}C"
-        except Exception:
-            continue
-
     return temps
 
 def read_dht11(prev_temperature, prev_humidity):
@@ -254,7 +239,7 @@ def process_message(message_text, battery, power, state, current_condition, temp
             f"\nIP: {ip}\n"
             f"RAM Usage: {ram}\n"
             f"CPU Usage: {cpu}\n"
-            f"Temperatures: {', '.join([f'{name}: {temp}' for name, temp in temps.items()])}\n"
+            f"CPU Temp: {temps.get('CPU', 'N/A')}\n"
         )
         send_telegram_message(message)
     if message_text == "/start":
