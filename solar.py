@@ -6,6 +6,7 @@ from datetime import datetime
 import os
 import psutil
 import socket
+import glob
 import platform
 import sys
 import re
@@ -109,6 +110,32 @@ def get_ram_usage():
 def get_cpu_usage():
     return f"{psutil.cpu_percent(interval=1)}%"
 
+def get_temperatures():
+    temps = {}
+    
+    # 1. CPU temp via vcgencmd (Raspberry Pi-specific)
+    try:
+        cpu_temp = os.popen("vcgencmd measure_temp").readline().strip()
+        if cpu_temp.startswith("temp="):
+            temps["CPU"] = cpu_temp.replace("temp=", "")
+    except Exception:
+        pass
+
+    # 2. Other thermal zones (system files)
+    thermal_zones = glob.glob('/sys/class/thermal/thermal_zone*/temp')
+    for zone in thermal_zones:
+        try:
+            zone_name_file = zone.replace("/temp", "/type")
+            with open(zone_name_file, 'r') as f:
+                name = f.read().strip()
+            with open(zone, 'r') as f:
+                raw_temp = int(f.read().strip())
+                temps[name] = f"{raw_temp / 1000:.1f}°C"
+        except Exception:
+            continue
+
+    return temps
+
 def read_dht11(prev_temperature, prev_humidity):
     try:
         temperature = dht_sensor.temperature
@@ -208,6 +235,10 @@ def handle_telegram_messages(battery, power, state, current_condition, temperatu
 
 def process_message(message_text, battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum):
     if message_text == "/now":
+        ip = get_ip_address()
+        ram = get_ram_usage()
+        cpu = get_cpu_usage()
+        temps = get_temperatures()
         message = (
             f"Battery: {battery}%\n"
             f"Power: {power}W\n"
@@ -220,6 +251,10 @@ def process_message(message_text, battery, power, state, current_condition, temp
             f"Clouds: {clouds}%\n"
             f"Garage Temp: {garage_temp}C\n"
             f"Garage Humidity: {garage_hum}%"
+            f"\nIP: {ip}\n"
+            f"RAM Usage: {ram}\n"
+            f"CPU Usage: {cpu}\n"
+            f"Temperatures: {', '.join([f'{name}: {temp}' for name, temp in temps.items()])}\n"
         )
         send_telegram_message(message)
     if message_text == "/start":
