@@ -113,12 +113,31 @@ def get_cpu_usage():
 def get_temperatures():
     temps = {}
     try:
+        # Try vcgencmd first
         cpu_temp = os.popen("vcgencmd measure_temp").readline().strip()
         if cpu_temp.startswith("temp="):
-            # Extract only the numeric part with °C
-            temps["CPU"] = cpu_temp.replace("temp=", "").replace("'C", "C")
+            temps["CPU"] = cpu_temp.replace("temp=", "")
+            return temps
     except Exception:
         pass
+
+    # Fallback: read from thermal zones
+    try:
+        for path in glob.glob('/sys/class/thermal/thermal_zone*/temp'):
+            try:
+                with open(path, 'r') as f:
+                    temp_milli = int(f.read().strip())
+                    temp_c = temp_milli / 1000
+                # Try to get type of thermal zone
+                type_path = path.replace('temp', 'type')
+                with open(type_path, 'r') as f:
+                    name = f.read().strip()
+                temps[name] = f"{temp_c:.1f}C"
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     return temps
 
 def read_dht11(prev_temperature, prev_humidity):
@@ -239,7 +258,7 @@ def process_message(message_text, battery, power, state, current_condition, temp
             f"\nIP: {ip}\n"
             f"RAM Usage: {ram}\n"
             f"CPU Usage: {cpu}\n"
-            f"CPU Temp: {temps.get('CPU', 'N/A')}\n"
+            f"CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or "N/A"}\n"
         )
         send_telegram_message(message)
     if message_text == "/start":
