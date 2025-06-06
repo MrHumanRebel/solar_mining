@@ -258,7 +258,7 @@ def process_message(message_text, battery, power, state, current_condition, temp
             f"\nIP: {ip}\n"
             f"RAM Usage: {ram}\n"
             f"CPU Usage: {cpu}\n"
-            f"CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or "N/A"}\n"
+            f"CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
         )
         send_telegram_message(message)
     if message_text == "/start":
