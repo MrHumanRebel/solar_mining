@@ -130,7 +130,7 @@ def get_temperatures():
                 name = f.read().strip()
             with open(zone, 'r') as f:
                 raw_temp = int(f.read().strip())
-                temps[name] = f"{raw_temp / 1000:.1f}°C"
+                temps[name] = f"{raw_temp / 1000:.1f}C"
         except Exception:
             continue
 
