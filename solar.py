@@ -213,12 +213,12 @@ def process_message(message_text, battery, power, state, current_condition, temp
             f"Power: {power}W\n"
             f"State: {state}\n"
             f"Condition: {current_condition}\n"
-            f"Temperature: {temperature}°C\n"
+            f"Temperature: {temperature}C\n"
             f"Humidity: {humidity}%\n"
             f"Sunrise: {sunrise.strftime('%H:%M')}\n"
             f"Sunset: {sunset.strftime('%H:%M')}\n"
             f"Clouds: {clouds}%\n"
-            f"Garage Temp: {garage_temp}°C\n"
+            f"Garage Temp: {garage_temp}C\n"
             f"Garage Humidity: {garage_hum}%"
         )
         send_telegram_message(message)
