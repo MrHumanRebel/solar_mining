@@ -574,7 +574,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                     press_power_button(16, 0.55)
         elif (
             (battery_charge <= 90)
-            or (current_power <= 450)
+            or (current_power <= 100)
             or (
                 any(keyword in current_condition for keyword in [
                     'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
