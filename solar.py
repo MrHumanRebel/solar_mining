@@ -562,7 +562,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 and now.hour < 13
             ) or (
                 battery_charge > 90
-                and current_power > 150
+                and current_power > 50
             )
         ):
             print("Crypto production ready!")
