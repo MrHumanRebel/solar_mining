@@ -681,8 +681,8 @@ def main_loop():
                         soc=battery,
                         solar_power=power,
                         weather_condition=current_condition,
-                        temperature=temperature,
-                        humidity=humidity
+                        temperature=garage_temp,
+                        humidity=garage_hum
                     )
                 print("Cycle complete. Waiting for next interval.")
             except requests.HTTPError as http_err:
@@ -716,8 +716,8 @@ def main_loop():
                         soc=0,
                         solar_power=0,
                         weather_condition = f"Sunrise: {sunrise.strftime('%H:%M')}",
-                        temperature=0,
-                        humidity=0
+                        temperature=garage_temp,
+                        humidity=garage_hum
                 )
             print(f"Garage temperature: {garage_temp}C")
             print(f"Garage humidity: {garage_hum}%")
