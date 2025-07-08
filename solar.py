@@ -579,7 +579,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 any(keyword in current_condition for keyword in [
                     'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
                     'sleet', 'blizzard', 'dust', 'sand', 'ash',
-                    'tornado', 'hurricane', 'lightning'
+                    'tornado', 'hurricane', 'lightning', 'moderate rain', 'heavy intensity rain'
                 ])
                 and battery_charge <= 95
                 and current_power <= 1000
@@ -588,7 +588,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 any(keyword in forecast_1h_condition for keyword in [
                     'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
                     'sleet', 'blizzard', 'dust', 'sand', 'ash',
-                    'tornado', 'hurricane', 'lightning'
+                    'tornado', 'hurricane', 'lightning', 'moderate rain', 'heavy intensity rain'
                 ])
                 and battery_charge <= 95
                 and current_power <= 1000
@@ -597,7 +597,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 any(keyword in forecast_3h_condition for keyword in [
                     'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
                     'sleet', 'blizzard', 'dust', 'sand', 'ash',
-                    'tornado', 'hurricane', 'lightning'
+                    'tornado', 'hurricane', 'lightning', 'moderate rain', 'heavy intensity rain'
                 ])
                 and battery_charge <= 95
                 and current_power <= 1000
