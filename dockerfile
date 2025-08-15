@@ -1,4 +1,4 @@
-FROM python:slim
+FROM python:3.11-slim-bullseye
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     libfreetype6-dev \
     libtiff5-dev \
     libopenjp2-7 \
+    libatlas-base-dev \
     i2c-tools \
     iputils-ping \
     tzdata \
@@ -23,7 +24,7 @@ RUN apt-get update && apt-get install -y \
     libusb-1.0-0-dev \
     python3-dev \
     libc6-dev \
-    libgpiod-dev \
+    libgpiod2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
