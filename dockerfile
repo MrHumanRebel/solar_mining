@@ -15,7 +15,6 @@ RUN apt-get update && apt-get install -y \
     libfreetype6-dev \
     libtiff5-dev \
     libopenjp2-7 \
-    libatlas-dev \
     i2c-tools \
     iputils-ping \
     tzdata \
