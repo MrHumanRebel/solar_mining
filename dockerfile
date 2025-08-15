@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
     libfreetype6-dev \
     libtiff5-dev \
     libopenjp2-7 \
-    libatlas-base-dev \
+    libatlas-dev \
     i2c-tools \
     iputils-ping \
     tzdata \
@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y \
     libusb-1.0-0-dev \
     python3-dev \
     libc6-dev \
-    libgpiod2 \
+    libgpiod-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
