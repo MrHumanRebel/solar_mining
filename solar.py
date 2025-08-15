@@ -507,7 +507,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
                 and any(keyword in forecast_1h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
                 and current_power > 0 
-                and battery_charge >= 40
+                and battery_charge >= 35
                 and now.hour < 12
             ) or (
                 any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
@@ -528,7 +528,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
                 and any(keyword in forecast_3h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
                 and current_power > 0 
-                and battery_charge >= 40
+                and battery_charge >= 35
                 and now.hour < 12
             ) or (
                 any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
