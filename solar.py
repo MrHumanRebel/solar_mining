@@ -484,7 +484,18 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         print(f"Internal Power: {internal_power}W")
 
         now = datetime.now(tz=budapest_tz)
-        
+
+        solar_keywords = [
+                    'sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds',
+                    'partly cloudy', 'mostly sunny', 'sunshine', 'sunrise', 'sunset'
+        ]
+
+        non_solar_keywords = [
+                    'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
+                    'sleet', 'blizzard', 'dust', 'sand', 'ash', 'drizzle', 'sleet', 'shower', 'mist', 'fog', 'haze', 'smoke',
+                    'tornado', 'hurricane', 'squall','lightning', 'moderate rain', 'heavy intensity rain', 'overcast'
+        ]
+
         # Ping the miner to check that it is turned on
         if is_rpi and (now - uptime) > timedelta(minutes=3):
             check_uptime(now, prev_state)
@@ -504,62 +515,62 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         elif (
             # 1H Conditions
             (
-                any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and any(keyword in forecast_1h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
+                any(keyword in current_condition for keyword in solar_keywords)
+                and any(keyword in forecast_1h_condition for keyword in solar_keywords)
                 and current_power > 0 
                 and battery_charge >= 35
-                and now.hour < 12
+                and now.hour < 13
             ) or (
-                any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and any(keyword in forecast_1h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
+                any(keyword in current_condition for keyword in solar_keywords)
+                and any(keyword in forecast_1h_condition for keyword in solar_keywords)
                 and battery_charge >= 65
+                and now.hour < 13
+            ) or (
+                any(keyword in current_condition for keyword in solar_keywords)
+                and any(keyword in forecast_1h_condition for keyword in solar_keywords)
+                and battery_charge >= 55
                 and now.hour < 12
             ) or (
-                any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and any(keyword in forecast_1h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and battery_charge >= 55
-                and now.hour < 11
-            ) or (
-                any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and any(keyword in forecast_1h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
+                any(keyword in current_condition for keyword in solar_keywords)
+                and any(keyword in forecast_1h_condition for keyword in solar_keywords)
                 and battery_charge >= 45
-                and now.hour < 10
+                and now.hour < 11
             ) or (  # 3H Conditions
-                any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and any(keyword in forecast_3h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
+                any(keyword in current_condition for keyword in solar_keywords)
+                and any(keyword in forecast_3h_condition for keyword in solar_keywords)
                 and current_power > 0 
                 and battery_charge >= 35
-                and now.hour < 12
+                and now.hour < 13
             ) or (
-                any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and any(keyword in forecast_3h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
+                any(keyword in current_condition for keyword in solar_keywords)
+                and any(keyword in forecast_3h_condition for keyword in solar_keywords)
                 and battery_charge >= 65
+                and now.hour < 13
+            ) or (
+                any(keyword in current_condition for keyword in solar_keywords)
+                and any(keyword in forecast_3h_condition for keyword in solar_keywords)
+                and battery_charge >= 55
                 and now.hour < 12
             ) or (
-                any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and any(keyword in forecast_3h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and battery_charge >= 55
-                and now.hour < 11
-            ) or (
-                any(keyword in current_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
-                and any(keyword in forecast_3h_condition for keyword in ['sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds'])
+                any(keyword in current_condition for keyword in solar_keywords)
+                and any(keyword in forecast_3h_condition for keyword in solar_keywords)
                 and battery_charge >= 45
-                and now.hour < 10
+                and now.hour < 11
             ) or ( # Power Conditions
                 battery_charge >= 60 
                 and current_power >= 2500
-                and now.hour < 10
+                and now.hour < 11
             ) or (
                 battery_charge >= 70 
                 and current_power >= 2250
-                and now.hour < 11
+                and now.hour < 12
             ) or (
                 battery_charge >= 80 
                 and current_power >= 2000
-                and now.hour < 12
-            ) or (
-                current_power >= 3500
                 and now.hour < 13
+            ) or (
+                current_power >= 3000
+                and now.hour < 14
             ) or (
                 battery_charge > 90
                 and current_power > 50
@@ -574,31 +585,19 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                     press_power_button(16, 0.55)
         elif (
             (battery_charge <= 90)
-            or (current_power <= 100)
+            or (current_power <= 150)
             or (
-                any(keyword in current_condition for keyword in [
-                    'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
-                    'sleet', 'blizzard', 'dust', 'sand', 'ash',
-                    'tornado', 'hurricane', 'lightning', 'moderate rain', 'heavy intensity rain'
-                ])
+                any(keyword in current_condition for keyword in )
                 and battery_charge <= 95
                 and current_power <= 1000
             )
             or (
-                any(keyword in forecast_1h_condition for keyword in [
-                    'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
-                    'sleet', 'blizzard', 'dust', 'sand', 'ash',
-                    'tornado', 'hurricane', 'lightning', 'moderate rain', 'heavy intensity rain'
-                ])
+                any(keyword in forecast_1h_condition for keyword in non_solar_keywords)
                 and battery_charge <= 95
                 and current_power <= 1000
             )
             or (
-                any(keyword in forecast_3h_condition for keyword in [
-                    'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
-                    'sleet', 'blizzard', 'dust', 'sand', 'ash',
-                    'tornado', 'hurricane', 'lightning', 'moderate rain', 'heavy intensity rain'
-                ])
+                any(keyword in forecast_3h_condition for keyword in non_solar_keywords)
                 and battery_charge <= 95
                 and current_power <= 1000
             )
@@ -636,22 +635,41 @@ def main_loop():
     prev_garage_temp = None
     prev_garage_hum = None
 
+    temp_alert_active = False
+    hum_alert_active = False
+
     while True:
         now = datetime.now(tz=budapest_tz)    
         garage_data = read_dht11(prev_garage_temp, prev_garage_hum)
         garage_temp = garage_data['temperature']
         garage_hum = garage_data['humidity']
 
+        garage_temp_history.append(garage_temp)
+        garage_hum_history.append(garage_hum)
+
         if len(garage_temp_history) == 12:
             mean_temp = statistics.mean(garage_temp_history)
             mean_hum = statistics.mean(garage_hum_history)
+
             if mean_temp > 40:
-                send_telegram_message(f"Warning! The average garage temperature is too high: {mean_temp:.1f}C")
+                if not temp_alert_active:
+                    send_telegram_message(f"Warning! The average garage temperature is too high: {mean_temp:.1f}C")
+                    temp_alert_active = True
+            else:
+                temp_alert_active = False
+
             if mean_hum > 80:
-                send_telegram_message(f"Warning! The average garage humidity is too high: {mean_hum:.1f}")
-            if abs(garage_temp - mean_temp) > 3:
+                if not hum_alert_active:
+                    send_telegram_message(f"Warning! The average garage humidity is too high: {mean_hum:.1f}%")
+                    hum_alert_active = True
+            else:
+                hum_alert_active = False
+
+            if abs(garage_temp - mean_temp) > 5:
                 direction = "risen" if garage_temp > mean_temp else "fallen"
-                send_telegram_message(f"Garage temperature has {direction} to: {garage_temp}C (mean was {mean_temp:.1f}C)")
+                send_telegram_message(
+                    f"Garage temperature has {direction} to: {garage_temp}C (mean was {mean_temp:.1f}C)"
+                )
 
         garage_temp_history.append(garage_temp)
         garage_hum_history.append(garage_hum)
@@ -660,6 +678,7 @@ def main_loop():
 
         if now.month == 1 and now.day == 1 and used_quote != 0:
             print("January 1st detected ? resetting quote usage to 0.")
+            send_telegram_message("January 1st detected ? resetting quote usage to 0.")
             used_quote = 0
             save_quote_usage(used_quote)
 
