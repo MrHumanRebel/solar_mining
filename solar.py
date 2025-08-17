@@ -587,7 +587,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             (battery_charge <= 90)
             or (current_power <= 150)
             or (
-                any(keyword in current_condition for keyword in )
+                any(keyword in current_condition for keyword in non_solar_keywords)
                 and battery_charge <= 95
                 and current_power <= 1000
             )
