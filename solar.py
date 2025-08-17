@@ -155,7 +155,7 @@ def clean_value(value):
     # Ensure the value is a string before applying re.sub
     return int(float(re.sub(r'[^\d.]+', '', str(value))))
 
-def write_to_display(state_text, soc, solar_power, weather_condition, temperature, humidity):
+def write_to_display(state_text, soc, solar_power, temperature, humidity):
     flush_display()
     draw.rectangle((0, 0, oled.width, oled.height), outline=0, fill=0)
 
@@ -169,7 +169,7 @@ def write_to_display(state_text, soc, solar_power, weather_condition, temperatur
 
     line1 = f"SOC: {soc}% PWR: {solar_power}W"
     line2 = f"{state_text}"
-    line3 = f"{weather_condition}  {temperature}C {humidity}%"
+    line3 = f"{temperature}C {humidity}%"
     line4 = f""
 
     draw.text((0, 0), line1, font=font, fill=25)
