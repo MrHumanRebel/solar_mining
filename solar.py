@@ -729,7 +729,6 @@ def main_loop():
                         state_text="sleep",
                         soc=0,
                         solar_power=0,
-                        weather_condition = f"Sunrise: {sunrise.strftime('%H:%M')}",
                         temperature=garage_temp,
                         humidity=garage_hum
                 )
