@@ -219,7 +219,7 @@ def send_telegram_message(message, max_retries=3, keyboard=True):
             else:
                 print("All retry attempts failed.")
 
-def handle_telegram_messages(battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum):
+def handle_telegram_messages(battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum):
     global last_update_id
     try:
         url = f'https://api.telegram.org/bot{BOT_TOKEN}/getUpdates'
@@ -233,11 +233,11 @@ def handle_telegram_messages(battery, power, state, current_condition, temperatu
         for update in data.get('result', []):
             last_update_id = update['update_id']  # Update the last processed update ID
             if 'message' in update and 'text' in update['message']:
-                process_message(update['message']['text'], battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum)
+                process_message(update['message']['text'], battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum)
     except requests.exceptions.RequestException as e:
         print("Error while handling Telegram messages:", e)
 
-def process_message(message_text, battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum):
+def process_message(message_text, battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum):
     if message_text == "/now":
         ip = get_ip_address()
         ram = get_ram_usage()
@@ -248,8 +248,6 @@ def process_message(message_text, battery, power, state, current_condition, temp
             f"Power: {power}W\n"
             f"State: {state}\n"
             f"Condition: {current_condition}\n"
-            f"Temperature: {temperature}C\n"
-            f"Humidity: {humidity}%\n"
             f"Sunrise: {sunrise.strftime('%H:%M')}\n"
             f"Sunset: {sunset.strftime('%H:%M')}\n"
             f"Clouds: {clouds}%\n"
@@ -365,14 +363,12 @@ def get_current_weather(api_key, location_lat, location_lon):
     data = response.json()
 
     current_condition = data['weather'][0]['description'].lower()
-    temperature = data['main']['temp']
-    humidity = data['main']['humidity']
     clouds = data['clouds']['all'] 
     sunrise_ts = data['sys']['sunrise']
     sunset_ts = data['sys']['sunset']
 
     sunrise_dt = datetime.fromtimestamp(sunrise_ts, tz=budapest_tz) - timedelta(minutes=10)
-    sunset_dt = datetime.fromtimestamp(sunset_ts, tz=budapest_tz) - timedelta(minutes=120)
+    sunset_dt = datetime.fromtimestamp(sunset_ts, tz=budapest_tz) - timedelta(minutes=140)
     
     ################################################
     # FUTURE WEATHER
@@ -384,23 +380,19 @@ def get_current_weather(api_key, location_lat, location_lon):
     forecast_data = response.json()
 
     forecast_1h_data = forecast_data['list'][0]
-    forecast_1h_temp = forecast_1h_data['main']['temp']
-    forecast_1h_humidity = forecast_1h_data['main']['humidity']
     forecast_1h_clouds = forecast_1h_data['clouds']['all']
     forecast_1h_condition = forecast_1h_data['weather'][0]['description'].lower()
     forecast_1h_timestamp = forecast_1h_data['dt_txt']
 
     forecast_3h_data = forecast_data['list'][1]
-    forecast_3h_temp = forecast_3h_data['main']['temp']
-    forecast_3h_humidity = forecast_3h_data['main']['humidity']
     forecast_3h_clouds = forecast_3h_data['clouds']['all']
     forecast_3h_condition = forecast_3h_data['weather'][0]['description'].lower()
     forecast_3h_timestamp = forecast_3h_data['dt_txt']
 
     return (
-        current_condition, temperature, humidity, sunrise_dt, sunset_dt, clouds,
-        forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp,
-        forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp
+        current_condition, sunrise_dt, sunset_dt, clouds,
+        forecast_1h_condition, forecast_1h_clouds, forecast_1h_timestamp,
+        forecast_3h_condition, forecast_3h_clouds, forecast_3h_timestamp
     )
 
 def press_power_button(gpio_pin, press_time):
@@ -456,11 +448,15 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
 
     try:
         # Fetch current weather condition, temperature, and humidity
-        current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(weather_api_key, location_lat, location_lon)
+        current_condition, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(weather_api_key, location_lat, location_lon)
         print(f"")
-        print(f"Current weather: {current_condition}, {temperature}C | Humidity: {humidity}% | Clouds: {clouds}%")
-        print(f"1H forecast: {forecast_1h_condition}, {forecast_1h_temp}C | Humidity: {forecast_1h_humidity}% | Clouds: {forecast_1h_clouds}% | Time:{forecast_1h_timestamp}")
-        print(f"3H forecast: {forecast_3h_condition}, {forecast_3h_temp}C | Humidity: {forecast_3h_humidity}% | Clouds: {forecast_3h_clouds}% | Time:{forecast_3h_timestamp}")
+        print(f"Current weather: {current_condition}, | Clouds: {clouds}%")
+        print(f"1H forecast: {forecast_1h_condition}, | Clouds: {forecast_1h_clouds}% | Time:{forecast_1h_timestamp}")
+        print(f"3H forecast: {forecast_3h_condition}, | Clouds: {forecast_3h_clouds}% | Time:{forecast_3h_timestamp}")
+
+        garage_data = read_dht11(0, 0)
+        temperature = garage_data['temperature']
+        humidity = garage_data['humidity']
 
         data_list = data.get("dataList", [])
 
@@ -620,7 +616,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             prev_state = state
             save_prev_state(prev_state, now)
 
-        return battery_charge, current_power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp
+        return battery_charge, current_power, state, current_condition, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_clouds, forecast_3h_timestamp
     except Exception as e:
         print(f"Error while checking production conditions: {e}")
         return None, None, state, sunrise, sunset
@@ -628,7 +624,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
 def main_loop():
     global prev_state, state, used_quote, sunrise, sunset, uptime
     used_quote = load_quote_usage()
-    current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
+    current_condition, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
     garage_temp_history = deque(maxlen=12)
     garage_hum_history = deque(maxlen=12)
@@ -693,13 +689,12 @@ def main_loop():
                 token = get_access_token()
                 data = fetch_current_data(token)
                 store_data(data)
-                battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_temp, forecast_1h_humidity, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_temp, forecast_3h_humidity, forecast_3h_clouds, forecast_3h_timestamp = check_crypto_production_conditions(data, WEATHER_API, LOCATION_LAT, LOCATION_LON)
+                battery, power, state, current_condition, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_clouds, forecast_3h_timestamp = check_crypto_production_conditions(data, WEATHER_API, LOCATION_LAT, LOCATION_LON)
                 if is_rpi:
                     write_to_display(
                         state_text=state,
                         soc=battery,
                         solar_power=power,
-                        weather_condition=current_condition,
                         temperature=garage_temp,
                         humidity=garage_hum
                     )
@@ -713,7 +708,7 @@ def main_loop():
             print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)")
             print(f"Garage temperature: {garage_temp}C")
             print(f"Garage humidity: {garage_hum}%")
-            handle_telegram_messages(battery, power, state, current_condition, temperature, humidity, sunrise, sunset, clouds, garage_temp, garage_hum)
+            handle_telegram_messages(battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum)
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
