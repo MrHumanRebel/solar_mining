@@ -54,7 +54,6 @@ if is_rpi:
         import adafruit_ssd1306
         import RPi.GPIO as GPIO
         import adafruit_dht
-        import board
         import atexit
         dht_sensor = adafruit_dht.DHT11(board.D26)
         atexit.register(dht_sensor.exit)
@@ -191,7 +190,7 @@ def sleep_until_next_5min(offset_seconds=60):
     print(f"Sleeping for {sleep_seconds} seconds...")
     time.sleep(sleep_seconds)
 
-def send_telegram_message(message, max_retries=3, keyboard=True):
+def send_telegram_message(message, max_retries=10, keyboard=True):
     url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
     payload = {'chat_id': CHAT_ID, 'text': message}
 
@@ -565,7 +564,8 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 and current_power >= 2000
                 and now.hour < 13
             ) or (
-                current_power >= 3000
+                battery_charge >= 50 
+                and current_power >= 3000
                 and now.hour < 14
             ) or (
                 battery_charge > 90
