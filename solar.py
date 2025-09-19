@@ -190,7 +190,7 @@ def sleep_until_next_5min(offset_seconds=60):
     print(f"Sleeping for {sleep_seconds} seconds...")
     time.sleep(sleep_seconds)
 
-def send_telegram_message(message, max_retries=10, keyboard=True):
+def send_telegram_message(message, max_retries=15, keyboard=True):
     url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
     payload = {'chat_id': CHAT_ID, 'text': message}
 
@@ -717,6 +717,7 @@ def main_loop():
             state = "stop"
             if prev_state == "production":
                 print("Miner did not shut down correctly, shutting down...")
+                send_telegram_message("Miner did not shut down correctly, shutting down...")
                 print("Trying to press power button.")
                 if is_rpi:
                     press_power_button(16, 0.55)
