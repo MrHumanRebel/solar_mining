@@ -735,6 +735,7 @@ def main_loop():
                 )
             print(f"Garage temperature: {garage_temp}C")
             print(f"Garage humidity: {garage_hum}%")
+            print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)")
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
 
