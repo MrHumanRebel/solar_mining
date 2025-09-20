@@ -242,7 +242,6 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         ram = get_ram_usage()
         cpu = get_cpu_usage()
         temps = get_temperatures()
-        used_quote = int(used_quote)
         percentage = (used_quote / QUOTE_LIMIT) * 100
         message = (
             f"Battery: {battery}%\n"
