@@ -244,7 +244,6 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         cpu = get_cpu_usage()
         temps = get_temperatures()
         percentage = (used_quote / QUOTE_LIMIT) * 100
-        hashrate = get_hiveon_rvn_hashrate(WALLET_ADDRESS)
         message = (
             f"Battery: {battery}%\n"
             f"Power: {power}W\n"
@@ -260,7 +259,6 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"CPU Usage: {cpu}\n"
             f"CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
             f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)"
-            f"\nHiveon RVN Hashrate: {hashrate / 1000000:.2f} MH/s"
         )
         send_telegram_message(message)
     if message_text == "/start":
@@ -357,23 +355,6 @@ def save_prev_state(state, uptime):
         json.dump({'prev_state': state, 'uptime': uptime_str}, f, indent=4)
 
 
-def get_hiveon_rvn_hashrate(wallet: str) -> float:
-    url = f"https://hiveon.net/api/rvn/miner/{wallet}/stats"
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Try common hashrate fields
-        for key in ["hashrate", "currentHashrate", "reportedHashrate", "lastHashrate"]:
-            if key in data and data[key] is not None:
-                return float(data[key])
-
-        return 0.0  # if no known field found
-    except Exception as e:
-        print(f"Error fetching hashrate: {e}")
-        return 0.0
-
 def get_current_weather(api_key, location_lat, location_lon):
     ################################################
     # CURRENT WEATHER
@@ -463,21 +444,6 @@ def check_uptime(now, prev_state):
             print(f"{miner_ip} is offline for {difference.days * 24 + hours} hours and {minutes} minutes")
     except Exception as e:
         print(f"Error during uptime check: {e}")
-
-    # Get hashrate from Hiveon to check if miner is actually mining
-    hashrate = get_hiveon_rvn_hashrate(WALLET_ADDRESS)
-    print(f"Current Hiveon RVN hashrate: {hashrate / 1000000:.2f} MH/s")
-    try:
-        if hashrate <= 20 and prev_state == "production" and (now - uptime) > timedelta(minutes=10):
-            print(f"Hashrate is 0 MH/s. Attempting restart sequence...")
-            press_power_button(16, 10)
-            time.sleep(15)
-            press_power_button(16, 0.55)
-            print("Restart sequence completed.")
-            uptime = now
-            save_prev_state(prev_state, uptime)
-    except Exception as e:
-        print(f"Error during hashrate check: {e}")
     
 def check_crypto_production_conditions(data, weather_api_key, location_lat, location_lon):
     global prev_state, state, used_quote, sunrise, sunset, uptime
