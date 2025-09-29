@@ -21,6 +21,7 @@ services:
       - MY_QUOTE_FILE=/app/quote_usage.json
       - MY_STATE_FILE=/app/state.json
       - MY_SOLARMAN_FILE=/app/solarman_data.json
+      - WALLET_ADDRESS=${WALLET_ADDRESS}
     volumes:
       - ./wait-for-dns.sh:/app/wait-for-dns.sh
       - ./state.json:/app/state.json
