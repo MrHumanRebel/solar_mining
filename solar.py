@@ -244,6 +244,7 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         cpu = get_cpu_usage()
         temps = get_temperatures()
         percentage = (used_quote / QUOTE_LIMIT) * 100
+        hashrate = get_hiveon_rvn_hashrate(WALLET_ADDRESS)
         message = (
             f"Battery: {battery}%\n"
             f"Power: {power}W\n"
@@ -259,6 +260,7 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"CPU Usage: {cpu}\n"
             f"CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
             f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)"
+            f"\nHiveon RVN Hashrate: {hashrate / 1000000:.2f} MH/s"
         )
         send_telegram_message(message)
     if message_text == "/start":
