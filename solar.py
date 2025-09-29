@@ -466,7 +466,7 @@ def check_uptime(now, prev_state):
     hashrate = get_hiveon_rvn_hashrate(WALLET_ADDRESS)
     print(f"Current Hiveon RVN hashrate: {hashrate / 1000000:.2f} MH/s")
     try:
-        if hashrate <= 20 and prev_state == "production" and (now - uptime) > timedelta(minutes=5):
+        if hashrate <= 20 and prev_state == "production" and (now - uptime) > timedelta(minutes=10):
             print(f"Hashrate is 0 MH/s. Attempting restart sequence...")
             press_power_button(16, 10)
             time.sleep(15)
