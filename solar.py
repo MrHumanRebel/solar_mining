@@ -718,6 +718,14 @@ def main_loop():
         else:
             print(f"Outside of active hours. Sleeping... (Sunrise: {sunrise.strftime('%H:%M')} | Sunset: {sunset.strftime('%H:%M')})")
             print(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+            prev_garage_hum = None
+            prev_garage_temp = None
+            garage_data = read_dht11(prev_garage_temp, prev_garage_hum)
+            garage_temp = garage_data['temperature']
+            garage_hum = garage_data['humidity']
+            current_condition, sunrise, sunset, clouds, forecast_1h_condition, forecast_1h_clouds, forecast_1h_timestamp, forecast_3h_condition, forecast_3h_clouds, forecast_3h_timestamp = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
+
             state = "stop"
             if prev_state == "production":
                 print("Miner did not shut down correctly, shutting down...")
@@ -742,6 +750,7 @@ def main_loop():
             used_quote = int(used_quote)
             percentage = (used_quote / QUOTE_LIMIT) * 100
             print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)")
+            handle_telegram_messages(0, 0, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum)
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
 
