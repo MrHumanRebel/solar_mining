@@ -286,27 +286,38 @@ def sha256_hash(password):
     print(f"Hashed password: {passwd}")
     return passwd
 
+import requests
+
 def get_access_token():
     print("Getting access token...")
-    url = f' https://globalapi.solarmanpv.com/account/v1.0/token?appId={APP_ID}&language=en'
+    url = f'https://globalapi.solarmanpv.com/account/v1.0/token?appId={APP_ID}&language=en'
     headers = {'Content-Type': 'application/json'}
     payload = {
         'appSecret': APP_SECRET,
         'email': EMAIL,
         'password': sha256_hash(PASSWORD)
     }
-    response = requests.post(url, headers=headers, json=payload)
-    response.raise_for_status()
 
-    # Debug: Print the entire response to see its structure
-    print("Response received!")
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=5)
+        response.raise_for_status()
 
-    # Ensure 'access_token' is extracted correctly
-    access_token = response.json().get('access_token')
-    if not access_token:
-        raise ValueError("Access token not found in the response.")
-    print("Access token received!")
-    return access_token
+        print("Response received!")
+
+        data = response.json()
+        access_token = data.get('access_token')
+
+        if not access_token:
+            print("[Warning] Access token not found in response.")
+            return None
+
+        print("Access token received!")
+        return access_token
+
+    except (requests.RequestException, ValueError) as e:
+        print(f"[Warning] Failed to get access token: {e}")
+        # Return None so program can continue safely
+        return None
 
 def fetch_current_data(access_token):
     print("Fetching current device data...")
@@ -316,10 +327,17 @@ def fetch_current_data(access_token):
         'Content-Type': 'application/json'
     }
     payload = {'deviceSn': DEVICE_SN}
-    response = requests.post(url, headers=headers, json=payload)
-    response.raise_for_status()
-    print("Current data fetched successfully.")
-    return response.json()
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=5)
+        response.raise_for_status()
+        print("Current data fetched successfully.")
+        return response.json()
+
+    except (requests.RequestException, ValueError) as e:
+        print(f"[Warning] Failed to fetch current device data: {e}")
+        # Return empty data so program continues safely
+        return {}
 
 def store_data(data, filename=SOLARMAN_FILE):
     with open(filename, 'w') as f:
@@ -356,47 +374,64 @@ def save_prev_state(state, uptime):
 
 
 def get_current_weather(api_key, location_lat, location_lon):
-    ################################################
-    # CURRENT WEATHER
-    ################################################
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={location_lat}&lon={location_lon}&appid={api_key}&units=metric"
-    
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        ################################################
+        # CURRENT WEATHER
+        ################################################
+        url = f"https://api.openweathermap.org/data/2.5/weather?lat={location_lat}&lon={location_lon}&appid={api_key}&units=metric"
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
 
-    current_condition = data['weather'][0]['description'].lower()
-    clouds = data['clouds']['all'] 
-    sunrise_ts = data['sys']['sunrise']
-    sunset_ts = data['sys']['sunset']
+        current_condition = data['weather'][0]['description'].lower()
+        clouds = data['clouds']['all'] 
+        sunrise_ts = data['sys']['sunrise']
+        sunset_ts = data['sys']['sunset']
 
-    sunrise_dt = datetime.fromtimestamp(sunrise_ts, tz=budapest_tz) - timedelta(minutes=10)
-    sunset_dt = datetime.fromtimestamp(sunset_ts, tz=budapest_tz) - timedelta(minutes=120)
-    
-    ################################################
-    # FUTURE WEATHER
-    ################################################
-    url = f"https://api.openweathermap.org/data/2.5/forecast?lat={location_lat}&lon={location_lon}&appid={api_key}&units=metric"
-    
-    response = requests.get(url)
-    response.raise_for_status()
-    forecast_data = response.json()
+        sunrise_dt = datetime.fromtimestamp(sunrise_ts, tz=budapest_tz) - timedelta(minutes=10)
+        sunset_dt = datetime.fromtimestamp(sunset_ts, tz=budapest_tz) - timedelta(minutes=120)
 
-    forecast_1h_data = forecast_data['list'][0]
-    forecast_1h_clouds = forecast_1h_data['clouds']['all']
-    forecast_1h_condition = forecast_1h_data['weather'][0]['description'].lower()
-    forecast_1h_timestamp = forecast_1h_data['dt_txt']
+        ################################################
+        # FUTURE WEATHER
+        ################################################
+        url = f"https://api.openweathermap.org/data/2.5/forecast?lat={location_lat}&lon={location_lon}&appid={api_key}&units=metric"
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        forecast_data = response.json()
 
-    forecast_3h_data = forecast_data['list'][1]
-    forecast_3h_clouds = forecast_3h_data['clouds']['all']
-    forecast_3h_condition = forecast_3h_data['weather'][0]['description'].lower()
-    forecast_3h_timestamp = forecast_3h_data['dt_txt']
+        forecast_1h_data = forecast_data['list'][0]
+        forecast_1h_clouds = forecast_1h_data['clouds']['all']
+        forecast_1h_condition = forecast_1h_data['weather'][0]['description'].lower()
+        forecast_1h_timestamp = forecast_1h_data['dt_txt']
+
+        forecast_3h_data = forecast_data['list'][1]
+        forecast_3h_clouds = forecast_3h_data['clouds']['all']
+        forecast_3h_condition = forecast_3h_data['weather'][0]['description'].lower()
+        forecast_3h_timestamp = forecast_3h_data['dt_txt']
+
+    except (requests.RequestException, KeyError, IndexError, ValueError) as e:
+        print(f"[Warning] Weather request failed: {e}")
+        # Alapértelmezett biztonságos értékek
+        current_condition = "unknown"
+        clouds = 0
+        now = datetime.now(tz=budapest_tz)
+        sunrise_dt = now.replace(hour=6, minute=0, second=0)  # kb. reggel 6
+        sunset_dt = now.replace(hour=18, minute=0, second=0)  # kb. este 6
+
+        forecast_1h_condition = "unknown"
+        forecast_1h_clouds = 0
+        forecast_1h_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        forecast_3h_condition = "unknown"
+        forecast_3h_clouds = 0
+        forecast_3h_timestamp = (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
 
     return (
         current_condition, sunrise_dt, sunset_dt, clouds,
         forecast_1h_condition, forecast_1h_clouds, forecast_1h_timestamp,
         forecast_3h_condition, forecast_3h_clouds, forecast_3h_timestamp
     )
+
 
 def press_power_button(gpio_pin, press_time):
     print(f"Pressing power button on GPIO pin {gpio_pin} for {press_time} seconds...")
