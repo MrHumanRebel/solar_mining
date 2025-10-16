@@ -286,8 +286,6 @@ def sha256_hash(password):
     print(f"Hashed password: {passwd}")
     return passwd
 
-import requests
-
 def get_access_token():
     print("Getting access token...")
     url = f'https://globalapi.solarmanpv.com/account/v1.0/token?appId={APP_ID}&language=en'
