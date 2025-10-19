@@ -387,7 +387,7 @@ def get_current_weather(api_key, location_lat, location_lon):
         sunset_ts = data['sys']['sunset']
 
         sunrise_dt = datetime.fromtimestamp(sunrise_ts, tz=budapest_tz) - timedelta(minutes=10)
-        sunset_dt = datetime.fromtimestamp(sunset_ts, tz=budapest_tz) - timedelta(minutes=120)
+        sunset_dt = datetime.fromtimestamp(sunset_ts, tz=budapest_tz) - timedelta(minutes=90)
 
         ################################################
         # FUTURE WEATHER
