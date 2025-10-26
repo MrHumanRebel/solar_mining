@@ -338,12 +338,12 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"Clouds: {clouds}%\n"
             f"Garage Temp: {garage_temp}C\n"
             f"Garage Humidity: {garage_hum}%"
-            f"\n\nInverter Output (per phase):\n"
+            f"\nInverter Output (per phase):\n"
             f"  L1: {l1_str}\n"
             f"  L2: {l2_str}\n"
             f"  L3: {l3_str}\n"
             f"  Total: {lt_str}\n"
-            f"\nIP: {ip}\n"
+            f"IP: {ip}\n"
             f"RAM Usage: {ram}\n"
             f"CPU Usage: {cpu}\n"
             f"CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
@@ -367,8 +367,7 @@ def process_message(message_text, battery, power, state, current_condition, sunr
                     pass
                 if phase:
                     msg = (
-                        f"Per-phase inverter output power"
-                        f"{' @ ' + ts if ts else ''}:\n"
+                        f"Per-phase inverter output power\n"
                         f"L1: {phase.get('L1', 0)} {phase.get('unit', 'W')}\n"
                         f"L2: {phase.get('L2', 0)} {phase.get('unit', 'W')}\n"
                         f"L3: {phase.get('L3', 0)} {phase.get('unit', 'W')}\n"
@@ -464,7 +463,7 @@ def store_data(data, filename=SOLARMAN_FILE):
         out["phasePowers"] = _extract_phase_powers(out)
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(out, f, indent=4, ensure_ascii=False)
-        print(f"Data stored to {filename} (with phasePowers).")
+        print(f"Data stored to {filename}")
     except Exception as e:
         print(f"[Warning] Failed to store data: {e}")
 
