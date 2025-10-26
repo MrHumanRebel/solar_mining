@@ -18,6 +18,8 @@ import statistics
 from pytz import timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List
+import traceback
+import signal
 
 # NEW: threading / futures
 import threading
@@ -128,8 +130,79 @@ def _extract_phase_powers(data: Dict[str, Any]) -> Dict[str, Any]:
     lt = int(_find_value(dl, "INV_O_P_T", 0.0))
     return {"L1": l1, "L2": l2, "L3": l3, "LT": lt, "unit": "W"}
 
+def _runtime_info() -> str:
+    try:
+        ip = get_ip_address()
+    except Exception:
+        ip = "N/A"
+    return (
+        f"Host: {platform.node()} | OS: {platform.system()} {platform.release()} ({platform.machine()})\n"
+        f"Python: {platform.python_version()} | PID: {os.getpid()}\n"
+        f"IP: {ip}"
+    )
+
+def _extract_error_fields(err: Exception) -> Tuple[str, Optional[int], Optional[str]]:
+    """
+    Returns (error_type, http_status, http_reason) if available.
+    For requests exceptions, try to surface status code & reason.
+    """
+    etype = type(err).__name__
+    status = None
+    reason = None
+    try:
+        # requests HTTPError may carry response
+        resp = getattr(err, "response", None)
+        if resp is not None:
+            status = getattr(resp, "status_code", None)
+            reason = getattr(resp, "reason", None)
+    except Exception:
+        pass
+    return etype, status, reason
+
+def _format_exception_for_tg(err: Exception, max_lines: int = 6) -> str:
+    etype, status, reason = _extract_error_fields(err)
+    lines = [f"Type: {etype}"]
+    if status is not None:
+        lines.append(f"HTTP status: {status}{' ' + str(reason) if reason else ''}")
+    try:
+        tb_iter = traceback.TracebackException.from_exception(err).format()
+        head = "".join(tb_iter).strip().splitlines()[:max_lines]
+        if head:
+            lines.append("Traceback:")
+            lines.extend(head)
+    except Exception:
+        lines.append("Traceback: <unavailable>")
+    return "\n".join(lines)
+
+
+def notify_startup():
+    ts = datetime.now(tz=budapest_tz).strftime("%Y-%m-%d %H:%M:%S")
+    msg = (
+        f"🚀 Program started\n"
+        f"Time (Europe/Budapest): {ts}\n"
+        f"{_runtime_info()}"
+    )
+    send_telegram_message(msg, keyboard=True)
+
+def notify_shutdown(reason: str = "normal", err: Exception = None):
+    ts = datetime.now(tz=budapest_tz).strftime("%Y-%m-%d %H:%M:%S")
+    header = f"🛑 Program stopped"
+    body = [f"Reason: {reason}", f"Time (Europe/Budapest): {ts}", _runtime_info()]
+    if err is not None:
+        body.append("\nError details:\n" + _format_exception_for_tg(err))
+    send_telegram_message(f"{header}\n" + "\n".join(body), keyboard=True)
+
+# graceful signal handlers
+def _signal_handler(sig, frame):
+    name = signal.Signals(sig).name if isinstance(sig, int) else str(sig)
+    try:
+        notify_shutdown(reason=f"signal {name}", err=None)
+    finally:
+        # Immediate exit after notifying
+        os._exit(0)
+
 # =========================
-# ORIGINAL FUNCTION NAMES (REFACTORED INSIDE)
+# ORIGINAL FUNCTION NAMES
 # =========================
 def init_display():
     """Initialize OLED on Raspberry Pi."""
@@ -450,7 +523,9 @@ def fetch_current_data(access_token):
         print("Current data fetched successfully.")
         return r.json()
     except (requests.RequestException, ValueError) as e:
-        print(f"[Warning] Failed to fetch current device data: {e}")
+        et, sc, rsn = _extract_error_fields(e)
+        print(f"[Warning] Failed to fetch current device data: {et}"
+            f"{f' | HTTP {sc} {rsn}' if sc else ''} | {e}")
         return {}
 
 def store_data(data, filename=SOLARMAN_FILE):
@@ -900,11 +975,9 @@ def main_loop():
                 store_data(data)  # attaches phasePowers
 
                 (battery, power, state, current_condition, sunrise, sunset, clouds,
-                 f1_cond, f1_clouds, f1_ts,
-                 f3_cond, f3_clouds, f3_ts) = check_crypto_production_conditions(
-                    data, WEATHER_API, LOCATION_LON, LOCATION_LON  # NOTE: original signature uses (api, lat, lon); keep as is if needed
+                f1_cond, f1_clouds, f1_ts, f3_cond, f3_clouds, f3_ts) = check_crypto_production_conditions(
+                    data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
-                # ^ If your original order is (api, lat, lon), correct the above to LOCATION_LAT, LOCATION_LON
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
@@ -985,6 +1058,41 @@ def main_loop():
             print("__________________________________________________________________________________________")
 
 if __name__ == '__main__':
-    if is_rpi:
-        init_display()
-    main_loop()
+    # Send startup notification first
+    try:
+        notify_startup()
+    except Exception as _e:
+        # Startup message shouldn't kill the app
+        print(f"[startup notify] {type(_e).__name__}: {_e}")
+
+    # Register graceful shutdown notifications
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except Exception as _e:
+        print(f"[signal register] {type(_e).__name__}: {_e}")
+
+    # Also try atexit as a last resort (won't catch SIGKILL)
+    import atexit
+    atexit.register(lambda: notify_shutdown(reason="atexit", err=None))
+
+    try:
+        if is_rpi:
+            init_display()
+        main_loop()
+    except KeyboardInterrupt as e:
+        # This is usually handled by SIGINT, but keep as fallback
+        notify_shutdown(reason="KeyboardInterrupt", err=e)
+        sys.exit(130)  # 128+SIGINT
+    except SystemExit as e:
+        # sys.exit(...) – include code if present
+        code = getattr(e, 'code', None)
+        notify_shutdown(reason=f"SystemExit code={code}", err=None)
+        raise
+    except Exception as e:
+        # Any unhandled exception – crash report with error details
+        try:
+            notify_shutdown(reason="crash", err=e)
+        finally:
+            # Non-zero exit for supervisors (systemd, etc.)
+            sys.exit(1)
