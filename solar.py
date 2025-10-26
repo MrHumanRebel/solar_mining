@@ -136,7 +136,7 @@ def _runtime_info() -> str:
     except Exception:
         ip = "N/A"
     return (
-        f"Host: {platform.node()} \n OS: {platform.system()} {platform.release()} ({platform.machine()})\n"
+        f"Host: {platform.node()} \nOS: {platform.system()} {platform.release()} ({platform.machine()})\n"
         f"Python: {platform.python_version()} | PID: {os.getpid()}\n"
         f"IP: {ip}"
     )
