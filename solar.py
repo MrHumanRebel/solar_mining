@@ -136,7 +136,7 @@ def _runtime_info() -> str:
     except Exception:
         ip = "N/A"
     return (
-        f"Host: {platform.node()} | OS: {platform.system()} {platform.release()} ({platform.machine()})\n"
+        f"Host: {platform.node()} \n OS: {platform.system()} {platform.release()} ({platform.machine()})\n"
         f"Python: {platform.python_version()} | PID: {os.getpid()}\n"
         f"IP: {ip}"
     )
@@ -187,7 +187,7 @@ def notify_startup():
 def notify_shutdown(reason: str = "normal", err: Exception = None):
     ts = datetime.now(tz=budapest_tz).strftime("%Y-%m-%d %H:%M:%S")
     header = f"🛑 Program stopped"
-    body = [f"Reason: {reason}", f"Time (Europe/Budapest): {ts}", _runtime_info()]
+    body = [f"Reason: {reason}", f"\nTime (Europe/Budapest): {ts}\n", _runtime_info()]
     if err is not None:
         body.append("\nError details:\n" + _format_exception_for_tg(err))
     send_telegram_message(f"{header}\n" + "\n".join(body), keyboard=True)
