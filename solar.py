@@ -731,8 +731,8 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         if is_rpi and uptime and (now - uptime) > timedelta(minutes=3):
             check_uptime(now, prev_state)
 
-        # IMMEDIATE POWER-BASED STOP RULE
-        if (inv_l1 > 2000) or (inv_l2 > 2000) or (inv_l3 > 2000) or (inv_lt > 5000):
+        # IMMEDIATE POWER-BASED STOP RULE MINER IS ON L2 and L3
+        if (inv_l2 > 2000) or (inv_l3 > 2000) or (inv_lt > 5000):
             print("Power safety threshold exceeded → Crypto production over (STOP).")
             state = "stop"
             if prev_state == "production":
