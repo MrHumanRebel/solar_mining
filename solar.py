@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List
 import traceback
 import signal
+import shutil
+import subprocess
 
 # NEW: threading / futures
 import threading
@@ -83,7 +85,15 @@ _shared_snapshot = {
 # Detect Raspberry Pi
 if platform.system() == "Linux" and any(arch in platform.machine() for arch in ['arm', 'aarch64', 'armv7l']):
     is_rpi = True
+else:
+    is_rpi = False
 
+# Hardware feature flags (soft-optional)
+OLED_AVAILABLE = False
+GPIO_AVAILABLE = False
+DHT_AVAILABLE = False
+
+# Attempt Raspberry Pi-specific imports without ever exiting the app
 if is_rpi:
     try:
         import board
@@ -97,12 +107,24 @@ if is_rpi:
 
         dht_sensor = adafruit_dht.DHT11(board.D26)
         atexit.register(dht_sensor.exit)
-        print("Raspberry Pi OLED dependencies loaded.")
-    except ImportError as e:
-        print(f"Failed to import Raspberry Pi-specific modules: {e}")
-        sys.exit(1)
+        OLED_AVAILABLE = True
+        GPIO_AVAILABLE = True
+        DHT_AVAILABLE = True
+        print("Raspberry Pi OLED/DHT/GPIO dependencies loaded.")
+    except Exception as e:
+        # Fall back gracefully – keep the app running
+        print(f"[Warning] Raspberry Pi-specific modules not fully available: {e}")
+        try:
+            # Try partial availability
+            import RPi.GPIO as GPIO  # noqa: F401
+            GPIO_AVAILABLE = True
+        except Exception:
+            pass
+        dht_sensor = None
 else:
-    print("Not running on Raspberry Pi. Skipping OLED display setup.")
+    print("Not running on Raspberry Pi. Skipping OLED/DHT/GPIO setup.")
+    dht_sensor = None
+
 
 # =========================
 # SMALL, FAST HELPERS
@@ -206,17 +228,21 @@ def _signal_handler(sig, frame):
 # =========================
 def init_display():
     """Initialize OLED on Raspberry Pi."""
-    if not is_rpi:
+    if not (is_rpi and OLED_AVAILABLE):
         return
     global oled, image, draw, font
-    i2c = busio.I2C(board.SCL, board.SDA)
-    oled = adafruit_ssd1306.SSD1306_I2C(128, 32, i2c)
-    image = Image.new("1", (oled.width, oled.height))
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
-    oled.fill(0)
-    oled.show()
-    print("OLED initialized")
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        oled = adafruit_ssd1306.SSD1306_I2C(128, 32, i2c)
+        image = Image.new("1", (oled.width, oled.height))
+        draw = ImageDraw.Draw(image)
+        font = ImageFont.load_default()
+        oled.fill(0)
+        oled.show()
+        print("OLED initialized")
+    except Exception as e:
+        print(f"[Warning] OLED init failed: {e}")
+
 
 def flush_display():
     if oled:
@@ -239,38 +265,55 @@ def get_ram_usage():
 def get_cpu_usage():
     return f"{psutil.cpu_percent(interval=1)}%"
 
+import shutil
+import subprocess
+
 def get_temperatures():
     """
     Returns a dict of temperatures from available sensors.
     Prefer 'vcgencmd' when available (RPi), otherwise thermal zones.
+    Never let missing tools print shell errors or raise.
     """
     temps = {}
+
     try:
-        cpu_temp = os.popen("vcgencmd measure_temp").readline().strip()
-        if cpu_temp.startswith("temp="):
-            temps["CPU"] = cpu_temp.replace("temp=", "")
-            return temps
+        if shutil.which("vcgencmd"):
+            res = subprocess.run(
+                ["vcgencmd", "measure_temp"],
+                capture_output=True, text=True, timeout=2
+            )
+            line = (res.stdout or "").strip()
+            if line.startswith("temp="):
+                temps["CPU"] = line.replace("temp=", "")
+                return temps
+        # If vcgencmd missing or not usable, fall through to thermal zones
     except Exception:
         pass
 
-    for path in glob.glob('/sys/class/thermal/thermal_zone*/temp'):
-        try:
-            with open(path, 'r') as f:
-                milli = int(f.read().strip())
-            c = milli / 1000
-            type_path = path.replace('temp', 'type')
+    try:
+        for path in glob.glob('/sys/class/thermal/thermal_zone*/temp'):
             try:
-                with open(type_path, 'r') as tf:
-                    name = tf.read().strip()
+                with open(path, 'r') as f:
+                    milli = int(f.read().strip())
+                c = milli / 1000
+                type_path = path.replace('temp', 'type')
+                try:
+                    with open(type_path, 'r') as tf:
+                        name = tf.read().strip()
+                except Exception:
+                    name = f"zone_{Path(path).parent.name}"
+                temps[name] = f"{c:.1f}C"
             except Exception:
-                name = f"zone_{Path(path).parent.name}"
-            temps[name] = f"{c:.1f}C"
-        except Exception:
-            continue
+                continue
+    except Exception:
+        pass
+
     return temps
 
+
 def read_dht11(prev_temperature, prev_humidity):
-    if not is_rpi:
+    # If not Pi or DHT not available, keep previous values (no-op)
+    if not (is_rpi and DHT_AVAILABLE and dht_sensor):
         return {'temperature': prev_temperature, 'humidity': prev_humidity}
     try:
         temperature = dht_sensor.temperature
@@ -280,6 +323,7 @@ def read_dht11(prev_temperature, prev_humidity):
         return {'temperature': prev_temperature, 'humidity': prev_humidity}
     except Exception:
         return {'temperature': prev_temperature, 'humidity': prev_humidity}
+
 
 def clean_value(value):
     return int(float(re.sub(r'[^\d.]+', '', str(value))))
@@ -456,14 +500,24 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             send_telegram_message("Failed to read phase data.")
 
     if message_text == "/start":
-        press_power_button(16, 0.55)
-        send_telegram_message("Crypto production started! Pressed power button.")
+        if is_rpi and GPIO_AVAILABLE:
+            press_power_button(16, 0.55)
+            send_telegram_message("Crypto production started! Pressed power button.")
+        else:
+            send_telegram_message("Crypto production start requested, but GPIO is not available on this host.")
     if message_text == "/stop":
-        press_power_button(16, 0.55)
-        send_telegram_message("Crypto production stopped! Pressed power button.")
+        if is_rpi and GPIO_AVAILABLE:
+            press_power_button(16, 0.55)
+            send_telegram_message("Crypto production stopped! Pressed power button.")
+        else:
+            send_telegram_message("Crypto production stop requested, but GPIO is not available on this host.")
     if message_text == "/force_stop":
-        press_power_button(16, 10)
-        send_telegram_message("Crypto production force stopped! Pressed power button for 10 seconds.")
+        if is_rpi and GPIO_AVAILABLE:
+            press_power_button(16, 10)
+            send_telegram_message("Crypto production force stopped! Pressed power button for 10 seconds.")
+        else:
+            send_telegram_message("Force stop requested, but GPIO is not available on this host.")
+
 
 def load_quote_usage():
     if os.path.exists(QUOTE_FILE):
@@ -630,15 +684,22 @@ def get_current_weather(api_key, location_lat, location_lon):
     )
 
 def press_power_button(gpio_pin, press_time):
+    if not (is_rpi and GPIO_AVAILABLE):
+        print(f"[Info] GPIO not available. Skipping power button press ({gpio_pin}, {press_time}s).")
+        return
     print(f"Pressing power button on GPIO pin {gpio_pin} for {press_time} seconds...")
-    with gpio_lock:
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
-        GPIO.output(gpio_pin, GPIO.HIGH)
-        time.sleep(press_time)
-        GPIO.output(gpio_pin, GPIO.LOW)
-        GPIO.cleanup()
-    print("Power button press completed.")
+    try:
+        with gpio_lock:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.output(gpio_pin, GPIO.HIGH)
+            time.sleep(press_time)
+            GPIO.output(gpio_pin, GPIO.LOW)
+            GPIO.cleanup()
+        print("Power button press completed.")
+    except Exception as e:
+        print(f"[Warning] GPIO press failed: {e}")
+
 
 def check_uptime(now, prev_state_val):
     global uptime
@@ -1077,7 +1138,7 @@ if __name__ == '__main__':
     atexit.register(lambda: notify_shutdown(reason="atexit", err=None))
 
     try:
-        if is_rpi:
+        if is_rpi and OLED_AVAILABLE:
             init_display()
         main_loop()
     except KeyboardInterrupt as e:
