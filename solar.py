@@ -3,6 +3,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timedelta
+from datetime import date as date_cls
 import os
 import psutil
 import socket
@@ -58,6 +59,7 @@ prev_state: Optional[str] = None
 state: Optional[str] = None
 uptime: Optional[datetime] = None
 used_quote: int = 0
+last_quote_reset_date: Optional[date_cls] = None
 budapest_tz = ZoneInfo("Europe/Budapest")
 
 oled = None
@@ -933,7 +935,7 @@ def _telegram_loop():
 
 
 def main_loop():
-    global prev_state, state, used_quote, sunrise, sunset, uptime
+    global prev_state, state, used_quote, sunrise, sunset, uptime, last_quote_reset_date
 
     used_quote = load_quote_usage()
     (current_condition, sunrise, sunset, clouds,
@@ -1000,11 +1002,19 @@ def main_loop():
         prev_garage_temp = garage_temp
         prev_garage_hum = garage_hum
 
-        if now.month == 1 and now.day == 1 and used_quote != 0:
+        today = now.date()
+
+        if (
+            today != last_quote_reset_date
+            and now.month == 1
+            and now.day == 1
+            and used_quote != 0
+        ):
             print("January 1st detected – resetting quote usage to 0.")
             send_telegram_message("January 1st detected – resetting quote usage to 0.")
             used_quote = 0
             save_quote_usage(used_quote)
+            last_quote_reset_date = today
 
         print(f"Sunrise start: {sunrise}:00 | Sunset stop: {sunset}:00")
         within_active = (sunrise.hour, sunrise.minute) <= (now.hour, now.minute) <= (sunset.hour, sunset.minute)
