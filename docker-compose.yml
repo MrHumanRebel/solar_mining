@@ -4,6 +4,7 @@ services:
   solar:
     image: ghcr.io/mrhumanrebel/solar_mining:latest
     container_name: solar_monitor
+    hostname: solarminer
     restart: unless-stopped
     entrypoint: ["/app/wait-for-dns.sh", "python", "solar.py"]
     environment:
@@ -39,6 +40,8 @@ services:
     networks:
       pihole_backend:
         ipv4_address: 172.31.0.101
+        aliases:
+          - solarminer
     dns:
       - 172.31.0.100
 
