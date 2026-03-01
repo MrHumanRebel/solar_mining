@@ -15,6 +15,7 @@ import math
 import subprocess
 from zoneinfo import ZoneInfo
 from collections import deque
+from collections import defaultdict
 import statistics
 from pytz import timezone
 from pathlib import Path
@@ -27,6 +28,7 @@ import subprocess
 # NEW: threading / futures
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # =========================
 # ENV / CONFIG
@@ -46,6 +48,7 @@ QUOTE_FILE = os.environ['MY_QUOTE_FILE']
 STATE_FILE = os.environ['MY_STATE_FILE']
 SOLARMAN_FILE = os.environ['MY_SOLARMAN_FILE']
 WALLET_ADDRESS = os.environ['WALLET_ADDRESS']
+HISTORY_DIR = os.getenv('MY_HISTORY_DIR', 'solarman_json')
 
 print(platform.machine())
 print(platform.system())
@@ -83,6 +86,14 @@ _shared_snapshot = {
     "sunrise": datetime.now(tz=budapest_tz), "sunset": datetime.now(tz=budapest_tz),
     "clouds": 0, "garage_temp": 0, "garage_hum": 0
 }
+
+# 6 months @ 5-minute cycle hard cap ≈ 51,840 points
+MAX_HISTORY_POINTS = int(os.getenv("MY_HISTORY_MAX_POINTS", "51840"))
+telemetry_history: deque = deque(maxlen=MAX_HISTORY_POINTS)
+
+
+# Historical profile cache (derived from solarman_json/*.json)
+historical_profile: Optional[Dict[str, Any]] = None
 
 # Detect Raspberry Pi
 if platform.system() == "Linux" and any(arch in platform.machine() for arch in ['arm', 'aarch64', 'armv7l']):
@@ -153,6 +164,252 @@ def _extract_phase_powers(data: Dict[str, Any]) -> Dict[str, Any]:
     l3 = int(_find_value(dl, "INV_O_P_L3", 0.0))
     lt = int(_find_value(dl, "INV_O_P_T", 0.0))
     return {"L1": l1, "L2": l2, "L3": l3, "LT": lt, "unit": "W"}
+
+
+def _parse_history_ts(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(value.strip(), "%Y/%m/%d %H:%M").replace(tzinfo=budapest_tz)
+    except Exception:
+        return None
+
+
+def _history_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, Any]:
+    """
+    Build month-level and hour-level production profile from downloaded Solarman JSON exports.
+    Robust behaviors:
+    - tolerates malformed files/rows,
+    - deduplicates overlaps on exact timestamp (same minute),
+    - avoids overweighting duplicate download windows,
+    - clamps obviously broken values.
+    """
+    files = sorted(glob.glob(os.path.join(history_dir, "*.json")))
+    if not files:
+        print(f"[History] No history files found in {history_dir}. Using static defaults.")
+        return {}
+
+    # timestamp -> list of observed values coming from possibly overlapping files
+    sample_by_ts: Dict[datetime, Dict[str, List[float]]] = defaultdict(lambda: {"prod": [], "soc": []})
+    invalid_rows = 0
+    parsed_rows = 0
+
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as err:
+            print(f"[History] Failed loading {fp}: {err}")
+            continue
+
+        if not isinstance(payload, list):
+            print(f"[History] Ignoring non-list JSON payload in {fp}")
+            continue
+
+        for row in payload:
+            if not isinstance(row, dict):
+                invalid_rows += 1
+                continue
+
+            ts = _parse_history_ts(str(row.get("Updated Time", "")).strip())
+            if ts is None:
+                invalid_rows += 1
+                continue
+
+            prod = max(0.0, min(_history_float(row.get("Production Power(W)"), 0.0), 25000.0))
+            soc = max(0.0, min(_history_float(row.get("SoC(%)"), 0.0), 100.0))
+
+            sample_by_ts[ts]["prod"].append(prod)
+            sample_by_ts[ts]["soc"].append(soc)
+            parsed_rows += 1
+
+    if not sample_by_ts:
+        print("[History] All rows were invalid or empty. Using static defaults.")
+        return {}
+
+    # Canonicalize each timestamp to a single robust sample to prevent overlap bias.
+    canonical: List[Dict[str, Any]] = []
+    duplicate_timestamps = 0
+    for ts in sorted(sample_by_ts.keys()):
+        prod_values = sample_by_ts[ts]["prod"]
+        soc_values = sample_by_ts[ts]["soc"]
+        if len(prod_values) > 1:
+            duplicate_timestamps += 1
+
+        # median is robust to occasional outliers in duplicate windows
+        prod = statistics.median(prod_values) if prod_values else 0.0
+        soc = statistics.median(soc_values) if soc_values else 0.0
+
+        canonical.append({"ts": ts, "prod": prod, "soc": soc})
+
+    month_hour_prod: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
+    month_hour_soc: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
+    month_daily_peaks: Dict[int, Dict[str, float]] = defaultdict(dict)
+
+    for item in canonical:
+        ts = item["ts"]
+        month = ts.month
+        hour = ts.hour
+        day_key = ts.strftime("%Y-%m-%d")
+        prod = item["prod"]
+        soc = item["soc"]
+
+        month_hour_prod[month][hour].append(prod)
+        month_hour_soc[month][hour].append(soc)
+
+        if day_key not in month_daily_peaks[month] or prod > month_daily_peaks[month][day_key]:
+            month_daily_peaks[month][day_key] = prod
+
+    profile: Dict[str, Any] = {
+        "months": {},
+        "files": len(files),
+        "parsed_rows": parsed_rows,
+        "invalid_rows": invalid_rows,
+        "unique_timestamps": len(canonical),
+        "duplicate_timestamps": duplicate_timestamps,
+    }
+
+    for month in range(1, 13):
+        hourly_prod = month_hour_prod.get(month, {})
+        if not hourly_prod:
+            continue
+
+        daily_peaks = list(month_daily_peaks.get(month, {}).values())
+        monthly_peak_p75 = (
+            statistics.quantiles(daily_peaks, n=4)[2]
+            if len(daily_peaks) >= 4
+            else (max(daily_peaks) if daily_peaks else 0.0)
+        )
+
+        daylight_hours = [h for h, vals in hourly_prod.items() if vals and statistics.mean(vals) >= 350]
+        solar_start_hour = min(daylight_hours) if daylight_hours else 8
+        solar_end_hour = max(daylight_hours) if daylight_hours else 15
+
+        midday_hours = [h for h in range(10, 15) if h in hourly_prod and hourly_prod[h]]
+        if midday_hours:
+            midday_avg = statistics.mean([statistics.mean(hourly_prod[h]) for h in midday_hours])
+        else:
+            midday_avg = statistics.mean([statistics.mean(v) for v in hourly_prod.values() if v])
+
+        evening_hours = [h for h in range(16, 24) if h in month_hour_soc.get(month, {})]
+        evening_soc_values: List[float] = []
+        for h in evening_hours:
+            evening_soc_values.extend(month_hour_soc[month][h])
+
+        evening_soc_p40 = (
+            statistics.quantiles(evening_soc_values, n=5)[1]
+            if len(evening_soc_values) >= 5
+            else (statistics.mean(evening_soc_values) if evening_soc_values else 45.0)
+        )
+
+        profile["months"][month] = {
+            "solar_start_hour": int(solar_start_hour),
+            "solar_end_hour": int(solar_end_hour),
+            "daylight_span": int(max(0, solar_end_hour - solar_start_hour + 1)),
+            "midday_avg": float(midday_avg),
+            "daily_peak_p75": float(monthly_peak_p75),
+            "evening_soc_p40": float(evening_soc_p40),
+        }
+
+    print(
+        f"[History] Profile ready from {profile['files']} files | parsed={profile['parsed_rows']} "
+        f"invalid={profile['invalid_rows']} unique_ts={profile['unique_timestamps']} "
+        f"dup_ts={profile['duplicate_timestamps']} months={sorted(profile['months'].keys())}"
+    )
+    return profile
+
+
+def _interpolate_month_config(target_month: int, months_cfg: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    """Interpolate missing month values from nearest available months (circular calendar distance)."""
+    if target_month in months_cfg:
+        return dict(months_cfg[target_month])
+    if not months_cfg:
+        return {}
+
+    keys = [
+        "solar_start_hour", "solar_end_hour", "daylight_span",
+        "midday_avg", "daily_peak_p75", "evening_soc_p40"
+    ]
+
+    weighted: Dict[str, float] = defaultdict(float)
+    weights: Dict[str, float] = defaultdict(float)
+
+    for m, cfg in months_cfg.items():
+        dist = min((target_month - m) % 12, (m - target_month) % 12)
+        if dist == 0:
+            dist = 0.5
+        w = 1.0 / dist
+        for k in keys:
+            if k in cfg:
+                weighted[k] += w * float(cfg[k])
+                weights[k] += w
+
+    out: Dict[str, Any] = {}
+    for k in keys:
+        if weights[k] > 0:
+            out[k] = weighted[k] / weights[k]
+    return out
+
+
+def _history_recommendation(now: datetime, battery_charge: float, current_power: float,
+                            sunrise_dt: datetime, sunset_dt: datetime) -> Dict[str, Any]:
+    """
+    Creates dynamic decision hints from historical production behavior for current month.
+    """
+    global historical_profile
+    months = (historical_profile or {}).get("months", {})
+    month_cfg = _interpolate_month_config(now.month, months)
+
+    if not month_cfg:
+        return {
+            "month_quality": "neutral",
+            "early_start_soc": 55,
+            "min_stop_soc": 20,
+            "late_day_reserve_soc": 80,
+            "should_preserve_battery": now.hour >= 15 and battery_charge < 80,
+            "headroom_good": current_power >= 2500,
+        }
+
+    daylight_span = int(month_cfg.get("daylight_span", 8))
+    midday_avg = float(month_cfg.get("midday_avg", 2000))
+    daily_peak_p75 = float(month_cfg.get("daily_peak_p75", 3500))
+    solar_start_hour = int(month_cfg.get("solar_start_hour", sunrise_dt.hour))
+    evening_soc_p40 = float(month_cfg.get("evening_soc_p40", 45.0))
+
+    strong_month = daylight_span >= 9 and midday_avg >= 2400
+    weak_month = daylight_span <= 7 or midday_avg <= 1700
+
+    early_start_soc = 32 if strong_month else (58 if weak_month else 45)
+    min_stop_soc = 26 if weak_month else 20
+    late_day_reserve_soc = max(72, int(evening_soc_p40 + (8 if weak_month else 4)))
+
+    headroom_good = (
+        current_power >= max(1800.0, 0.55 * daily_peak_p75)
+        and now.hour <= max(solar_start_hour + 5, sunrise_dt.hour + 4)
+    )
+
+    # Preserve battery in weaker months or later afternoon.
+    should_preserve_battery = (
+        now.hour >= (14 if weak_month else 16)
+        and battery_charge < late_day_reserve_soc
+        and current_power < max(1400.0, 0.4 * daily_peak_p75)
+    )
+
+    return {
+        "month_quality": "strong" if strong_month else ("weak" if weak_month else "neutral"),
+        "early_start_soc": early_start_soc,
+        "min_stop_soc": min_stop_soc,
+        "late_day_reserve_soc": late_day_reserve_soc,
+        "should_preserve_battery": should_preserve_battery,
+        "headroom_good": headroom_good,
+    }
 
 def _runtime_info() -> str:
     try:
@@ -779,6 +1036,13 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         print(f"Internal Power: {internal_power}W")
 
         now = datetime.now(tz=budapest_tz)
+        hist = _history_recommendation(now, battery_charge, current_power, sunrise, sunset)
+        print(
+            "[History tuning] "
+            f"month={hist['month_quality']} early_start_soc={hist['early_start_soc']}% "
+            f"min_stop_soc={hist['min_stop_soc']}% late_reserve={hist['late_day_reserve_soc']}% "
+            f"headroom_good={hist['headroom_good']} preserve={hist['should_preserve_battery']}"
+        )
 
         solar_keywords = [
             'sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds',
@@ -824,8 +1088,9 @@ ________________________________
                     f3_cond, f3_clouds, f3_ts)
 
         # ===== existing logic continues below =====
-        if ((prev_state == "production" and battery_charge < 20) or
-            (prev_state == "production" and now.hour > 14 and battery_charge < 80)):
+        if ((prev_state == "production" and battery_charge < hist["min_stop_soc"]) or
+            (prev_state == "production" and now.hour > 14 and battery_charge < hist["late_day_reserve_soc"]) or
+            (prev_state == "production" and hist["should_preserve_battery"])):
             print("Battery emergency shutdown.")
             state = "stop"
             if prev_state == "production":
@@ -837,14 +1102,15 @@ ________________________________
                 if is_rpi:
                     press_power_button(16, 0.55)
         elif (
-            (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and current_power > 0 and battery_charge >= 35 and now.hour < 13)
+            (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13)
             or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 65 and now.hour < 13)
             or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 55 and now.hour < 12)
             or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 45 and now.hour < 11)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and current_power > 0 and battery_charge >= 35 and now.hour < 13)
+            or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13)
             or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 65 and now.hour < 13)
             or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 55 and now.hour < 12)
             or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 45 and now.hour < 11)
+            or (hist["headroom_good"] and battery_charge >= hist["early_start_soc"] and now.hour < 14)
             or (battery_charge >= 60 and current_power >= 2500 and now.hour < 11)
             or (battery_charge >= 70 and current_power >= 2250 and now.hour < 12)
             or (battery_charge >= 80 and current_power >= 2000 and now.hour < 13)
@@ -859,11 +1125,12 @@ ________________________________
                 if is_rpi:
                     press_power_button(16, 0.55)
         elif (
-            (battery_charge <= 90)
+            (battery_charge <= max(90, hist["late_day_reserve_soc"]))
             or (current_power <= 150)
             or (any(k in current_condition for k in non_solar_keywords) and battery_charge <= 95 and current_power <= 1000)
             or (any(k in f1_cond for k in non_solar_keywords) and battery_charge <= 95 and current_power <= 1000)
             or (any(k in f3_cond for k in non_solar_keywords) and battery_charge <= 95 and current_power <= 1000)
+            or (hist["should_preserve_battery"] and now.hour >= 14)
         ):
             print("Crypto production over.")
             state = "stop"
@@ -913,6 +1180,171 @@ ________________________________
         return None, None, state, sunrise, sunset
 
 
+def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power: float,
+                      state_val: str, current_condition: str, clouds: float,
+                      garage_temp: Optional[float], garage_hum: Optional[float]):
+    dl = data.get("dataList", []) if isinstance(data, dict) else []
+    record = {
+        "ts": now.isoformat(),
+        "battery": float(battery or 0),
+        "power": float(power or 0),
+        "state": state_val or "unknown",
+        "condition": current_condition or "unknown",
+        "clouds": float(clouds or 0),
+        "garage_temp": float(garage_temp or 0),
+        "garage_hum": float(garage_hum or 0),
+        "inv_l1": float(_find_value(dl, "INV_O_P_L1", 0.0)),
+        "inv_l2": float(_find_value(dl, "INV_O_P_L2", 0.0)),
+        "inv_l3": float(_find_value(dl, "INV_O_P_L3", 0.0)),
+        "inv_lt": float(_find_value(dl, "INV_O_P_T", 0.0)),
+        "internal_power": float(_find_value(dl, "GS_T", 0.0)),
+    }
+    telemetry_history.append(record)
+
+
+def _miner_action(action: str) -> Dict[str, Any]:
+    now = datetime.now(tz=budapest_tz).isoformat()
+    duration = 0.55
+    if action == "force_stop":
+        duration = 10
+    if action not in {"start", "stop", "force_stop"}:
+        return {"ok": False, "message": "invalid action", "ts": now}
+
+    if not is_rpi:
+        return {"ok": False, "message": "GPIO unavailable (not Raspberry Pi runtime)", "ts": now}
+
+    try:
+        with gpio_lock:
+            press_power_button(16, duration)
+        return {"ok": True, "message": f"{action} signal sent ({duration}s)", "ts": now}
+    except Exception as err:
+        return {"ok": False, "message": str(err), "ts": now}
+
+
+def _weather_icon(condition: str) -> str:
+    c = (condition or "").lower()
+    if any(k in c for k in ["rain", "drizzle", "storm", "thunder"]):
+        return "fa-cloud-rain"
+    if any(k in c for k in ["snow", "sleet", "blizzard"]):
+        return "fa-snowflake"
+    if any(k in c for k in ["fog", "mist", "haze", "smoke"]):
+        return "fa-smog"
+    if any(k in c for k in ["cloud", "overcast"]):
+        return "fa-cloud"
+    return "fa-sun"
+
+
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Solar Mining Control</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root{--bg:#0b1220;--card:rgba(255,255,255,.08);--txt:#e9eefc;--muted:#9fb0d0;--ok:#47d16c;--warn:#f2b84b;--danger:#ff6b6b}
+[data-theme="light"]{--bg:#eef3ff;--card:rgba(255,255,255,.78);--txt:#111827;--muted:#4b5563}
+body{margin:0;background:linear-gradient(135deg,var(--bg),#1d2a46);color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh}
+.wrap{padding:16px;max-width:1400px;margin:0 auto}.top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px}
+.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.2);border-radius:16px;padding:14px}
+.k{color:var(--muted);font-size:.9rem}.v{font-size:1.6rem;font-weight:700}
+.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:10px;padding:10px 14px;color:white;cursor:pointer}
+.btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}
+.charts{display:grid;grid-template-columns:1fr;gap:12px;margin-top:12px}@media(min-width:980px){.charts{grid-template-columns:1fr 1fr}}
+</style></head>
+<body data-theme="dark"><div class="wrap"><div class="top"><h2><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
+<button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button></div>
+<div class="grid" id="metrics"></div><div class="card"><div class="actions">
+<button class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
+<button class="btn warn" onclick="act('stop')"><i class="fa-solid fa-stop"></i> Stop miner</button>
+<button class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
+</div><div id="actionResult" class="k" style="margin-top:8px"></div></div>
+<div class="charts"><div class="card"><canvas id="powerChart"></canvas></div><div class="card"><canvas id="phaseChart"></canvas></div>
+<div class="card"><canvas id="batteryChart"></canvas></div><div class="card"><canvas id="envChart"></canvas></div></div></div>
+<script>
+let powerChart,phaseChart,batteryChart,envChart;
+const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[{label,borderColor:color,data:[],tension:.25,pointRadius:0}]},options:{responsive:true,animation:false}});
+const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets},options:{responsive:true,animation:false}});
+function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',borderColor:'#60a5fa',data:[],pointRadius:0,tension:.2},{label:'L2',borderColor:'#f59e0b',data:[],pointRadius:0,tension:.2},{label:'L3',borderColor:'#f43f5e',data:[],pointRadius:0,tension:.2}]);batteryChart=mkMulti('batteryChart',[{label:'Battery %',borderColor:'#a78bfa',data:[],pointRadius:0,tension:.2},{label:'Miner ON',borderColor:'#22c55e',data:[],pointRadius:0,tension:.2}]);envChart=mkMulti('envChart',[{label:'Temp °C',borderColor:'#ef4444',data:[],pointRadius:0,tension:.2},{label:'Humidity %',borderColor:'#38bdf8',data:[],pointRadius:0,tension:.2}]);}
+function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});} 
+async function pull(){const r=await fetch('/api/snapshot');const d=await r.json();const icon=d.weather_icon||'fa-sun';
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'>State</div><div class='v'>${d.state}</div></div><div class='card'><div class='k'>Battery</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'>PV</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'>Weather</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'>Clouds</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'>History Points</div><div class='v'>${d.history_count}</div></div>`;
+const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
+powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
+phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
+batteryChart.data.labels=labels; batteryChart.data.datasets[0].data=h.map(x=>x.battery); batteryChart.data.datasets[1].data=h.map(x=>x.state==='production'?100:0); batteryChart.update();
+envChart.data.labels=labels; envChart.data.datasets[0].data=h.map(x=>x.garage_temp); envChart.data.datasets[1].data=h.map(x=>x.garage_hum); envChart.update();}
+async function act(a){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});const d=await r.json();document.getElementById('actionResult').textContent=d.message + ' @ ' + d.ts;}
+init();pull();setInterval(pull,10000);document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};
+</script></body></html>
+"""
+
+
+def _build_snapshot_payload() -> Dict[str, Any]:
+    with snapshot_lock:
+        snap = dict(_shared_snapshot)
+        hist = list(telemetry_history)
+    return {
+        "battery": snap.get("battery", 0),
+        "power": snap.get("power", 0),
+        "state": snap.get("state", "unknown"),
+        "current_condition": snap.get("current_condition", "unknown"),
+        "weather_icon": _weather_icon(snap.get("current_condition", "")),
+        "clouds": snap.get("clouds", 0),
+        "history_count": len(hist),
+        "history": hist[-1728:],
+    }
+
+
+class WebHandler(BaseHTTPRequestHandler):
+    def _write(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ["/", "/index.html"]:
+            self._write(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if self.path == "/api/snapshot":
+            payload = json.dumps(_build_snapshot_payload()).encode("utf-8")
+            self._write(200, payload, "application/json")
+            return
+        self._write(404, b'{"error":"not found"}', "application/json")
+
+    def do_POST(self):
+        if self.path != "/api/action":
+            self._write(404, b'{"error":"not found"}', "application/json")
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            payload = {}
+        action = str(payload.get("action", "")).strip().lower()
+        out = _miner_action(action)
+        code = 200 if out.get("ok") else 400
+        self._write(code, json.dumps(out).encode("utf-8"), "application/json")
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def _start_web_server():
+    host = os.getenv("MY_WEB_HOST", "0.0.0.0")
+    port = int(os.getenv("MY_WEB_PORT", "9000"))
+    print(f"[Web] Starting GUI on http://{host}:{port}")
+    try:
+        server = ThreadingHTTPServer((host, port), WebHandler)
+        server.serve_forever()
+    except Exception as err:
+        print(f"[Web] Server crashed: {err}")
+
+
 # ---------- THREAD RUNNER FOR TELEGRAM ----------
 def _telegram_loop():
     """
@@ -935,7 +1367,10 @@ def _telegram_loop():
 
 
 def main_loop():
-    global prev_state, state, used_quote, sunrise, sunset, uptime, last_quote_reset_date
+    global prev_state, state, used_quote, sunrise, sunset, uptime, last_quote_reset_date, historical_profile
+
+    if historical_profile is None:
+        historical_profile = build_historical_profile(HISTORY_DIR)
 
     used_quote = load_quote_usage()
     (current_condition, sunrise, sunset, clouds,
@@ -945,6 +1380,9 @@ def main_loop():
     # START TELEGRAM THREAD ONCE
     t_thread = threading.Thread(target=_telegram_loop, name="telegram-poller", daemon=True)
     t_thread.start()
+
+    web_thread = threading.Thread(target=_start_web_server, name="web-gui", daemon=True)
+    web_thread.start()
 
     garage_temp_history = deque(maxlen=12)
     garage_hum_history = deque(maxlen=12)
@@ -1049,6 +1487,9 @@ def main_loop():
                 f1_cond, f1_clouds, f1_ts, f3_cond, f3_clouds, f3_ts) = check_crypto_production_conditions(
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
+
+                _record_telemetry(now, data, battery or 0, power or 0, state or "unknown",
+                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:

@@ -31,8 +31,12 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
    
-# Copy the app code
+# Copy the app code and bundled historical tuning data
 COPY solar.py ./
+COPY wait-for-dns.sh ./
+COPY solarman_json ./solarman_json
+
+EXPOSE 9000
 
 # Entrypoint
 CMD ["python", "solar.py"]
