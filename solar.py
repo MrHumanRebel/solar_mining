@@ -24,6 +24,7 @@ import traceback
 import signal
 import shutil
 import subprocess
+from urllib.parse import urlparse, parse_qs
 
 # NEW: threading / futures
 import threading
@@ -90,6 +91,7 @@ _shared_snapshot = {
 # 6 months @ 5-minute cycle hard cap ≈ 51,840 points
 MAX_HISTORY_POINTS = int(os.getenv("MY_HISTORY_MAX_POINTS", "51840"))
 telemetry_history: deque = deque(maxlen=MAX_HISTORY_POINTS)
+TELEMETRY_FILE = Path(os.getenv("MY_TELEMETRY_FILE", "telemetry_history.json"))
 
 
 # Historical profile cache (derived from solarman_json/*.json)
@@ -1200,6 +1202,28 @@ def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power
         "internal_power": float(_find_value(dl, "GS_T", 0.0)),
     }
     telemetry_history.append(record)
+    _append_telemetry_to_file(record)
+
+
+def _append_telemetry_to_file(record: Dict[str, Any]) -> None:
+    try:
+        TELEMETRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        existing: List[Dict[str, Any]] = []
+        if TELEMETRY_FILE.exists():
+            try:
+                with TELEMETRY_FILE.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                if isinstance(payload, list):
+                    existing = payload
+            except Exception as err:
+                print(f"[Telemetry] Could not read telemetry file, recreating: {err}")
+
+        existing.append(record)
+        with TELEMETRY_FILE.open("w", encoding="utf-8") as fh:
+            json.dump(existing, fh, ensure_ascii=False)
+    except Exception as err:
+        print(f"[Telemetry] Failed to persist record: {err}")
 
 
 def _miner_action(action: str) -> Dict[str, Any]:
@@ -1242,49 +1266,116 @@ DASHBOARD_HTML = """
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
-:root{--bg:#0b1220;--card:rgba(255,255,255,.08);--txt:#e9eefc;--muted:#9fb0d0;--ok:#47d16c;--warn:#f2b84b;--danger:#ff6b6b}
-[data-theme="light"]{--bg:#eef3ff;--card:rgba(255,255,255,.78);--txt:#111827;--muted:#4b5563}
-body{margin:0;background:linear-gradient(135deg,var(--bg),#1d2a46);color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh}
-.wrap{padding:16px;max-width:1400px;margin:0 auto}.top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px}
-.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.2);border-radius:16px;padding:14px}
-.k{color:var(--muted);font-size:.9rem}.v{font-size:1.6rem;font-weight:700}
-.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:10px;padding:10px 14px;color:white;cursor:pointer}
-.btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}
-.charts{display:grid;grid-template-columns:1fr;gap:12px;margin-top:12px}@media(min-width:980px){.charts{grid-template-columns:1fr 1fr}}
+:root{--bg:#0b1220;--bg2:#182845;--card:rgba(20,31,56,.72);--txt:#e9eefc;--muted:#9fb0d0;--ok:#47d16c;--warn:#f2b84b;--danger:#ff6b6b;--input:#1f2c48;--border:rgba(255,255,255,.2)}
+[data-theme="light"]{--bg:#eef3ff;--bg2:#d9e8ff;--card:rgba(255,255,255,.85);--txt:#111827;--muted:#4b5563;--input:#ffffff;--border:rgba(17,24,39,.15)}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+.wrap{padding:18px;max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+.logo-wrap{display:flex;justify-content:center;padding-top:4px}
+.logo{max-width:min(360px,80vw);height:auto;filter:drop-shadow(0 10px 25px rgba(0,0,0,.35));}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.title{display:flex;align-items:center;gap:10px;margin:0;font-size:clamp(1.35rem,2.3vw,2rem)}
+.panel{background:var(--card);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:16px;padding:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.card{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:14px;padding:14px;min-width:0}
+.k{color:var(--muted);font-size:.9rem;margin-bottom:6px;display:flex;align-items:center;gap:8px}.v{font-size:1.65rem;font-weight:700;line-height:1.2;word-break:break-word}
+.k i{opacity:.95}
+.chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.chart-title{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8px}
+.chart-sub{font-size:.78rem;color:var(--muted)}
+.toolbar{display:grid;grid-template-columns:2fr 1fr;gap:12px;align-items:end}
+.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.field{display:flex;flex-direction:column;gap:6px}
+.field label{font-size:.82rem;color:var(--muted)}
+.field input,.btn{border-radius:10px;border:1px solid var(--border);padding:10px 12px;font-size:.95rem}
+.field input{background:var(--input);color:var(--txt)}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{color:#fff;cursor:pointer;background:transparent}
+.btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}.btn.ghost{background:transparent;color:var(--txt)}
+.charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.chart-card{height:340px}
+.chart-card canvas{width:100% !important;height:100% !important}
+@media(max-width:1100px){.charts{grid-template-columns:1fr}}
+@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:300px}}
 </style></head>
-<body data-theme="dark"><div class="wrap"><div class="top"><h2><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
+<body data-theme="dark"><div class="wrap">
+<div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
+<div class="top"><h2 class="title"><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
 <button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button></div>
-<div class="grid" id="metrics"></div><div class="card"><div class="actions">
+<div class="grid" id="metrics"></div>
+<div class="panel toolbar"><div class="filters">
+<div class="field"><label for="fromDate">From</label><input id="fromDate" type="date" /></div>
+<div class="field"><label for="toDate">To</label><input id="toDate" type="date" /></div>
+<div class="actions"><button class="btn ghost" id="resetRange"><i class="fa-solid fa-rotate-left"></i> Last 30 days</button><button class="btn ok" id="applyRange"><i class="fa-solid fa-filter"></i> Apply range</button></div>
+</div><div class="actions">
 <button class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
 <button class="btn warn" onclick="act('stop')"><i class="fa-solid fa-stop"></i> Stop miner</button>
 <button class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
-</div><div id="actionResult" class="k" style="margin-top:8px"></div></div>
-<div class="charts"><div class="card"><canvas id="powerChart"></canvas></div><div class="card"><canvas id="phaseChart"></canvas></div>
-<div class="card"><canvas id="batteryChart"></canvas></div><div class="card"><canvas id="envChart"></canvas></div></div></div>
+</div></div>
+<div id="actionResult" class="k"></div>
+<div class="charts"><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
+<div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Miner</div><div class="chart-sub">SOC and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div></div></div>
 <script>
 let powerChart,phaseChart,batteryChart,envChart;
-const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[{label,borderColor:color,data:[],tension:.25,pointRadius:0}]},options:{responsive:true,animation:false}});
-const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets},options:{responsive:true,animation:false}});
-function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',borderColor:'#60a5fa',data:[],pointRadius:0,tension:.2},{label:'L2',borderColor:'#f59e0b',data:[],pointRadius:0,tension:.2},{label:'L3',borderColor:'#f43f5e',data:[],pointRadius:0,tension:.2}]);batteryChart=mkMulti('batteryChart',[{label:'Battery %',borderColor:'#a78bfa',data:[],pointRadius:0,tension:.2},{label:'Miner ON',borderColor:'#22c55e',data:[],pointRadius:0,tension:.2}]);envChart=mkMulti('envChart',[{label:'Temp °C',borderColor:'#ef4444',data:[],pointRadius:0,tension:.2},{label:'Humidity %',borderColor:'#38bdf8',data:[],pointRadius:0,tension:.2}]);}
+const defaultLastDays=30;
+let currentRange={from:null,to:null};
+const chartOpts={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'nearest',intersect:false,axis:'x'},plugins:{tooltip:{enabled:true,displayColors:false,backgroundColor:'rgba(14,23,41,.92)',titleColor:'#e9eefc',bodyColor:'#e9eefc',padding:12,cornerRadius:12,caretPadding:8,borderColor:'rgba(255,255,255,.2)',borderWidth:1,callbacks:{label:(ctx)=>`${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(2)}`}}},scales:{x:{ticks:{maxRotation:0}},y:{beginAtZero:false}}};
+const styledSet=(label,color,tension=.2)=>({label,borderColor:color,backgroundColor:color,data:[],pointRadius:0,pointHoverRadius:5,pointHoverBorderWidth:2,pointHoverBackgroundColor:'#ffffff',pointHoverBorderColor:color,pointHitRadius:14,borderWidth:2,tension});
+const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[styledSet(label,color,.25)]},options:chartOpts});
+const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets.map(s=>styledSet(s.label,s.color,s.tension??.2))},options:chartOpts});
+function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Battery %',color:'#a78bfa'},{label:'Miner ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);setDefaultRange();}
 function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});} 
-async function pull(){const r=await fetch('/api/snapshot');const d=await r.json();const icon=d.weather_icon||'fa-sun';
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'>State</div><div class='v'>${d.state}</div></div><div class='card'><div class='k'>Battery</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'>PV</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'>Weather</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'>Clouds</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'>History Points</div><div class='v'>${d.history_count}</div></div>`;
+function formatDate(d){return d.toISOString().slice(0,10)}
+function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
+async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> State</div><div class='v'>${d.state}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> Battery</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> PV Power</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> Weather</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> Clouds</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> History Points</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
 powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
 phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
 batteryChart.data.labels=labels; batteryChart.data.datasets[0].data=h.map(x=>x.battery); batteryChart.data.datasets[1].data=h.map(x=>x.state==='production'?100:0); batteryChart.update();
 envChart.data.labels=labels; envChart.data.datasets[0].data=h.map(x=>x.garage_temp); envChart.data.datasets[1].data=h.map(x=>x.garage_hum); envChart.update();}
 async function act(a){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});const d=await r.json();document.getElementById('actionResult').textContent=d.message + ' @ ' + d.ts;}
+document.getElementById('applyRange').onclick=()=>{currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};pull();};
+document.getElementById('resetRange').onclick=()=>{setDefaultRange();pull();};
 init();pull();setInterval(pull,10000);document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};
 </script></body></html>
 """
 
 
-def _build_snapshot_payload() -> Dict[str, Any]:
+def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[str] = None) -> Dict[str, Any]:
     with snapshot_lock:
         snap = dict(_shared_snapshot)
         hist = list(telemetry_history)
+
+    now = datetime.now(tz=budapest_tz)
+    start_ts = None
+    end_ts = None
+    try:
+        if from_date:
+            start_ts = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=budapest_tz)
+    except ValueError:
+        start_ts = None
+    try:
+        if to_date:
+            end_ts = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=budapest_tz) + timedelta(days=1)
+    except ValueError:
+        end_ts = None
+
+    if start_ts is None or end_ts is None:
+        end_ts = now + timedelta(seconds=1)
+        start_ts = now - timedelta(days=30)
+
+    filtered_hist = []
+    for item in hist:
+        try:
+            ts = datetime.fromisoformat(str(item.get("ts", "")))
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=budapest_tz)
+        if start_ts <= ts < end_ts:
+            filtered_hist.append(item)
+
     return {
         "battery": snap.get("battery", 0),
         "power": snap.get("power", 0),
@@ -1292,8 +1383,8 @@ def _build_snapshot_payload() -> Dict[str, Any]:
         "current_condition": snap.get("current_condition", "unknown"),
         "weather_icon": _weather_icon(snap.get("current_condition", "")),
         "clouds": snap.get("clouds", 0),
-        "history_count": len(hist),
-        "history": hist[-1728:],
+        "history_count": len(filtered_hist),
+        "history": filtered_hist,
     }
 
 
@@ -1306,11 +1397,26 @@ class WebHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ["/", "/index.html"]:
+        parsed = urlparse(self.path)
+
+        if parsed.path in ["/", "/index.html"]:
             self._write(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
-        if self.path == "/api/snapshot":
-            payload = json.dumps(_build_snapshot_payload()).encode("utf-8")
+        if parsed.path == "/solarmining_logo.png":
+            logo_path = Path("solarmining_logo.png")
+            if not logo_path.exists():
+                self._write(404, b'{"error":"logo not found"}', "application/json")
+                return
+            self._write(200, logo_path.read_bytes(), "image/png")
+            return
+        if parsed.path == "/api/snapshot":
+            qs = parse_qs(parsed.query)
+            payload = json.dumps(
+                _build_snapshot_payload(
+                    qs.get("from", [None])[0],
+                    qs.get("to", [None])[0],
+                )
+            ).encode("utf-8")
             self._write(200, payload, "application/json")
             return
         self._write(404, b'{"error":"not found"}', "application/json")
@@ -1488,8 +1594,12 @@ def main_loop():
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
 
-                _record_telemetry(now, data, battery or 0, power or 0, state or "unknown",
-                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
+                has_usable_solarman_data = bool((data or {}).get("dataList"))
+                if has_usable_solarman_data:
+                    _record_telemetry(now, data, battery or 0, power or 0, state or "unknown",
+                                      current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
+                else:
+                    print("[Telemetry] Skipping save: no Solarman datapoints available for this cycle.")
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:

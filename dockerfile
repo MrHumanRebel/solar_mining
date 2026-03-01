@@ -33,6 +33,7 @@ RUN pip install --no-cache-dir -r requirements.txt
    
 # Copy the app code and bundled historical tuning data
 COPY solar.py ./
+COPY solarmining_logo.png ./
 COPY wait-for-dns.sh ./
 COPY solarman_json ./solarman_json
 
