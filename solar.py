@@ -1278,7 +1278,11 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 .panel{background:var(--card);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:16px;padding:14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
 .card{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:14px;padding:14px;min-width:0}
-.k{color:var(--muted);font-size:.9rem;margin-bottom:6px}.v{font-size:1.65rem;font-weight:700;line-height:1.2;word-break:break-word}
+.k{color:var(--muted);font-size:.9rem;margin-bottom:6px;display:flex;align-items:center;gap:8px}.v{font-size:1.65rem;font-weight:700;line-height:1.2;word-break:break-word}
+.k i{opacity:.95}
+.chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.chart-title{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8px}
+.chart-sub{font-size:.78rem;color:var(--muted)}
 .toolbar{display:grid;grid-template-columns:2fr 1fr;gap:12px;align-items:end}
 .filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
 .field{display:flex;flex-direction:column;gap:6px}
@@ -1288,9 +1292,10 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 .actions{display:flex;gap:8px;flex-wrap:wrap}
 .btn{color:#fff;cursor:pointer;background:transparent}
 .btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}.btn.ghost{background:transparent;color:var(--txt)}
-.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
+.charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .chart-card{height:340px}
 .chart-card canvas{width:100% !important;height:100% !important}
+@media(max-width:1100px){.charts{grid-template-columns:1fr}}
 @media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:300px}}
 </style></head>
 <body data-theme="dark"><div class="wrap">
@@ -1308,8 +1313,8 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 <button class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
 </div></div>
 <div id="actionResult" class="k"></div>
-<div class="charts"><div class="card chart-card"><canvas id="powerChart"></canvas></div><div class="card chart-card"><canvas id="phaseChart"></canvas></div>
-<div class="card chart-card"><canvas id="batteryChart"></canvas></div><div class="card chart-card"><canvas id="envChart"></canvas></div></div></div>
+<div class="charts"><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
+<div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Miner</div><div class="chart-sub">SOC and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div></div></div>
 <script>
 let powerChart,phaseChart,batteryChart,envChart;
 const defaultLastDays=30;
@@ -1323,7 +1328,7 @@ function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'
 function formatDate(d){return d.toISOString().slice(0,10)}
 function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'>State</div><div class='v'>${d.state}</div></div><div class='card'><div class='k'>Battery</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'>PV</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'>Weather</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'>Clouds</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'>History Points</div><div class='v'>${d.history_count}</div></div>`;
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> State</div><div class='v'>${d.state}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> Battery</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> PV Power</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> Weather</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> Clouds</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> History Points</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
 powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
 phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
@@ -1589,8 +1594,12 @@ def main_loop():
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
 
-                _record_telemetry(now, data, battery or 0, power or 0, state or "unknown",
-                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
+                has_usable_solarman_data = bool((data or {}).get("dataList"))
+                if has_usable_solarman_data:
+                    _record_telemetry(now, data, battery or 0, power or 0, state or "unknown",
+                                      current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
+                else:
+                    print("[Telemetry] Skipping save: no Solarman datapoints available for this cycle.")
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
