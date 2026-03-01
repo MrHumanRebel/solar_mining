@@ -15,6 +15,7 @@ import math
 import subprocess
 from zoneinfo import ZoneInfo
 from collections import deque
+from collections import defaultdict
 import statistics
 from pytz import timezone
 from pathlib import Path
@@ -46,6 +47,7 @@ QUOTE_FILE = os.environ['MY_QUOTE_FILE']
 STATE_FILE = os.environ['MY_STATE_FILE']
 SOLARMAN_FILE = os.environ['MY_SOLARMAN_FILE']
 WALLET_ADDRESS = os.environ['WALLET_ADDRESS']
+HISTORY_DIR = os.getenv('MY_HISTORY_DIR', 'solarman_json')
 
 print(platform.machine())
 print(platform.system())
@@ -83,6 +85,9 @@ _shared_snapshot = {
     "sunrise": datetime.now(tz=budapest_tz), "sunset": datetime.now(tz=budapest_tz),
     "clouds": 0, "garage_temp": 0, "garage_hum": 0
 }
+
+# Historical profile cache (derived from solarman_json/*.json)
+historical_profile: Optional[Dict[str, Any]] = None
 
 # Detect Raspberry Pi
 if platform.system() == "Linux" and any(arch in platform.machine() for arch in ['arm', 'aarch64', 'armv7l']):
@@ -153,6 +158,252 @@ def _extract_phase_powers(data: Dict[str, Any]) -> Dict[str, Any]:
     l3 = int(_find_value(dl, "INV_O_P_L3", 0.0))
     lt = int(_find_value(dl, "INV_O_P_T", 0.0))
     return {"L1": l1, "L2": l2, "L3": l3, "LT": lt, "unit": "W"}
+
+
+def _parse_history_ts(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(value.strip(), "%Y/%m/%d %H:%M").replace(tzinfo=budapest_tz)
+    except Exception:
+        return None
+
+
+def _history_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, Any]:
+    """
+    Build month-level and hour-level production profile from downloaded Solarman JSON exports.
+    Robust behaviors:
+    - tolerates malformed files/rows,
+    - deduplicates overlaps on exact timestamp (same minute),
+    - avoids overweighting duplicate download windows,
+    - clamps obviously broken values.
+    """
+    files = sorted(glob.glob(os.path.join(history_dir, "*.json")))
+    if not files:
+        print(f"[History] No history files found in {history_dir}. Using static defaults.")
+        return {}
+
+    # timestamp -> list of observed values coming from possibly overlapping files
+    sample_by_ts: Dict[datetime, Dict[str, List[float]]] = defaultdict(lambda: {"prod": [], "soc": []})
+    invalid_rows = 0
+    parsed_rows = 0
+
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as err:
+            print(f"[History] Failed loading {fp}: {err}")
+            continue
+
+        if not isinstance(payload, list):
+            print(f"[History] Ignoring non-list JSON payload in {fp}")
+            continue
+
+        for row in payload:
+            if not isinstance(row, dict):
+                invalid_rows += 1
+                continue
+
+            ts = _parse_history_ts(str(row.get("Updated Time", "")).strip())
+            if ts is None:
+                invalid_rows += 1
+                continue
+
+            prod = max(0.0, min(_history_float(row.get("Production Power(W)"), 0.0), 25000.0))
+            soc = max(0.0, min(_history_float(row.get("SoC(%)"), 0.0), 100.0))
+
+            sample_by_ts[ts]["prod"].append(prod)
+            sample_by_ts[ts]["soc"].append(soc)
+            parsed_rows += 1
+
+    if not sample_by_ts:
+        print("[History] All rows were invalid or empty. Using static defaults.")
+        return {}
+
+    # Canonicalize each timestamp to a single robust sample to prevent overlap bias.
+    canonical: List[Dict[str, Any]] = []
+    duplicate_timestamps = 0
+    for ts in sorted(sample_by_ts.keys()):
+        prod_values = sample_by_ts[ts]["prod"]
+        soc_values = sample_by_ts[ts]["soc"]
+        if len(prod_values) > 1:
+            duplicate_timestamps += 1
+
+        # median is robust to occasional outliers in duplicate windows
+        prod = statistics.median(prod_values) if prod_values else 0.0
+        soc = statistics.median(soc_values) if soc_values else 0.0
+
+        canonical.append({"ts": ts, "prod": prod, "soc": soc})
+
+    month_hour_prod: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
+    month_hour_soc: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
+    month_daily_peaks: Dict[int, Dict[str, float]] = defaultdict(dict)
+
+    for item in canonical:
+        ts = item["ts"]
+        month = ts.month
+        hour = ts.hour
+        day_key = ts.strftime("%Y-%m-%d")
+        prod = item["prod"]
+        soc = item["soc"]
+
+        month_hour_prod[month][hour].append(prod)
+        month_hour_soc[month][hour].append(soc)
+
+        if day_key not in month_daily_peaks[month] or prod > month_daily_peaks[month][day_key]:
+            month_daily_peaks[month][day_key] = prod
+
+    profile: Dict[str, Any] = {
+        "months": {},
+        "files": len(files),
+        "parsed_rows": parsed_rows,
+        "invalid_rows": invalid_rows,
+        "unique_timestamps": len(canonical),
+        "duplicate_timestamps": duplicate_timestamps,
+    }
+
+    for month in range(1, 13):
+        hourly_prod = month_hour_prod.get(month, {})
+        if not hourly_prod:
+            continue
+
+        daily_peaks = list(month_daily_peaks.get(month, {}).values())
+        monthly_peak_p75 = (
+            statistics.quantiles(daily_peaks, n=4)[2]
+            if len(daily_peaks) >= 4
+            else (max(daily_peaks) if daily_peaks else 0.0)
+        )
+
+        daylight_hours = [h for h, vals in hourly_prod.items() if vals and statistics.mean(vals) >= 350]
+        solar_start_hour = min(daylight_hours) if daylight_hours else 8
+        solar_end_hour = max(daylight_hours) if daylight_hours else 15
+
+        midday_hours = [h for h in range(10, 15) if h in hourly_prod and hourly_prod[h]]
+        if midday_hours:
+            midday_avg = statistics.mean([statistics.mean(hourly_prod[h]) for h in midday_hours])
+        else:
+            midday_avg = statistics.mean([statistics.mean(v) for v in hourly_prod.values() if v])
+
+        evening_hours = [h for h in range(16, 24) if h in month_hour_soc.get(month, {})]
+        evening_soc_values: List[float] = []
+        for h in evening_hours:
+            evening_soc_values.extend(month_hour_soc[month][h])
+
+        evening_soc_p40 = (
+            statistics.quantiles(evening_soc_values, n=5)[1]
+            if len(evening_soc_values) >= 5
+            else (statistics.mean(evening_soc_values) if evening_soc_values else 45.0)
+        )
+
+        profile["months"][month] = {
+            "solar_start_hour": int(solar_start_hour),
+            "solar_end_hour": int(solar_end_hour),
+            "daylight_span": int(max(0, solar_end_hour - solar_start_hour + 1)),
+            "midday_avg": float(midday_avg),
+            "daily_peak_p75": float(monthly_peak_p75),
+            "evening_soc_p40": float(evening_soc_p40),
+        }
+
+    print(
+        f"[History] Profile ready from {profile['files']} files | parsed={profile['parsed_rows']} "
+        f"invalid={profile['invalid_rows']} unique_ts={profile['unique_timestamps']} "
+        f"dup_ts={profile['duplicate_timestamps']} months={sorted(profile['months'].keys())}"
+    )
+    return profile
+
+
+def _interpolate_month_config(target_month: int, months_cfg: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    """Interpolate missing month values from nearest available months (circular calendar distance)."""
+    if target_month in months_cfg:
+        return dict(months_cfg[target_month])
+    if not months_cfg:
+        return {}
+
+    keys = [
+        "solar_start_hour", "solar_end_hour", "daylight_span",
+        "midday_avg", "daily_peak_p75", "evening_soc_p40"
+    ]
+
+    weighted: Dict[str, float] = defaultdict(float)
+    weights: Dict[str, float] = defaultdict(float)
+
+    for m, cfg in months_cfg.items():
+        dist = min((target_month - m) % 12, (m - target_month) % 12)
+        if dist == 0:
+            dist = 0.5
+        w = 1.0 / dist
+        for k in keys:
+            if k in cfg:
+                weighted[k] += w * float(cfg[k])
+                weights[k] += w
+
+    out: Dict[str, Any] = {}
+    for k in keys:
+        if weights[k] > 0:
+            out[k] = weighted[k] / weights[k]
+    return out
+
+
+def _history_recommendation(now: datetime, battery_charge: float, current_power: float,
+                            sunrise_dt: datetime, sunset_dt: datetime) -> Dict[str, Any]:
+    """
+    Creates dynamic decision hints from historical production behavior for current month.
+    """
+    global historical_profile
+    months = (historical_profile or {}).get("months", {})
+    month_cfg = _interpolate_month_config(now.month, months)
+
+    if not month_cfg:
+        return {
+            "month_quality": "neutral",
+            "early_start_soc": 55,
+            "min_stop_soc": 20,
+            "late_day_reserve_soc": 80,
+            "should_preserve_battery": now.hour >= 15 and battery_charge < 80,
+            "headroom_good": current_power >= 2500,
+        }
+
+    daylight_span = int(month_cfg.get("daylight_span", 8))
+    midday_avg = float(month_cfg.get("midday_avg", 2000))
+    daily_peak_p75 = float(month_cfg.get("daily_peak_p75", 3500))
+    solar_start_hour = int(month_cfg.get("solar_start_hour", sunrise_dt.hour))
+    evening_soc_p40 = float(month_cfg.get("evening_soc_p40", 45.0))
+
+    strong_month = daylight_span >= 9 and midday_avg >= 2400
+    weak_month = daylight_span <= 7 or midday_avg <= 1700
+
+    early_start_soc = 32 if strong_month else (58 if weak_month else 45)
+    min_stop_soc = 26 if weak_month else 20
+    late_day_reserve_soc = max(72, int(evening_soc_p40 + (8 if weak_month else 4)))
+
+    headroom_good = (
+        current_power >= max(1800.0, 0.55 * daily_peak_p75)
+        and now.hour <= max(solar_start_hour + 5, sunrise_dt.hour + 4)
+    )
+
+    # Preserve battery in weaker months or later afternoon.
+    should_preserve_battery = (
+        now.hour >= (14 if weak_month else 16)
+        and battery_charge < late_day_reserve_soc
+        and current_power < max(1400.0, 0.4 * daily_peak_p75)
+    )
+
+    return {
+        "month_quality": "strong" if strong_month else ("weak" if weak_month else "neutral"),
+        "early_start_soc": early_start_soc,
+        "min_stop_soc": min_stop_soc,
+        "late_day_reserve_soc": late_day_reserve_soc,
+        "should_preserve_battery": should_preserve_battery,
+        "headroom_good": headroom_good,
+    }
 
 def _runtime_info() -> str:
     try:
@@ -779,6 +1030,13 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         print(f"Internal Power: {internal_power}W")
 
         now = datetime.now(tz=budapest_tz)
+        hist = _history_recommendation(now, battery_charge, current_power, sunrise, sunset)
+        print(
+            "[History tuning] "
+            f"month={hist['month_quality']} early_start_soc={hist['early_start_soc']}% "
+            f"min_stop_soc={hist['min_stop_soc']}% late_reserve={hist['late_day_reserve_soc']}% "
+            f"headroom_good={hist['headroom_good']} preserve={hist['should_preserve_battery']}"
+        )
 
         solar_keywords = [
             'sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds',
@@ -824,8 +1082,9 @@ ________________________________
                     f3_cond, f3_clouds, f3_ts)
 
         # ===== existing logic continues below =====
-        if ((prev_state == "production" and battery_charge < 20) or
-            (prev_state == "production" and now.hour > 14 and battery_charge < 80)):
+        if ((prev_state == "production" and battery_charge < hist["min_stop_soc"]) or
+            (prev_state == "production" and now.hour > 14 and battery_charge < hist["late_day_reserve_soc"]) or
+            (prev_state == "production" and hist["should_preserve_battery"])):
             print("Battery emergency shutdown.")
             state = "stop"
             if prev_state == "production":
@@ -837,14 +1096,15 @@ ________________________________
                 if is_rpi:
                     press_power_button(16, 0.55)
         elif (
-            (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and current_power > 0 and battery_charge >= 35 and now.hour < 13)
+            (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13)
             or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 65 and now.hour < 13)
             or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 55 and now.hour < 12)
             or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 45 and now.hour < 11)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and current_power > 0 and battery_charge >= 35 and now.hour < 13)
+            or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13)
             or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 65 and now.hour < 13)
             or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 55 and now.hour < 12)
             or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 45 and now.hour < 11)
+            or (hist["headroom_good"] and battery_charge >= hist["early_start_soc"] and now.hour < 14)
             or (battery_charge >= 60 and current_power >= 2500 and now.hour < 11)
             or (battery_charge >= 70 and current_power >= 2250 and now.hour < 12)
             or (battery_charge >= 80 and current_power >= 2000 and now.hour < 13)
@@ -859,11 +1119,12 @@ ________________________________
                 if is_rpi:
                     press_power_button(16, 0.55)
         elif (
-            (battery_charge <= 90)
+            (battery_charge <= max(90, hist["late_day_reserve_soc"]))
             or (current_power <= 150)
             or (any(k in current_condition for k in non_solar_keywords) and battery_charge <= 95 and current_power <= 1000)
             or (any(k in f1_cond for k in non_solar_keywords) and battery_charge <= 95 and current_power <= 1000)
             or (any(k in f3_cond for k in non_solar_keywords) and battery_charge <= 95 and current_power <= 1000)
+            or (hist["should_preserve_battery"] and now.hour >= 14)
         ):
             print("Crypto production over.")
             state = "stop"
@@ -935,7 +1196,10 @@ def _telegram_loop():
 
 
 def main_loop():
-    global prev_state, state, used_quote, sunrise, sunset, uptime, last_quote_reset_date
+    global prev_state, state, used_quote, sunrise, sunset, uptime, last_quote_reset_date, historical_profile
+
+    if historical_profile is None:
+        historical_profile = build_historical_profile(HISTORY_DIR)
 
     used_quote = load_quote_usage()
     (current_condition, sunrise, sunset, clouds,
