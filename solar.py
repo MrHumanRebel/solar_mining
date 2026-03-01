@@ -91,7 +91,19 @@ _shared_snapshot = {
 # 6 months @ 5-minute cycle hard cap ≈ 51,840 points
 MAX_HISTORY_POINTS = int(os.getenv("MY_HISTORY_MAX_POINTS", "51840"))
 telemetry_history: deque = deque(maxlen=MAX_HISTORY_POINTS)
-TELEMETRY_FILE = Path(os.getenv("MY_TELEMETRY_FILE", "telemetry_history.json"))
+
+
+def _resolve_telemetry_file() -> Path:
+    raw = os.getenv("MY_TELEMETRY_FILE", "telemetry_history.json")
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    # Keep default file near script to avoid cwd-dependent path issues.
+    return (Path(__file__).resolve().parent / p).resolve()
+
+
+TELEMETRY_FILE = _resolve_telemetry_file()
+print(f"[Telemetry] Using telemetry store: {TELEMETRY_FILE}")
 
 
 # Historical profile cache (derived from solarman_json/*.json)
@@ -1182,6 +1194,56 @@ ________________________________
         return None, None, state, sunrise, sunset
 
 
+def _load_telemetry_from_file() -> int:
+    """Load persisted telemetry points into in-memory deque at startup."""
+    candidates = [TELEMETRY_FILE]
+
+    # Backward compatibility: previous versions may have written to cwd/telemetry_history.json
+    legacy_cwd_file = (Path.cwd() / "telemetry_history.json").resolve()
+    if legacy_cwd_file not in candidates:
+        candidates.append(legacy_cwd_file)
+
+    loaded_total = 0
+    seen_ts = set()
+
+    try:
+        telemetry_history.clear()
+
+        for fp in candidates:
+            if not fp.exists():
+                continue
+            try:
+                with fp.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception as err:
+                print(f"[Telemetry] Failed reading {fp}: {err}")
+                continue
+
+            if not isinstance(payload, list):
+                print(f"[Telemetry] Ignoring non-list telemetry payload in {fp}.")
+                continue
+
+            for item in payload[-MAX_HISTORY_POINTS:]:
+                if not isinstance(item, dict):
+                    continue
+                ts = str(item.get("ts", "")).strip()
+                if not ts or ts in seen_ts:
+                    continue
+                telemetry_history.append(item)
+                seen_ts.add(ts)
+                loaded_total += 1
+
+        sorted_hist = sorted(list(telemetry_history), key=lambda x: str(x.get("ts", "")))
+        telemetry_history.clear()
+        telemetry_history.extend(sorted_hist[-MAX_HISTORY_POINTS:])
+
+        print(f"[Telemetry] Loaded {len(telemetry_history)} points (raw read: {loaded_total}) from: {', '.join(str(x) for x in candidates)}")
+        return len(telemetry_history)
+    except Exception as err:
+        print(f"[Telemetry] Failed loading telemetry history: {err}")
+        return 0
+
+
 def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power: float,
                       state_val: str, current_condition: str, clouds: float,
                       garage_temp: Optional[float], garage_hum: Optional[float]):
@@ -1220,8 +1282,13 @@ def _append_telemetry_to_file(record: Dict[str, Any]) -> None:
                 print(f"[Telemetry] Could not read telemetry file, recreating: {err}")
 
         existing.append(record)
-        with TELEMETRY_FILE.open("w", encoding="utf-8") as fh:
+        if len(existing) > MAX_HISTORY_POINTS:
+            existing = existing[-MAX_HISTORY_POINTS:]
+
+        tmp_file = TELEMETRY_FILE.with_suffix(TELEMETRY_FILE.suffix + ".tmp")
+        with tmp_file.open("w", encoding="utf-8") as fh:
             json.dump(existing, fh, ensure_ascii=False)
+        tmp_file.replace(TELEMETRY_FILE)
     except Exception as err:
         print(f"[Telemetry] Failed to persist record: {err}")
 
@@ -1263,6 +1330,8 @@ DASHBOARD_HTML = """
 <html lang="en"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Solar Mining Control</title>
+<link rel="icon" type="image/png" href="/solarmining_logo.png" />
+<link rel="apple-touch-icon" href="/solarmining_logo.png" />
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
@@ -1271,8 +1340,8 @@ DASHBOARD_HTML = """
 *{box-sizing:border-box}
 body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
 .wrap{padding:10px 18px 16px;max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
-.logo-wrap{display:flex;justify-content:center;padding-top:0;margin-bottom:0}
-.logo{max-width:min(300px,72vw);height:auto;filter:drop-shadow(0 8px 18px rgba(0,0,0,.28));}
+.logo-wrap{display:flex;justify-content:center;padding-top:0;margin:-8px 0 -14px;line-height:0}
+.logo{display:block;max-width:min(300px,72vw);height:auto;filter:drop-shadow(0 8px 18px rgba(0,0,0,.28));}
 .top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 .title{display:flex;align-items:center;gap:10px;margin:0;font-size:clamp(1.35rem,2.3vw,2rem)}
 .panel{background:var(--card);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:16px;padding:14px}
@@ -1281,7 +1350,7 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 @media(max-width:1280px){.metrics-grid{grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px}}
 @media(max-width:760px){.metrics-grid{grid-template-columns:repeat(2,minmax(150px,1fr));gap:10px}}
 .card{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:14px;padding:14px;min-width:0}
-.k{color:var(--muted);font-size:.88rem;margin-bottom:6px;display:flex;align-items:center;gap:8px}.v{font-size:clamp(1.08rem,1.25vw,1.35rem);font-weight:700;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.metrics-grid .card{display:flex;flex-direction:column;justify-content:space-between;min-height:102px}.k{color:var(--muted);font-size:.88rem;margin-bottom:8px;display:flex;align-items:center;gap:8px}.v{font-size:clamp(1.08rem,1.25vw,1.35rem);font-weight:700;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:2.5em}
 .k i{opacity:.95}
 .chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)}
 .chart-title{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8px}
@@ -1292,9 +1361,12 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 .field label{font-size:.82rem;color:var(--muted)}
 .field input,.btn{border-radius:10px;border:1px solid var(--border);padding:10px 12px;font-size:.95rem}
 .field input{background:var(--input);color:var(--txt)}
-input[type="date"]{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.03));border:1px solid var(--border);box-shadow:inset 0 1px 0 rgba(255,255,255,.08);font-weight:600;letter-spacing:.02em}
-input[type="date"]:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25)}
-input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8%) saturate(321%) hue-rotate(178deg) brightness(102%) contrast(96%);cursor:pointer}
+input[type="date"]{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.04));border:1px solid rgba(148,163,184,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 8px 18px rgba(2,6,23,.22);font-weight:700;letter-spacing:.02em;color:var(--txt);min-height:42px;color-scheme:dark}
+[data-theme="light"] input[type="date"]{background:linear-gradient(180deg,#ffffff,#eef4ff);border-color:rgba(71,85,105,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 6px 14px rgba(15,23,42,.08);color-scheme:light}
+input[type="date"]:hover{border-color:rgba(96,165,250,.75)}
+input[type="date"]:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25),0 10px 22px rgba(59,130,246,.2)}
+input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8%) saturate(321%) hue-rotate(178deg) brightness(102%) contrast(96%);cursor:pointer;opacity:.95}
+[data-theme="light"] input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(25%) sepia(8%) saturate(1510%) hue-rotate(178deg) brightness(94%) contrast(85%)}
 .actions{display:flex;gap:8px;flex-wrap:wrap}
 .btn{color:#fff;cursor:pointer;background:transparent}
 .btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}.btn.ghost{background:transparent;color:var(--txt)}
@@ -1307,7 +1379,7 @@ input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8
 <body data-theme="dark"><div class="wrap">
 <div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
 <div class="top"><h2 id="dashTitle" class="title"><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
-<div class="actions"><button id="lang" class="btn ghost"><i class="fa-solid fa-language"></i> HU</button><button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button></div></div>
+<div class="actions"><button id="lang" class="btn ghost"><i class="fa-solid fa-earth-europe"></i> HU</button><button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button></div></div>
 <div class="grid metrics-grid" id="metrics"></div>
 <div class="panel toolbar"><div class="filters">
 <div class="field"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="date" /></div>
@@ -1320,7 +1392,7 @@ input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8
 </div></div>
 <div id="actionResult" class="k"></div>
 <div class="charts"><div class="card chart-card"><div class="chart-head"><div id="chPower" class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div id="chPowerSub" class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chPhase" class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div id="chPhaseSub" class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
-<div class="card chart-card"><div class="chart-head"><div id="chBattery" class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Miner</div><div id="chBatterySub" class="chart-sub">SOC and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chEnv" class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div id="chEnvSub" class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div></div></div>
+<div class="card chart-card"><div class="chart-head"><div id="chBattery" class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Mining Rig</div><div id="chBatterySub" class="chart-sub">Charge level and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chEnv" class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div id="chEnvSub" class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div></div></div>
 <script>
 let powerChart,phaseChart,batteryChart,envChart;
 const defaultLastDays=30;
@@ -1329,13 +1401,26 @@ let currentLang='en';
 const I18N={
   en:{title:'Solar Mining Dashboard',theme:'Theme',from:'From',to:'To',last30:'Last 30 days',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',
       state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
-      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Miner',chBatterySub:'SOC and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Battery %',dsMiner:'Miner ON',dsTemp:'Temp °C',dsHum:'Humidity %',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
-  hu:{title:'Solar Bányászat Dashboard',theme:'Téma',from:'Tól',to:'Ig',last30:'Utolsó 30 nap',apply:'Szűrés',start:'Miner indítása',stop:'Miner leállítása',force:'Kényszer leállítás',
-      state:'Állapot',battery:'Aksi',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzmény pontok',
-      chPower:'PV termelés',chPowerSub:'Watt trend',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Aksi és Miner',chBatterySub:'SOC és állapot',chEnv:'Garázs környezet',chEnvSub:'Hőmérséklet / Páratartalom',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Aksi %',dsMiner:'Miner BE',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
+      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
+  hu:{title:'Solar Bányászat Dashboard',theme:'Téma',from:'Tól',to:'Ig',last30:'Utolsó 30 nap',apply:'Szűrés',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszer leállítás',
+      state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzmény pontok',
+      chPower:'PV termelés',chPowerSub:'Watt trend',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Töltöttség és Bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázs környezet',chEnvSub:'Hőmérséklet / Páratartalom',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép BE',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
 const t=(k)=>I18N[currentLang][k]||k;
 function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
+function localizeWeather(cond){
+  const raw=String(cond||'').trim();
+  if(currentLang!=='hu') return raw;
+  const c=raw.toLowerCase();
+  const m=[
+    ['clear sky','tiszta ég'],['few clouds','gyengén felhős'],['scattered clouds','szórványfelhős'],
+    ['broken clouds','erősen felhős'],['overcast clouds','borult'],['shower rain','zápor'],['light rain','enyhe eső'],
+    ['moderate rain','mérsékelt eső'],['heavy intensity rain','erős eső'],['rain','eső'],['thunderstorm','zivatar'],
+    ['snow','havazás'],['mist','pára'],['fog','köd'],['haze','párás']
+  ];
+  for(const [en,hu] of m){ if(c.includes(en)) return hu; }
+  return raw;
+}
 function applyChartI18n(){
   if(!powerChart||!phaseChart||!batteryChart||!envChart)return;
   powerChart.data.datasets[0].label=t('dsPv');
@@ -1347,7 +1432,7 @@ function applyChartI18n(){
 function applyI18n(){
   document.getElementById('dashTitle').innerHTML=`<i class="fa-solid fa-solar-panel"></i> ${t('title')}`;
   document.getElementById('theme').innerHTML=`<i class="fa-solid fa-circle-half-stroke"></i> ${t('theme')}`;
-  document.getElementById('lang').innerHTML=`<i class="fa-solid fa-language"></i> ${t('langBtn')}`;
+  document.getElementById('lang').innerHTML=`<i class="fa-solid fa-earth-europe"></i> ${t('langBtn')}`;
   document.getElementById('lblFrom').textContent=t('from');
   document.getElementById('lblTo').textContent=t('to');
   document.getElementById('resetRange').innerHTML=`<i class="fa-solid fa-rotate-left"></i> ${t('last30')}`;
@@ -1369,13 +1454,13 @@ const chartOpts={responsive:true,maintainAspectRatio:false,animation:false,inter
 const styledSet=(label,color,tension=.2)=>({label,borderColor:color,backgroundColor:color,data:[],pointRadius:0,pointHoverRadius:5,pointHoverBorderWidth:2,pointHoverBackgroundColor:'#ffffff',pointHoverBorderColor:color,pointHitRadius:14,borderWidth:2,tension});
 const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[styledSet(label,color,.25)]},options:chartOpts});
 const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets.map(s=>styledSet(s.label,s.color,s.tension??.2))},options:chartOpts});
-function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Battery %',color:'#a78bfa'},{label:'Miner ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);setDefaultRange();}
+function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Charge %',color:'#a78bfa'},{label:'Mining Rig ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);setDefaultRange();}
 function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});} 
 function formatDate(d){return d.toISOString().slice(0,10)}
 function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
 const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
 powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
 phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
@@ -1423,6 +1508,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         if start_ts <= ts < end_ts:
             filtered_hist.append(item)
 
+    filtered_hist.sort(key=lambda x: str(x.get("ts", "")))
+
     return {
         "battery": snap.get("battery", 0),
         "power": snap.get("power", 0),
@@ -1457,6 +1544,34 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._write(404, b'{"error":"logo not found"}', "application/json")
                 return
             self._write(200, logo_path.read_bytes(), "image/png")
+            return
+
+        # Dedicated favicon pack support (GitHub-uploaded /favicon/* assets)
+        if parsed.path in {"/favicon.ico", "/site.webmanifest"} or parsed.path.startswith("/favicon/"):
+            rel = parsed.path.lstrip("/")
+            # allow root aliases when browsers request these
+            if parsed.path == "/favicon.ico":
+                rel = "favicon/favicon.ico"
+            if parsed.path == "/site.webmanifest":
+                rel = "favicon/site.webmanifest"
+
+            static_path = Path(rel)
+            if not static_path.exists() or not static_path.is_file():
+                self._write(404, b'{"error":"favicon asset not found"}', "application/json")
+                return
+
+            suffix = static_path.suffix.lower()
+            ctype = "application/octet-stream"
+            if suffix == ".png":
+                ctype = "image/png"
+            elif suffix == ".svg":
+                ctype = "image/svg+xml"
+            elif suffix == ".ico":
+                ctype = "image/x-icon"
+            elif suffix == ".webmanifest":
+                ctype = "application/manifest+json"
+
+            self._write(200, static_path.read_bytes(), ctype)
             return
         if parsed.path == "/api/snapshot":
             qs = parse_qs(parsed.query)
@@ -1526,6 +1641,8 @@ def main_loop():
 
     if historical_profile is None:
         historical_profile = build_historical_profile(HISTORY_DIR)
+
+    _load_telemetry_from_file()
 
     used_quote = load_quote_usage()
     (current_condition, sunrise, sunset, clouds,
@@ -1644,11 +1761,10 @@ def main_loop():
                 )
 
                 has_usable_solarman_data = bool((data or {}).get("dataList"))
-                if has_usable_solarman_data:
-                    _record_telemetry(now, data, battery or 0, power or 0, state or "unknown",
-                                      current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
-                else:
-                    print("[Telemetry] Skipping save: no Solarman datapoints available for this cycle.")
+                if not has_usable_solarman_data:
+                    print("[Telemetry] Solarman dataList is empty for this cycle; saving fallback telemetry row.")
+                _record_telemetry(now, data or {}, battery or 0, power or 0, state or "unknown",
+                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
