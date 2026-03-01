@@ -36,5 +36,7 @@ COPY solar.py ./
 COPY wait-for-dns.sh ./
 COPY solarman_json ./solarman_json
 
+EXPOSE 9000
+
 # Entrypoint
 CMD ["python", "solar.py"]

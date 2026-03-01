@@ -23,6 +23,9 @@ services:
       - MY_SOLARMAN_FILE=/app/solarman_data.json
       - WALLET_ADDRESS=${WALLET_ADDRESS}
       - MY_HISTORY_DIR=/app/solarman_json
+      - MY_WEB_PORT=9000
+    ports:
+      - "9000:9000"
     volumes:
       - ./wait-for-dns.sh:/app/wait-for-dns.sh
       - ./state.json:/app/state.json

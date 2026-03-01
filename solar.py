@@ -28,6 +28,7 @@ import subprocess
 # NEW: threading / futures
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # =========================
 # ENV / CONFIG
@@ -85,6 +86,11 @@ _shared_snapshot = {
     "sunrise": datetime.now(tz=budapest_tz), "sunset": datetime.now(tz=budapest_tz),
     "clouds": 0, "garage_temp": 0, "garage_hum": 0
 }
+
+# 6 months @ 5-minute cycle hard cap ≈ 51,840 points
+MAX_HISTORY_POINTS = int(os.getenv("MY_HISTORY_MAX_POINTS", "51840"))
+telemetry_history: deque = deque(maxlen=MAX_HISTORY_POINTS)
+
 
 # Historical profile cache (derived from solarman_json/*.json)
 historical_profile: Optional[Dict[str, Any]] = None
@@ -1174,6 +1180,171 @@ ________________________________
         return None, None, state, sunrise, sunset
 
 
+def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power: float,
+                      state_val: str, current_condition: str, clouds: float,
+                      garage_temp: Optional[float], garage_hum: Optional[float]):
+    dl = data.get("dataList", []) if isinstance(data, dict) else []
+    record = {
+        "ts": now.isoformat(),
+        "battery": float(battery or 0),
+        "power": float(power or 0),
+        "state": state_val or "unknown",
+        "condition": current_condition or "unknown",
+        "clouds": float(clouds or 0),
+        "garage_temp": float(garage_temp or 0),
+        "garage_hum": float(garage_hum or 0),
+        "inv_l1": float(_find_value(dl, "INV_O_P_L1", 0.0)),
+        "inv_l2": float(_find_value(dl, "INV_O_P_L2", 0.0)),
+        "inv_l3": float(_find_value(dl, "INV_O_P_L3", 0.0)),
+        "inv_lt": float(_find_value(dl, "INV_O_P_T", 0.0)),
+        "internal_power": float(_find_value(dl, "GS_T", 0.0)),
+    }
+    telemetry_history.append(record)
+
+
+def _miner_action(action: str) -> Dict[str, Any]:
+    now = datetime.now(tz=budapest_tz).isoformat()
+    duration = 0.55
+    if action == "force_stop":
+        duration = 10
+    if action not in {"start", "stop", "force_stop"}:
+        return {"ok": False, "message": "invalid action", "ts": now}
+
+    if not is_rpi:
+        return {"ok": False, "message": "GPIO unavailable (not Raspberry Pi runtime)", "ts": now}
+
+    try:
+        with gpio_lock:
+            press_power_button(16, duration)
+        return {"ok": True, "message": f"{action} signal sent ({duration}s)", "ts": now}
+    except Exception as err:
+        return {"ok": False, "message": str(err), "ts": now}
+
+
+def _weather_icon(condition: str) -> str:
+    c = (condition or "").lower()
+    if any(k in c for k in ["rain", "drizzle", "storm", "thunder"]):
+        return "fa-cloud-rain"
+    if any(k in c for k in ["snow", "sleet", "blizzard"]):
+        return "fa-snowflake"
+    if any(k in c for k in ["fog", "mist", "haze", "smoke"]):
+        return "fa-smog"
+    if any(k in c for k in ["cloud", "overcast"]):
+        return "fa-cloud"
+    return "fa-sun"
+
+
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Solar Mining Control</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root{--bg:#0b1220;--card:rgba(255,255,255,.08);--txt:#e9eefc;--muted:#9fb0d0;--ok:#47d16c;--warn:#f2b84b;--danger:#ff6b6b}
+[data-theme="light"]{--bg:#eef3ff;--card:rgba(255,255,255,.78);--txt:#111827;--muted:#4b5563}
+body{margin:0;background:linear-gradient(135deg,var(--bg),#1d2a46);color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh}
+.wrap{padding:16px;max-width:1400px;margin:0 auto}.top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px}
+.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.2);border-radius:16px;padding:14px}
+.k{color:var(--muted);font-size:.9rem}.v{font-size:1.6rem;font-weight:700}
+.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:10px;padding:10px 14px;color:white;cursor:pointer}
+.btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}
+.charts{display:grid;grid-template-columns:1fr;gap:12px;margin-top:12px}@media(min-width:980px){.charts{grid-template-columns:1fr 1fr}}
+</style></head>
+<body data-theme="dark"><div class="wrap"><div class="top"><h2><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
+<button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button></div>
+<div class="grid" id="metrics"></div><div class="card"><div class="actions">
+<button class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
+<button class="btn warn" onclick="act('stop')"><i class="fa-solid fa-stop"></i> Stop miner</button>
+<button class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
+</div><div id="actionResult" class="k" style="margin-top:8px"></div></div>
+<div class="charts"><div class="card"><canvas id="powerChart"></canvas></div><div class="card"><canvas id="phaseChart"></canvas></div>
+<div class="card"><canvas id="batteryChart"></canvas></div><div class="card"><canvas id="envChart"></canvas></div></div></div>
+<script>
+let powerChart,phaseChart,batteryChart,envChart;
+const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[{label,borderColor:color,data:[],tension:.25,pointRadius:0}]},options:{responsive:true,animation:false}});
+const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets},options:{responsive:true,animation:false}});
+function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',borderColor:'#60a5fa',data:[],pointRadius:0,tension:.2},{label:'L2',borderColor:'#f59e0b',data:[],pointRadius:0,tension:.2},{label:'L3',borderColor:'#f43f5e',data:[],pointRadius:0,tension:.2}]);batteryChart=mkMulti('batteryChart',[{label:'Battery %',borderColor:'#a78bfa',data:[],pointRadius:0,tension:.2},{label:'Miner ON',borderColor:'#22c55e',data:[],pointRadius:0,tension:.2}]);envChart=mkMulti('envChart',[{label:'Temp °C',borderColor:'#ef4444',data:[],pointRadius:0,tension:.2},{label:'Humidity %',borderColor:'#38bdf8',data:[],pointRadius:0,tension:.2}]);}
+function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});} 
+async function pull(){const r=await fetch('/api/snapshot');const d=await r.json();const icon=d.weather_icon||'fa-sun';
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'>State</div><div class='v'>${d.state}</div></div><div class='card'><div class='k'>Battery</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'>PV</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'>Weather</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'>Clouds</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'>History Points</div><div class='v'>${d.history_count}</div></div>`;
+const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
+powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
+phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
+batteryChart.data.labels=labels; batteryChart.data.datasets[0].data=h.map(x=>x.battery); batteryChart.data.datasets[1].data=h.map(x=>x.state==='production'?100:0); batteryChart.update();
+envChart.data.labels=labels; envChart.data.datasets[0].data=h.map(x=>x.garage_temp); envChart.data.datasets[1].data=h.map(x=>x.garage_hum); envChart.update();}
+async function act(a){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});const d=await r.json();document.getElementById('actionResult').textContent=d.message + ' @ ' + d.ts;}
+init();pull();setInterval(pull,10000);document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};
+</script></body></html>
+"""
+
+
+def _build_snapshot_payload() -> Dict[str, Any]:
+    with snapshot_lock:
+        snap = dict(_shared_snapshot)
+        hist = list(telemetry_history)
+    return {
+        "battery": snap.get("battery", 0),
+        "power": snap.get("power", 0),
+        "state": snap.get("state", "unknown"),
+        "current_condition": snap.get("current_condition", "unknown"),
+        "weather_icon": _weather_icon(snap.get("current_condition", "")),
+        "clouds": snap.get("clouds", 0),
+        "history_count": len(hist),
+        "history": hist[-1728:],
+    }
+
+
+class WebHandler(BaseHTTPRequestHandler):
+    def _write(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ["/", "/index.html"]:
+            self._write(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if self.path == "/api/snapshot":
+            payload = json.dumps(_build_snapshot_payload()).encode("utf-8")
+            self._write(200, payload, "application/json")
+            return
+        self._write(404, b'{"error":"not found"}', "application/json")
+
+    def do_POST(self):
+        if self.path != "/api/action":
+            self._write(404, b'{"error":"not found"}', "application/json")
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            payload = {}
+        action = str(payload.get("action", "")).strip().lower()
+        out = _miner_action(action)
+        code = 200 if out.get("ok") else 400
+        self._write(code, json.dumps(out).encode("utf-8"), "application/json")
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def _start_web_server():
+    host = os.getenv("MY_WEB_HOST", "0.0.0.0")
+    port = int(os.getenv("MY_WEB_PORT", "9000"))
+    print(f"[Web] Starting GUI on http://{host}:{port}")
+    try:
+        server = ThreadingHTTPServer((host, port), WebHandler)
+        server.serve_forever()
+    except Exception as err:
+        print(f"[Web] Server crashed: {err}")
+
+
 # ---------- THREAD RUNNER FOR TELEGRAM ----------
 def _telegram_loop():
     """
@@ -1209,6 +1380,9 @@ def main_loop():
     # START TELEGRAM THREAD ONCE
     t_thread = threading.Thread(target=_telegram_loop, name="telegram-poller", daemon=True)
     t_thread.start()
+
+    web_thread = threading.Thread(target=_start_web_server, name="web-gui", daemon=True)
+    web_thread.start()
 
     garage_temp_history = deque(maxlen=12)
     garage_hum_history = deque(maxlen=12)
@@ -1313,6 +1487,9 @@ def main_loop():
                 f1_cond, f1_clouds, f1_ts, f3_cond, f3_clouds, f3_ts) = check_crypto_production_conditions(
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
+
+                _record_telemetry(now, data, battery or 0, power or 0, state or "unknown",
+                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
