@@ -1,0 +1,2 @@
+python3 -m pip install requests openpyxl
+python3 solarman_copyasfetch_tojson.py --from 2025-05-01 --to 2026-03-01 --dir ./solarman_json
