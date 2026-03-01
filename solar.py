@@ -91,7 +91,19 @@ _shared_snapshot = {
 # 6 months @ 5-minute cycle hard cap ≈ 51,840 points
 MAX_HISTORY_POINTS = int(os.getenv("MY_HISTORY_MAX_POINTS", "51840"))
 telemetry_history: deque = deque(maxlen=MAX_HISTORY_POINTS)
-TELEMETRY_FILE = Path(os.getenv("MY_TELEMETRY_FILE", "telemetry_history.json"))
+
+
+def _resolve_telemetry_file() -> Path:
+    raw = os.getenv("MY_TELEMETRY_FILE", "telemetry_history.json")
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    # Keep default file near script to avoid cwd-dependent path issues.
+    return (Path(__file__).resolve().parent / p).resolve()
+
+
+TELEMETRY_FILE = _resolve_telemetry_file()
+print(f"[Telemetry] Using telemetry store: {TELEMETRY_FILE}")
 
 
 # Historical profile cache (derived from solarman_json/*.json)
@@ -1184,26 +1196,49 @@ ________________________________
 
 def _load_telemetry_from_file() -> int:
     """Load persisted telemetry points into in-memory deque at startup."""
+    candidates = [TELEMETRY_FILE]
+
+    # Backward compatibility: previous versions may have written to cwd/telemetry_history.json
+    legacy_cwd_file = (Path.cwd() / "telemetry_history.json").resolve()
+    if legacy_cwd_file not in candidates:
+        candidates.append(legacy_cwd_file)
+
+    loaded_total = 0
+    seen_ts = set()
+
     try:
-        if not TELEMETRY_FILE.exists():
-            print(f"[Telemetry] No telemetry file found at {TELEMETRY_FILE}.")
-            return 0
+        telemetry_history.clear()
 
-        with TELEMETRY_FILE.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
+        for fp in candidates:
+            if not fp.exists():
+                continue
+            try:
+                with fp.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception as err:
+                print(f"[Telemetry] Failed reading {fp}: {err}")
+                continue
 
-        if not isinstance(payload, list):
-            print("[Telemetry] Telemetry file is not a list. Ignoring persisted data.")
-            return 0
+            if not isinstance(payload, list):
+                print(f"[Telemetry] Ignoring non-list telemetry payload in {fp}.")
+                continue
 
-        loaded = 0
-        for item in payload[-MAX_HISTORY_POINTS:]:
-            if isinstance(item, dict) and item.get("ts"):
+            for item in payload[-MAX_HISTORY_POINTS:]:
+                if not isinstance(item, dict):
+                    continue
+                ts = str(item.get("ts", "")).strip()
+                if not ts or ts in seen_ts:
+                    continue
                 telemetry_history.append(item)
-                loaded += 1
+                seen_ts.add(ts)
+                loaded_total += 1
 
-        print(f"[Telemetry] Loaded {loaded} history points from {TELEMETRY_FILE}.")
-        return loaded
+        sorted_hist = sorted(list(telemetry_history), key=lambda x: str(x.get("ts", "")))
+        telemetry_history.clear()
+        telemetry_history.extend(sorted_hist[-MAX_HISTORY_POINTS:])
+
+        print(f"[Telemetry] Loaded {len(telemetry_history)} points (raw read: {loaded_total}) from: {', '.join(str(x) for x in candidates)}")
+        return len(telemetry_history)
     except Exception as err:
         print(f"[Telemetry] Failed loading telemetry history: {err}")
         return 0
@@ -1249,8 +1284,11 @@ def _append_telemetry_to_file(record: Dict[str, Any]) -> None:
         existing.append(record)
         if len(existing) > MAX_HISTORY_POINTS:
             existing = existing[-MAX_HISTORY_POINTS:]
-        with TELEMETRY_FILE.open("w", encoding="utf-8") as fh:
+
+        tmp_file = TELEMETRY_FILE.with_suffix(TELEMETRY_FILE.suffix + ".tmp")
+        with tmp_file.open("w", encoding="utf-8") as fh:
             json.dump(existing, fh, ensure_ascii=False)
+        tmp_file.replace(TELEMETRY_FILE)
     except Exception as err:
         print(f"[Telemetry] Failed to persist record: {err}")
 
@@ -1292,6 +1330,8 @@ DASHBOARD_HTML = """
 <html lang="en"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Solar Mining Control</title>
+<link rel="icon" type="image/png" href="/solarmining_logo.png" />
+<link rel="apple-touch-icon" href="/solarmining_logo.png" />
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
@@ -1505,6 +1545,34 @@ class WebHandler(BaseHTTPRequestHandler):
                 return
             self._write(200, logo_path.read_bytes(), "image/png")
             return
+
+        # Dedicated favicon pack support (GitHub-uploaded /favicon/* assets)
+        if parsed.path in {"/favicon.ico", "/site.webmanifest"} or parsed.path.startswith("/favicon/"):
+            rel = parsed.path.lstrip("/")
+            # allow root aliases when browsers request these
+            if parsed.path == "/favicon.ico":
+                rel = "favicon/favicon.ico"
+            if parsed.path == "/site.webmanifest":
+                rel = "favicon/site.webmanifest"
+
+            static_path = Path(rel)
+            if not static_path.exists() or not static_path.is_file():
+                self._write(404, b'{"error":"favicon asset not found"}', "application/json")
+                return
+
+            suffix = static_path.suffix.lower()
+            ctype = "application/octet-stream"
+            if suffix == ".png":
+                ctype = "image/png"
+            elif suffix == ".svg":
+                ctype = "image/svg+xml"
+            elif suffix == ".ico":
+                ctype = "image/x-icon"
+            elif suffix == ".webmanifest":
+                ctype = "application/manifest+json"
+
+            self._write(200, static_path.read_bytes(), ctype)
+            return
         if parsed.path == "/api/snapshot":
             qs = parse_qs(parsed.query)
             payload = json.dumps(
@@ -1693,11 +1761,10 @@ def main_loop():
                 )
 
                 has_usable_solarman_data = bool((data or {}).get("dataList"))
-                if has_usable_solarman_data:
-                    _record_telemetry(now, data, battery or 0, power or 0, state or "unknown",
-                                      current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
-                else:
-                    print("[Telemetry] Skipping save: no Solarman datapoints available for this cycle.")
+                if not has_usable_solarman_data:
+                    print("[Telemetry] Solarman dataList is empty for this cycle; saving fallback telemetry row.")
+                _record_telemetry(now, data or {}, battery or 0, power or 0, state or "unknown",
+                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
