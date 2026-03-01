@@ -1270,15 +1270,18 @@ DASHBOARD_HTML = """
 [data-theme="light"]{--bg:#eef3ff;--bg2:#d9e8ff;--card:rgba(255,255,255,.85);--txt:#111827;--muted:#4b5563;--input:#ffffff;--border:rgba(17,24,39,.15)}
 *{box-sizing:border-box}
 body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
-.wrap{padding:18px;max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
-.logo-wrap{display:flex;justify-content:center;padding-top:4px}
-.logo{max-width:min(360px,80vw);height:auto;filter:drop-shadow(0 10px 25px rgba(0,0,0,.35));}
+.wrap{padding:10px 18px 16px;max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
+.logo-wrap{display:flex;justify-content:center;padding-top:0;margin-bottom:0}
+.logo{max-width:min(300px,72vw);height:auto;filter:drop-shadow(0 8px 18px rgba(0,0,0,.28));}
 .top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 .title{display:flex;align-items:center;gap:10px;margin:0;font-size:clamp(1.35rem,2.3vw,2rem)}
 .panel{background:var(--card);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:16px;padding:14px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.grid{display:grid;gap:12px}
+.metrics-grid{grid-template-columns:repeat(8,minmax(120px,1fr));gap:10px}
+@media(max-width:1280px){.metrics-grid{grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px}}
+@media(max-width:760px){.metrics-grid{grid-template-columns:repeat(2,minmax(150px,1fr));gap:10px}}
 .card{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:14px;padding:14px;min-width:0}
-.k{color:var(--muted);font-size:.9rem;margin-bottom:6px;display:flex;align-items:center;gap:8px}.v{font-size:1.65rem;font-weight:700;line-height:1.2;word-break:break-word}
+.k{color:var(--muted);font-size:.88rem;margin-bottom:6px;display:flex;align-items:center;gap:8px}.v{font-size:clamp(1.08rem,1.25vw,1.35rem);font-weight:700;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .k i{opacity:.95}
 .chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)}
 .chart-title{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8px}
@@ -1289,36 +1292,79 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 .field label{font-size:.82rem;color:var(--muted)}
 .field input,.btn{border-radius:10px;border:1px solid var(--border);padding:10px 12px;font-size:.95rem}
 .field input{background:var(--input);color:var(--txt)}
+input[type="date"]{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.03));border:1px solid var(--border);box-shadow:inset 0 1px 0 rgba(255,255,255,.08);font-weight:600;letter-spacing:.02em}
+input[type="date"]:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25)}
+input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8%) saturate(321%) hue-rotate(178deg) brightness(102%) contrast(96%);cursor:pointer}
 .actions{display:flex;gap:8px;flex-wrap:wrap}
 .btn{color:#fff;cursor:pointer;background:transparent}
 .btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}.btn.ghost{background:transparent;color:var(--txt)}
 .charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.chart-card{height:340px}
-.chart-card canvas{width:100% !important;height:100% !important}
+.chart-card{height:360px;display:flex;flex-direction:column;overflow:hidden}
+.chart-card canvas{width:100% !important;flex:1 1 auto;min-height:0}
 @media(max-width:1100px){.charts{grid-template-columns:1fr}}
-@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:300px}}
+@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:320px}}
 </style></head>
 <body data-theme="dark"><div class="wrap">
 <div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
-<div class="top"><h2 class="title"><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
-<button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button></div>
-<div class="grid" id="metrics"></div>
+<div class="top"><h2 id="dashTitle" class="title"><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
+<div class="actions"><button id="lang" class="btn ghost"><i class="fa-solid fa-language"></i> HU</button><button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button></div></div>
+<div class="grid metrics-grid" id="metrics"></div>
 <div class="panel toolbar"><div class="filters">
-<div class="field"><label for="fromDate">From</label><input id="fromDate" type="date" /></div>
-<div class="field"><label for="toDate">To</label><input id="toDate" type="date" /></div>
+<div class="field"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="date" /></div>
+<div class="field"><label id="lblTo" for="toDate">To</label><input id="toDate" type="date" /></div>
 <div class="actions"><button class="btn ghost" id="resetRange"><i class="fa-solid fa-rotate-left"></i> Last 30 days</button><button class="btn ok" id="applyRange"><i class="fa-solid fa-filter"></i> Apply range</button></div>
 </div><div class="actions">
-<button class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
-<button class="btn warn" onclick="act('stop')"><i class="fa-solid fa-stop"></i> Stop miner</button>
-<button class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
+<button id="btnStart" class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
+<button id="btnStop" class="btn warn" onclick="act('stop')"><i class="fa-solid fa-stop"></i> Stop miner</button>
+<button id="btnForce" class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
 </div></div>
 <div id="actionResult" class="k"></div>
-<div class="charts"><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
-<div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Miner</div><div class="chart-sub">SOC and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div></div></div>
+<div class="charts"><div class="card chart-card"><div class="chart-head"><div id="chPower" class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div id="chPowerSub" class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chPhase" class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div id="chPhaseSub" class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
+<div class="card chart-card"><div class="chart-head"><div id="chBattery" class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Miner</div><div id="chBatterySub" class="chart-sub">SOC and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chEnv" class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div id="chEnvSub" class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div></div></div>
 <script>
 let powerChart,phaseChart,batteryChart,envChart;
 const defaultLastDays=30;
 let currentRange={from:null,to:null};
+let currentLang='en';
+const I18N={
+  en:{title:'Solar Mining Dashboard',theme:'Theme',from:'From',to:'To',last30:'Last 30 days',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',
+      state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
+      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Miner',chBatterySub:'SOC and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Battery %',dsMiner:'Miner ON',dsTemp:'Temp °C',dsHum:'Humidity %',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
+  hu:{title:'Solar Bányászat Dashboard',theme:'Téma',from:'Tól',to:'Ig',last30:'Utolsó 30 nap',apply:'Szűrés',start:'Miner indítása',stop:'Miner leállítása',force:'Kényszer leállítás',
+      state:'Állapot',battery:'Aksi',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzmény pontok',
+      chPower:'PV termelés',chPowerSub:'Watt trend',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Aksi és Miner',chBatterySub:'SOC és állapot',chEnv:'Garázs környezet',chEnvSub:'Hőmérséklet / Páratartalom',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Aksi %',dsMiner:'Miner BE',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
+};
+const t=(k)=>I18N[currentLang][k]||k;
+function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
+function applyChartI18n(){
+  if(!powerChart||!phaseChart||!batteryChart||!envChart)return;
+  powerChart.data.datasets[0].label=t('dsPv');
+  phaseChart.data.datasets[0].label=t('dsL1'); phaseChart.data.datasets[1].label=t('dsL2'); phaseChart.data.datasets[2].label=t('dsL3');
+  batteryChart.data.datasets[0].label=t('dsBatt'); batteryChart.data.datasets[1].label=t('dsMiner');
+  envChart.data.datasets[0].label=t('dsTemp'); envChart.data.datasets[1].label=t('dsHum');
+  powerChart.update('none'); phaseChart.update('none'); batteryChart.update('none'); envChart.update('none');
+}
+function applyI18n(){
+  document.getElementById('dashTitle').innerHTML=`<i class="fa-solid fa-solar-panel"></i> ${t('title')}`;
+  document.getElementById('theme').innerHTML=`<i class="fa-solid fa-circle-half-stroke"></i> ${t('theme')}`;
+  document.getElementById('lang').innerHTML=`<i class="fa-solid fa-language"></i> ${t('langBtn')}`;
+  document.getElementById('lblFrom').textContent=t('from');
+  document.getElementById('lblTo').textContent=t('to');
+  document.getElementById('resetRange').innerHTML=`<i class="fa-solid fa-rotate-left"></i> ${t('last30')}`;
+  document.getElementById('applyRange').innerHTML=`<i class="fa-solid fa-filter"></i> ${t('apply')}`;
+  document.getElementById('btnStart').innerHTML=`<i class="fa-solid fa-play"></i> ${t('start')}`;
+  document.getElementById('btnStop').innerHTML=`<i class="fa-solid fa-stop"></i> ${t('stop')}`;
+  document.getElementById('btnForce').innerHTML=`<i class="fa-solid fa-power-off"></i> ${t('force')}`;
+  document.getElementById('chPower').innerHTML=`<i class="fa-solid fa-solar-panel"></i> ${t('chPower')}`;
+  document.getElementById('chPowerSub').textContent=t('chPowerSub');
+  document.getElementById('chPhase').innerHTML=`<i class="fa-solid fa-bolt"></i> ${t('chPhase')}`;
+  document.getElementById('chPhaseSub').textContent=t('chPhaseSub');
+  document.getElementById('chBattery').innerHTML=`<i class="fa-solid fa-battery-three-quarters"></i> ${t('chBattery')}`;
+  document.getElementById('chBatterySub').textContent=t('chBatterySub');
+  document.getElementById('chEnv').innerHTML=`<i class="fa-solid fa-temperature-half"></i> ${t('chEnv')}`;
+  document.getElementById('chEnvSub').textContent=t('chEnvSub');
+  applyChartI18n();
+}
 const chartOpts={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'nearest',intersect:false,axis:'x'},plugins:{tooltip:{enabled:true,displayColors:false,backgroundColor:'rgba(14,23,41,.92)',titleColor:'#e9eefc',bodyColor:'#e9eefc',padding:12,cornerRadius:12,caretPadding:8,borderColor:'rgba(255,255,255,.2)',borderWidth:1,callbacks:{label:(ctx)=>`${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(2)}`}}},scales:{x:{ticks:{maxRotation:0}},y:{beginAtZero:false}}};
 const styledSet=(label,color,tension=.2)=>({label,borderColor:color,backgroundColor:color,data:[],pointRadius:0,pointHoverRadius:5,pointHoverBorderWidth:2,pointHoverBackgroundColor:'#ffffff',pointHoverBorderColor:color,pointHitRadius:14,borderWidth:2,tension});
 const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[styledSet(label,color,.25)]},options:chartOpts});
@@ -1328,7 +1374,8 @@ function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'
 function formatDate(d){return d.toISOString().slice(0,10)}
 function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> State</div><div class='v'>${d.state}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> Battery</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> PV Power</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> Weather</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> Clouds</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> History Points</div><div class='v'>${d.history_count}</div></div>`;
+const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${d.current_condition}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
 powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
 phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
@@ -1337,7 +1384,7 @@ envChart.data.labels=labels; envChart.data.datasets[0].data=h.map(x=>x.garage_te
 async function act(a){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});const d=await r.json();document.getElementById('actionResult').textContent=d.message + ' @ ' + d.ts;}
 document.getElementById('applyRange').onclick=()=>{currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};pull();};
 document.getElementById('resetRange').onclick=()=>{setDefaultRange();pull();};
-init();pull();setInterval(pull,10000);document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};
+init();applyI18n();pull();setInterval(pull,10000);document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};document.getElementById('lang').onclick=()=>{currentLang=currentLang==='en'?'hu':'en';applyI18n();pull();};
 </script></body></html>
 """
 
@@ -1383,6 +1430,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "current_condition": snap.get("current_condition", "unknown"),
         "weather_icon": _weather_icon(snap.get("current_condition", "")),
         "clouds": snap.get("clouds", 0),
+        "sunrise": snap.get("sunrise").isoformat() if snap.get("sunrise") else "",
+        "sunset": snap.get("sunset").isoformat() if snap.get("sunset") else "",
         "history_count": len(filtered_hist),
         "history": filtered_hist,
     }
