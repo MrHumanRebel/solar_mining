@@ -736,39 +736,41 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         )
 
         month_quality = str(hints.get("month_quality", "neutral"))
-        mq_hu = {"strong": "erős", "weak": "gyenge", "neutral": "semleges"}.get(month_quality, month_quality)
+        month_quality_label = {"strong": "Strong", "weak": "Weak", "neutral": "Neutral"}.get(month_quality, month_quality)
+        preserve_battery_label = "Yes" if hints.get("should_preserve_battery", False) else "No"
+        headroom_good_label = "Yes" if hints.get("headroom_good", False) else "No"
 
         message = (
             f"⚡️ Solar Mining — NOW\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"🔋 Energetika / Energy\n"
-            f"• Battery / Töltöttség: {battery}%\n"
-            f"• Power / Teljesítmény: {power}W\n"
-            f"• State / Állapot: {state}\n"
-            f"• Condition / Időjárás: {current_condition}\n"
-            f"• Clouds / Felhőzet: {clouds}%\n"
-            f"• Sunrise / Napkelte: {sunrise.strftime('%H:%M')}\n"
-            f"• Sunset / Napnyugta: {sunset.strftime('%H:%M')}\n\n"
-            f"🏠 Környezet / Environment\n"
-            f"• Garage Temp / Garázs hőm.: {garage_temp}C\n"
-            f"• Garage Hum / Garázs pára: {garage_hum}%\n\n"
-            f"⚡ Inverter fázisok / Inverter phases\n"
+            f"🔋 Energy\n"
+            f"• Battery: {battery}%\n"
+            f"• Power: {power}W\n"
+            f"• State: {state}\n"
+            f"• Weather: {current_condition}\n"
+            f"• Clouds: {clouds}%\n"
+            f"• Sunrise: {sunrise.strftime('%H:%M')}\n"
+            f"• Sunset: {sunset.strftime('%H:%M')}\n\n"
+            f"🏠 Environment\n"
+            f"• Garage temperature: {garage_temp}C\n"
+            f"• Garage humidity: {garage_hum}%\n\n"
+            f"⚡ Inverter phases\n"
             f"• L1: {l1_str}\n"
             f"• L2: {l2_str}\n"
             f"• L3: {l3_str}\n"
-            f"• Total / Összesen: {lt_str}\n\n"
-            f"🧠 Historikus döntési hint-ek / Historical decision hints\n"
-            f"• month_quality: {month_quality} ({mq_hu})\n"
-            f"• early_start_soc: {hints.get('early_start_soc', 'N/A')}%\n"
-            f"• min_stop_soc: {hints.get('min_stop_soc', 'N/A')}%\n"
-            f"• late_day_reserve_soc: {hints.get('late_day_reserve_soc', 'N/A')}%\n"
-            f"• should_preserve_battery: {hints.get('should_preserve_battery', False)}\n"
-            f"• headroom_good: {hints.get('headroom_good', False)}\n\n"
-            f"🖥️ Rendszer / System\n"
+            f"• Total: {lt_str}\n\n"
+            f"🧠 Historical decision hints\n"
+            f"• Month quality: {month_quality_label}\n"
+            f"• Early start SOC: {hints.get('early_start_soc', 'N/A')}%\n"
+            f"• Minimum stop SOC: {hints.get('min_stop_soc', 'N/A')}%\n"
+            f"• Late-day reserve SOC: {hints.get('late_day_reserve_soc', 'N/A')}%\n"
+            f"• Preserve battery: {preserve_battery_label}\n"
+            f"• Headroom good: {headroom_good_label}\n\n"
+            f"🖥️ System\n"
             f"• IP: {ip}\n"
-            f"• RAM Usage: {ram}\n"
-            f"• CPU Usage: {cpu}\n"
-            f"• CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
+            f"• RAM usage: {ram}\n"
+            f"• CPU usage: {cpu}\n"
+            f"• CPU temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
             f"• Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)"
         )
         send_telegram_message(message)
@@ -1469,10 +1471,10 @@ let currentLang='en';
 const I18N={
   en:{title:'Solar Mining Dashboard',theme:'Theme',from:'From',to:'To',last30:'Last 30 days',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',
       state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
-      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
-  hu:{title:'Solar Bányászat Dashboard',theme:'Téma',from:'Tól',to:'Ig',last30:'Utolsó 30 nap',apply:'Szűrés',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszer leállítás',
-      state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzmény pontok',
-      chPower:'PV termelés',chPowerSub:'Watt trend',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Töltöttség és Bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázs környezet',chEnvSub:'Hőmérséklet / Páratartalom',chHistSoc:'Historikus SOC küszöbök',chHistSocSub:'Dinamikus SOC logika időben',chHistFlags:'Historikus döntési jelzők',chHistFlagsSub:'Akkumulátor védelem / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum stop SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátor kímélés',headroomGood:'Elég tartalék teljesítmény',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép BE',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
+      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
+  hu:{title:'Solar Bányászat Dashboard',theme:'Téma',from:'Ettől',to:'Eddig',last30:'Utolsó 30 nap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',
+      state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
+      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
 const t=(k)=>I18N[currentLang][k]||k;
 function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
@@ -1495,7 +1497,9 @@ function applyChartI18n(){
   phaseChart.data.datasets[0].label=t('dsL1'); phaseChart.data.datasets[1].label=t('dsL2'); phaseChart.data.datasets[2].label=t('dsL3');
   batteryChart.data.datasets[0].label=t('dsBatt'); batteryChart.data.datasets[1].label=t('dsMiner');
   envChart.data.datasets[0].label=t('dsTemp'); envChart.data.datasets[1].label=t('dsHum');
-  powerChart.update('none'); phaseChart.update('none'); batteryChart.update('none'); envChart.update('none');
+  histSocChart.data.datasets[0].label=t('dsHistEarly'); histSocChart.data.datasets[1].label=t('dsHistMinStop'); histSocChart.data.datasets[2].label=t('dsHistLate');
+  histFlagsChart.data.datasets[0].label=t('dsFlagPreserve'); histFlagsChart.data.datasets[1].label=t('dsFlagHeadroom'); histFlagsChart.data.datasets[2].label=t('dsFlagMonth');
+  powerChart.update('none'); phaseChart.update('none'); batteryChart.update('none'); envChart.update('none'); histSocChart.update('none'); histFlagsChart.update('none');
 }
 function applyI18n(){
   document.getElementById('dashTitle').innerHTML=`<i class="fa-solid fa-solar-panel"></i> ${t('title')}`;
@@ -1526,7 +1530,7 @@ const chartOpts={responsive:true,maintainAspectRatio:false,animation:false,inter
 const styledSet=(label,color,tension=.2)=>({label,borderColor:color,backgroundColor:color,data:[],pointRadius:0,pointHoverRadius:5,pointHoverBorderWidth:2,pointHoverBackgroundColor:'#ffffff',pointHoverBorderColor:color,pointHitRadius:14,borderWidth:2,tension});
 const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[styledSet(label,color,.25)]},options:chartOpts});
 const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets.map(s=>styledSet(s.label,s.color,s.tension??.2))},options:chartOpts});
-function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Charge %',color:'#a78bfa'},{label:'Mining Rig ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);histSocChart=mkMulti('histSocChart',[{label:'Early start SOC %',color:'#22d3ee'},{label:'Min stop SOC %',color:'#f59e0b'},{label:'Late reserve SOC %',color:'#a78bfa'}]);histFlagsChart=mkMulti('histFlagsChart',[{label:'Preserve battery',color:'#ef4444'},{label:'Headroom good',color:'#22c55e'},{label:'Month quality score',color:'#60a5fa'}]);setDefaultRange();}
+function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Charge %',color:'#a78bfa'},{label:'Mining Rig ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);histSocChart=mkMulti('histSocChart',[{label:t('dsHistEarly'),color:'#22d3ee'},{label:t('dsHistMinStop'),color:'#f59e0b'},{label:t('dsHistLate'),color:'#a78bfa'}]);histFlagsChart=mkMulti('histFlagsChart',[{label:t('dsFlagPreserve'),color:'#ef4444'},{label:t('dsFlagHeadroom'),color:'#22c55e'},{label:t('dsFlagMonth'),color:'#60a5fa'}]);setDefaultRange();}
 function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});} 
 function formatDate(d){return d.toISOString().slice(0,10)}
 function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
