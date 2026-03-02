@@ -85,7 +85,15 @@ snapshot_lock = threading.Lock()
 _shared_snapshot = {
     "battery": 0, "power": 0, "state": "init", "current_condition": "unknown",
     "sunrise": datetime.now(tz=budapest_tz), "sunset": datetime.now(tz=budapest_tz),
-    "clouds": 0, "garage_temp": 0, "garage_hum": 0
+    "clouds": 0, "garage_temp": 0, "garage_hum": 0,
+    "historical_hints": {
+        "month_quality": "neutral",
+        "early_start_soc": 55,
+        "min_stop_soc": 20,
+        "late_day_reserve_soc": 80,
+        "should_preserve_battery": False,
+        "headroom_good": False,
+    },
 }
 
 # 6 months @ 5-minute cycle hard cap ≈ 51,840 points
@@ -663,7 +671,7 @@ def send_telegram_message(message, max_retries=15, keyboard=True):
             else:
                 print("All retry attempts failed.")
 
-def handle_telegram_messages(battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum):
+def handle_telegram_messages(battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum, historical_hints=None):
     """
     Poll Telegram updates and process commands.
     Long polling reduces request count and improves responsiveness.
@@ -684,11 +692,11 @@ def handle_telegram_messages(battery, power, state, current_condition, sunrise, 
             msg = update.get('message', {})
             text = msg.get('text')
             if text:
-                process_message(text, battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum)
+                process_message(text, battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum, historical_hints)
     except requests.exceptions.RequestException as e:
         print(f"Error while handling Telegram messages: {e}")
 
-def process_message(message_text, battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum):
+def process_message(message_text, battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum, historical_hints=None):
     global used_quote
     if message_text == "/now":
         ip = get_ip_address()
@@ -718,26 +726,50 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         l3_str = f"{l3} {unit}" if isinstance(l3, (int, float)) else "N/A"
         lt_str = f"{lt} {unit}" if isinstance(lt, (int, float)) else "N/A"
 
+        now_dt = datetime.now(tz=budapest_tz)
+        hints = historical_hints if isinstance(historical_hints, dict) and historical_hints else _history_recommendation(
+            now_dt,
+            _safe_float(battery, 0.0),
+            _safe_float(power, 0.0),
+            sunrise if isinstance(sunrise, datetime) else now_dt,
+            sunset if isinstance(sunset, datetime) else now_dt,
+        )
+
+        month_quality = str(hints.get("month_quality", "neutral"))
+        mq_hu = {"strong": "erős", "weak": "gyenge", "neutral": "semleges"}.get(month_quality, month_quality)
+
         message = (
-            f"Battery: {battery}%\n"
-            f"Power: {power}W\n"
-            f"State: {state}\n"
-            f"Condition: {current_condition}\n"
-            f"Sunrise: {sunrise.strftime('%H:%M')}\n"
-            f"Sunset: {sunset.strftime('%H:%M')}\n"
-            f"Clouds: {clouds}%\n"
-            f"Garage Temp: {garage_temp}C\n"
-            f"Garage Humidity: {garage_hum}%"
-            f"\nInverter Output (per phase):\n"
-            f"  L1: {l1_str}\n"
-            f"  L2: {l2_str}\n"
-            f"  L3: {l3_str}\n"
-            f"  Total: {lt_str}\n"
-            f"IP: {ip}\n"
-            f"RAM Usage: {ram}\n"
-            f"CPU Usage: {cpu}\n"
-            f"CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
-            f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)"
+            f"⚡️ Solar Mining — NOW\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🔋 Energetika / Energy\n"
+            f"• Battery / Töltöttség: {battery}%\n"
+            f"• Power / Teljesítmény: {power}W\n"
+            f"• State / Állapot: {state}\n"
+            f"• Condition / Időjárás: {current_condition}\n"
+            f"• Clouds / Felhőzet: {clouds}%\n"
+            f"• Sunrise / Napkelte: {sunrise.strftime('%H:%M')}\n"
+            f"• Sunset / Napnyugta: {sunset.strftime('%H:%M')}\n\n"
+            f"🏠 Környezet / Environment\n"
+            f"• Garage Temp / Garázs hőm.: {garage_temp}C\n"
+            f"• Garage Hum / Garázs pára: {garage_hum}%\n\n"
+            f"⚡ Inverter fázisok / Inverter phases\n"
+            f"• L1: {l1_str}\n"
+            f"• L2: {l2_str}\n"
+            f"• L3: {l3_str}\n"
+            f"• Total / Összesen: {lt_str}\n\n"
+            f"🧠 Historikus döntési hint-ek / Historical decision hints\n"
+            f"• month_quality: {month_quality} ({mq_hu})\n"
+            f"• early_start_soc: {hints.get('early_start_soc', 'N/A')}%\n"
+            f"• min_stop_soc: {hints.get('min_stop_soc', 'N/A')}%\n"
+            f"• late_day_reserve_soc: {hints.get('late_day_reserve_soc', 'N/A')}%\n"
+            f"• should_preserve_battery: {hints.get('should_preserve_battery', False)}\n"
+            f"• headroom_good: {hints.get('headroom_good', False)}\n\n"
+            f"🖥️ Rendszer / System\n"
+            f"• IP: {ip}\n"
+            f"• RAM Usage: {ram}\n"
+            f"• CPU Usage: {cpu}\n"
+            f"• CPU Temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
+            f"• Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)"
         )
         send_telegram_message(message)
 
@@ -1099,7 +1131,7 @@ ________________________________
                 )
             return (battery_charge, current_power, state, current_condition, sunrise, sunset, clouds,
                     f1_cond, f1_clouds, f1_ts,
-                    f3_cond, f3_clouds, f3_ts)
+                    f3_cond, f3_clouds, f3_ts, hist)
 
         # ===== existing logic continues below =====
         if ((prev_state == "production" and battery_charge < hist["min_stop_soc"]) or
@@ -1187,7 +1219,7 @@ ________________________________
 
         return (battery_charge, current_power, state, current_condition, sunrise, sunset, clouds,
                 f1_cond, f1_clouds, f1_ts,
-                f3_cond, f3_clouds, f3_ts)
+                f3_cond, f3_clouds, f3_ts, hist)
 
     except Exception as e:
         print(f"Error while checking production conditions: {e}")
@@ -1246,7 +1278,13 @@ def _load_telemetry_from_file() -> int:
 
 def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power: float,
                       state_val: str, current_condition: str, clouds: float,
-                      garage_temp: Optional[float], garage_hum: Optional[float]):
+                      garage_temp: Optional[float], garage_hum: Optional[float],
+                      historical_hints: Optional[Dict[str, Any]] = None,
+                      sunrise_dt: Optional[datetime] = None, sunset_dt: Optional[datetime] = None):
+    if not _is_active_window(now, sunrise_dt, sunset_dt):
+        print("[Telemetry] Skipping idle-period telemetry persist (outside active sunrise/sunset window).")
+        return
+
     dl = data.get("dataList", []) if isinstance(data, dict) else []
     record = {
         "ts": now.isoformat(),
@@ -1262,9 +1300,32 @@ def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power
         "inv_l3": float(_find_value(dl, "INV_O_P_L3", 0.0)),
         "inv_lt": float(_find_value(dl, "INV_O_P_T", 0.0)),
         "internal_power": float(_find_value(dl, "GS_T", 0.0)),
+        "month_quality": str((historical_hints or {}).get("month_quality", "neutral")),
+        "early_start_soc": float((historical_hints or {}).get("early_start_soc", 55)),
+        "min_stop_soc": float((historical_hints or {}).get("min_stop_soc", 20)),
+        "late_day_reserve_soc": float((historical_hints or {}).get("late_day_reserve_soc", 80)),
+        "should_preserve_battery": bool((historical_hints or {}).get("should_preserve_battery", False)),
+        "headroom_good": bool((historical_hints or {}).get("headroom_good", False)),
     }
     telemetry_history.append(record)
     _append_telemetry_to_file(record)
+
+
+def _is_active_window(now: datetime, sunrise_dt: Optional[datetime], sunset_dt: Optional[datetime]) -> bool:
+    """Return True when current time is within the sunrise/sunset window."""
+    if not isinstance(now, datetime):
+        return False
+    if not isinstance(sunrise_dt, datetime) or not isinstance(sunset_dt, datetime):
+        return False
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=budapest_tz)
+    if sunrise_dt.tzinfo is None:
+        sunrise_dt = sunrise_dt.replace(tzinfo=budapest_tz)
+    if sunset_dt.tzinfo is None:
+        sunset_dt = sunset_dt.replace(tzinfo=budapest_tz)
+
+    return (sunrise_dt.hour, sunrise_dt.minute) <= (now.hour, now.minute) <= (sunset_dt.hour, sunset_dt.minute)
 
 
 def _append_telemetry_to_file(record: Dict[str, Any]) -> None:
@@ -1373,8 +1434,14 @@ input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8
 .charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .chart-card{height:360px;display:flex;flex-direction:column;overflow:hidden}
 .chart-card canvas{width:100% !important;flex:1 1 auto;min-height:0}
-@media(max-width:1100px){.charts{grid-template-columns:1fr}}
-@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:320px}}
+.hints-panel{padding:16px}
+.hints-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.hint-card{background:linear-gradient(165deg,rgba(99,102,241,.18),rgba(14,165,233,.12));border:1px solid var(--border);border-radius:16px;padding:14px;box-shadow:0 12px 26px rgba(2,6,23,.2);min-height:112px}
+.hint-title{font-size:.8rem;color:var(--muted);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.hint-value{font-size:1.15rem;font-weight:800;line-height:1.2}
+.hint-sub{margin-top:6px;color:var(--muted);font-size:.8rem}
+@media(max-width:1100px){.charts{grid-template-columns:1fr}.hints-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:320px}.hints-grid{grid-template-columns:1fr}}
 </style></head>
 <body data-theme="dark"><div class="wrap">
 <div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
@@ -1391,20 +1458,21 @@ input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8
 <button id="btnForce" class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
 </div></div>
 <div id="actionResult" class="k"></div>
+<div class="panel hints-panel"><div class="hints-grid" id="historyHints"></div></div>
 <div class="charts"><div class="card chart-card"><div class="chart-head"><div id="chPower" class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div id="chPowerSub" class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chPhase" class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div id="chPhaseSub" class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
-<div class="card chart-card"><div class="chart-head"><div id="chBattery" class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Mining Rig</div><div id="chBatterySub" class="chart-sub">Charge level and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chEnv" class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div id="chEnvSub" class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div></div></div>
+<div class="card chart-card"><div class="chart-head"><div id="chBattery" class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Mining Rig</div><div id="chBatterySub" class="chart-sub">Charge level and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chEnv" class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div id="chEnvSub" class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chHistSoc" class="chart-title"><i class="fa-solid fa-layer-group"></i> Historical SOC Thresholds</div><div id="chHistSocSub" class="chart-sub">Dynamic SOC logic over time</div></div><canvas id="histSocChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chHistFlags" class="chart-title"><i class="fa-solid fa-chart-line"></i> Historical Decision Flags</div><div id="chHistFlagsSub" class="chart-sub">Battery preserve / headroom / month quality</div></div><canvas id="histFlagsChart"></canvas></div></div></div>
 <script>
-let powerChart,phaseChart,batteryChart,envChart;
+let powerChart,phaseChart,batteryChart,envChart,histSocChart,histFlagsChart;
 const defaultLastDays=30;
 let currentRange={from:null,to:null};
 let currentLang='en';
 const I18N={
   en:{title:'Solar Mining Dashboard',theme:'Theme',from:'From',to:'To',last30:'Last 30 days',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',
       state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
-      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
+      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
   hu:{title:'Solar Bányászat Dashboard',theme:'Téma',from:'Tól',to:'Ig',last30:'Utolsó 30 nap',apply:'Szűrés',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszer leállítás',
       state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzmény pontok',
-      chPower:'PV termelés',chPowerSub:'Watt trend',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Töltöttség és Bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázs környezet',chEnvSub:'Hőmérséklet / Páratartalom',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép BE',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
+      chPower:'PV termelés',chPowerSub:'Watt trend',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Töltöttség és Bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázs környezet',chEnvSub:'Hőmérséklet / Páratartalom',chHistSoc:'Historikus SOC küszöbök',chHistSocSub:'Dinamikus SOC logika időben',chHistFlags:'Historikus döntési jelzők',chHistFlagsSub:'Akkumulátor védelem / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum stop SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátor kímélés',headroomGood:'Elég tartalék teljesítmény',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép BE',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
 const t=(k)=>I18N[currentLang][k]||k;
 function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
@@ -1448,13 +1516,17 @@ function applyI18n(){
   document.getElementById('chBatterySub').textContent=t('chBatterySub');
   document.getElementById('chEnv').innerHTML=`<i class="fa-solid fa-temperature-half"></i> ${t('chEnv')}`;
   document.getElementById('chEnvSub').textContent=t('chEnvSub');
+  document.getElementById('chHistSoc').innerHTML=`<i class="fa-solid fa-layer-group"></i> ${t('chHistSoc')}`;
+  document.getElementById('chHistSocSub').textContent=t('chHistSocSub');
+  document.getElementById('chHistFlags').innerHTML=`<i class="fa-solid fa-chart-line"></i> ${t('chHistFlags')}`;
+  document.getElementById('chHistFlagsSub').textContent=t('chHistFlagsSub');
   applyChartI18n();
 }
 const chartOpts={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'nearest',intersect:false,axis:'x'},plugins:{tooltip:{enabled:true,displayColors:false,backgroundColor:'rgba(14,23,41,.92)',titleColor:'#e9eefc',bodyColor:'#e9eefc',padding:12,cornerRadius:12,caretPadding:8,borderColor:'rgba(255,255,255,.2)',borderWidth:1,callbacks:{label:(ctx)=>`${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(2)}`}}},scales:{x:{ticks:{maxRotation:0}},y:{beginAtZero:false}}};
 const styledSet=(label,color,tension=.2)=>({label,borderColor:color,backgroundColor:color,data:[],pointRadius:0,pointHoverRadius:5,pointHoverBorderWidth:2,pointHoverBackgroundColor:'#ffffff',pointHoverBorderColor:color,pointHitRadius:14,borderWidth:2,tension});
 const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[styledSet(label,color,.25)]},options:chartOpts});
 const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets.map(s=>styledSet(s.label,s.color,s.tension??.2))},options:chartOpts});
-function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Charge %',color:'#a78bfa'},{label:'Mining Rig ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);setDefaultRange();}
+function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Charge %',color:'#a78bfa'},{label:'Mining Rig ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);histSocChart=mkMulti('histSocChart',[{label:'Early start SOC %',color:'#22d3ee'},{label:'Min stop SOC %',color:'#f59e0b'},{label:'Late reserve SOC %',color:'#a78bfa'}]);histFlagsChart=mkMulti('histFlagsChart',[{label:'Preserve battery',color:'#ef4444'},{label:'Headroom good',color:'#22c55e'},{label:'Month quality score',color:'#60a5fa'}]);setDefaultRange();}
 function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});} 
 function formatDate(d){return d.toISOString().slice(0,10)}
 function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
@@ -1462,10 +1534,18 @@ async function pull(){const qs=new URLSearchParams(currentRange).toString();cons
 const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
 document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
+const hints=d.historical_hints||{};
+const monthQ=String(hints.month_quality||'neutral');
+const qText=t(monthQ==='strong'?'strong':(monthQ==='weak'?'weak':'neutral'));
+const boolTxt=(v)=>v?t('yes'):t('no');
+document.getElementById('historyHints').innerHTML=`<div class='hint-card'><div class='hint-title'><i class='fa-solid fa-calendar-days'></i> ${t('monthQuality')}</div><div class='hint-value'>${qText}</div><div class='hint-sub'>month_quality</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt'></i> ${t('earlyStart')}</div><div class='hint-value'>${Number(hints.early_start_soc||0).toFixed(0)}%</div><div class='hint-sub'>early_start_soc</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-stop'></i> ${t('minStop')}</div><div class='hint-value'>${Number(hints.min_stop_soc||0).toFixed(0)}%</div><div class='hint-sub'>min_stop_soc</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-end'></i> ${t('lateReserve')}</div><div class='hint-value'>${Number(hints.late_day_reserve_soc||0).toFixed(0)}%</div><div class='hint-sub'>late_day_reserve_soc</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-shield-heart'></i> ${t('preserveBattery')}</div><div class='hint-value'>${boolTxt(!!hints.should_preserve_battery)}</div><div class='hint-sub'>should_preserve_battery</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-gauge-high'></i> ${t('headroomGood')}</div><div class='hint-value'>${boolTxt(!!hints.headroom_good)}</div><div class='hint-sub'>headroom_good</div></div>`;
 powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
 phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
 batteryChart.data.labels=labels; batteryChart.data.datasets[0].data=h.map(x=>x.battery); batteryChart.data.datasets[1].data=h.map(x=>x.state==='production'?100:0); batteryChart.update();
-envChart.data.labels=labels; envChart.data.datasets[0].data=h.map(x=>x.garage_temp); envChart.data.datasets[1].data=h.map(x=>x.garage_hum); envChart.update();}
+envChart.data.labels=labels; envChart.data.datasets[0].data=h.map(x=>x.garage_temp); envChart.data.datasets[1].data=h.map(x=>x.garage_hum); envChart.update();
+histSocChart.data.labels=labels; histSocChart.data.datasets[0].data=h.map(x=>Number(x.early_start_soc||0)); histSocChart.data.datasets[1].data=h.map(x=>Number(x.min_stop_soc||0)); histSocChart.data.datasets[2].data=h.map(x=>Number(x.late_day_reserve_soc||0)); histSocChart.update();
+const mq=(m)=>m==='strong'?100:(m==='weak'?0:50);
+histFlagsChart.data.labels=labels; histFlagsChart.data.datasets[0].data=h.map(x=>x.should_preserve_battery?100:0); histFlagsChart.data.datasets[1].data=h.map(x=>x.headroom_good?100:0); histFlagsChart.data.datasets[2].data=h.map(x=>mq(String(x.month_quality||'neutral'))); histFlagsChart.update();}
 async function act(a){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});const d=await r.json();document.getElementById('actionResult').textContent=d.message + ' @ ' + d.ts;}
 document.getElementById('applyRange').onclick=()=>{currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};pull();};
 document.getElementById('resetRange').onclick=()=>{setDefaultRange();pull();};
@@ -1521,6 +1601,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "sunset": snap.get("sunset").isoformat() if snap.get("sunset") else "",
         "history_count": len(filtered_hist),
         "history": filtered_hist,
+        "historical_hints": snap.get("historical_hints", {}),
     }
 
 
@@ -1628,7 +1709,8 @@ def _telegram_loop():
             handle_telegram_messages(
                 snap["battery"], snap["power"], snap["state"],
                 snap["current_condition"], snap["sunrise"], snap["sunset"],
-                snap["clouds"], snap["garage_temp"], snap["garage_hum"]
+                snap["clouds"], snap["garage_temp"], snap["garage_hum"],
+                snap.get("historical_hints", {})
             )
             # handle_telegram_messages long-polls (25s). No extra sleep needed.
         except Exception as e:
@@ -1756,7 +1838,7 @@ def main_loop():
                 store_data(data)  # attaches phasePowers
 
                 (battery, power, state, current_condition, sunrise, sunset, clouds,
-                f1_cond, f1_clouds, f1_ts, f3_cond, f3_clouds, f3_ts) = check_crypto_production_conditions(
+                f1_cond, f1_clouds, f1_ts, f3_cond, f3_clouds, f3_ts, hist_hints) = check_crypto_production_conditions(
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
 
@@ -1764,7 +1846,7 @@ def main_loop():
                 if not has_usable_solarman_data:
                     print("[Telemetry] Solarman dataList is empty for this cycle; saving fallback telemetry row.")
                 _record_telemetry(now, data or {}, battery or 0, power or 0, state or "unknown",
-                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum)
+                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum, hist_hints, sunrise, sunset)
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
@@ -1774,7 +1856,8 @@ def main_loop():
                         "state": state or "unknown",
                         "current_condition": current_condition or "unknown",
                         "sunrise": sunrise, "sunset": sunset, "clouds": clouds or 0,
-                        "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0
+                        "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0,
+                        "historical_hints": hist_hints or {}
                     })
 
                 if is_rpi:
@@ -1833,7 +1916,8 @@ def main_loop():
                     "battery": 0, "power": 0, "state": state or "stop",
                     "current_condition": current_condition or "unknown",
                     "sunrise": sunrise, "sunset": sunset, "clouds": clouds or 0,
-                    "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0
+                    "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0,
+                    "historical_hints": _history_recommendation(now, 0, 0, sunrise, sunset)
                 })
 
             pct = (used_quote / QUOTE_LIMIT) * 100 if QUOTE_LIMIT else 0
