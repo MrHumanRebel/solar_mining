@@ -22,6 +22,7 @@ services:
       - MY_QUOTE_FILE=/app/quote_usage.json
       - MY_STATE_FILE=/app/state.json
       - MY_SOLARMAN_FILE=/app/solarman_data.json
+      - MY_TELEMETRY_FILE=/app/solarman_json/telemetry_history.json
       - WALLET_ADDRESS=${WALLET_ADDRESS}
       - MY_HISTORY_DIR=/app/solarman_json
       - MY_WEB_PORT=9000
