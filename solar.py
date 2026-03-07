@@ -107,7 +107,13 @@ telemetry_history: deque = deque(maxlen=MAX_HISTORY_POINTS)
 
 
 def _resolve_telemetry_file() -> Path:
-    raw = os.getenv("MY_TELEMETRY_FILE", "telemetry_history.json")
+    raw = os.getenv("MY_TELEMETRY_FILE", "").strip()
+    if not raw:
+        # Use the state file directory by default, because it is usually a bind-mounted path.
+        state_path = Path(STATE_FILE)
+        default_dir = state_path.parent if str(state_path).strip() else Path(__file__).resolve().parent
+        return (default_dir / "telemetry_history.json").resolve()
+
     p = Path(raw)
     if p.is_absolute():
         return p
@@ -116,7 +122,9 @@ def _resolve_telemetry_file() -> Path:
 
 
 TELEMETRY_FILE = _resolve_telemetry_file()
+TELEMETRY_BACKUP_FILE = (Path(STATE_FILE).resolve().parent / "telemetry_history_backup.json").resolve()
 print(f"[Telemetry] Using telemetry store: {TELEMETRY_FILE}")
+print(f"[Telemetry] Using telemetry backup store: {TELEMETRY_BACKUP_FILE}")
 
 
 # Historical profile cache (derived from solarman_json/*.json)
@@ -1342,7 +1350,7 @@ ________________________________
 
 def _load_telemetry_from_file() -> int:
     """Load persisted telemetry points into in-memory deque at startup."""
-    candidates = [TELEMETRY_FILE]
+    candidates = [TELEMETRY_FILE, TELEMETRY_BACKUP_FILE]
 
     # Backward compatibility: previous versions may have written to cwd/telemetry_history.json
     legacy_cwd_file = (Path.cwd() / "telemetry_history.json").resolve()
@@ -1382,6 +1390,9 @@ def _load_telemetry_from_file() -> int:
         sorted_hist = sorted(list(telemetry_history), key=lambda x: str(x.get("ts", "")))
         telemetry_history.clear()
         telemetry_history.extend(sorted_hist[-MAX_HISTORY_POINTS:])
+
+        # Heal/seed both telemetry stores so restarts always have a consistent source.
+        _write_full_telemetry_history(telemetry_history)
 
         print(f"[Telemetry] Loaded {len(telemetry_history)} points (raw read: {loaded_total}) from: {', '.join(str(x) for x in candidates)}")
         return len(telemetry_history)
@@ -1443,29 +1454,48 @@ def _is_active_window(now: datetime, sunrise_dt: Optional[datetime], sunset_dt: 
 
 
 def _append_telemetry_to_file(record: Dict[str, Any]) -> None:
+    _persist_telemetry_record_to_file(TELEMETRY_FILE, record)
+    if TELEMETRY_BACKUP_FILE != TELEMETRY_FILE:
+        _persist_telemetry_record_to_file(TELEMETRY_BACKUP_FILE, record)
+
+
+def _persist_telemetry_record_to_file(target_file: Path, record: Dict[str, Any]) -> None:
     try:
-        TELEMETRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        target_file.parent.mkdir(parents=True, exist_ok=True)
 
         existing: List[Dict[str, Any]] = []
-        if TELEMETRY_FILE.exists():
+        if target_file.exists():
             try:
-                with TELEMETRY_FILE.open("r", encoding="utf-8") as fh:
+                with target_file.open("r", encoding="utf-8") as fh:
                     payload = json.load(fh)
                 if isinstance(payload, list):
                     existing = payload
             except Exception as err:
-                print(f"[Telemetry] Could not read telemetry file, recreating: {err}")
+                print(f"[Telemetry] Could not read telemetry file {target_file}, recreating: {err}")
 
         existing.append(record)
         if len(existing) > MAX_HISTORY_POINTS:
             existing = existing[-MAX_HISTORY_POINTS:]
 
-        tmp_file = TELEMETRY_FILE.with_suffix(TELEMETRY_FILE.suffix + ".tmp")
+        tmp_file = target_file.with_suffix(target_file.suffix + ".tmp")
         with tmp_file.open("w", encoding="utf-8") as fh:
             json.dump(existing, fh, ensure_ascii=False)
-        tmp_file.replace(TELEMETRY_FILE)
+        tmp_file.replace(target_file)
     except Exception as err:
-        print(f"[Telemetry] Failed to persist record: {err}")
+        print(f"[Telemetry] Failed to persist record into {target_file}: {err}")
+
+
+def _write_full_telemetry_history(history: deque) -> None:
+    payload = list(history)[-MAX_HISTORY_POINTS:]
+    for target_file in {TELEMETRY_FILE, TELEMETRY_BACKUP_FILE}:
+        try:
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = target_file.with_suffix(target_file.suffix + ".tmp")
+            with tmp_file.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            tmp_file.replace(target_file)
+        except Exception as err:
+            print(f"[Telemetry] Failed to sync telemetry history into {target_file}: {err}")
 
 
 def _miner_action(action: str) -> Dict[str, Any]:
