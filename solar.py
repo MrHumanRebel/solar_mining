@@ -50,6 +50,11 @@ STATE_FILE = os.environ['MY_STATE_FILE']
 SOLARMAN_FILE = os.environ['MY_SOLARMAN_FILE']
 WALLET_ADDRESS = os.environ['WALLET_ADDRESS']
 HISTORY_DIR = os.getenv('MY_HISTORY_DIR', 'solarman_json')
+BATTERY_CAPACITY_WH = float(os.getenv("MY_BATTERY_CAPACITY_WH", "0"))
+BATTERY_CAPACITY_AH = float(os.getenv("MY_BATTERY_CAPACITY_AH", "200"))
+BATTERY_NOMINAL_V = float(os.getenv("MY_BATTERY_NOMINAL_V", "55.2"))
+MINER_POWER_W = float(os.getenv("MY_MINER_POWER_W", "1000"))
+BATTERY_FLOOR_SOC = float(os.getenv("MY_BATTERY_FLOOR_SOC", "20"))
 
 print(platform.machine())
 print(platform.system())
@@ -175,6 +180,25 @@ def _find_value(data_list: List[Dict[str, Any]], key: str, default: float = 0.0)
         if e.get("key") == key:
             return _safe_float(e.get("value"), default)
     return default
+
+
+
+def _find_first_value(data_list: List[Dict[str, Any]], keys: List[str], default: float = 0.0) -> float:
+    for k in keys:
+        v = _find_value(data_list, k, None)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return float(default)
+
+
+def _effective_battery_capacity_wh(battery_voltage: float) -> float:
+    if BATTERY_CAPACITY_WH > 0:
+        return BATTERY_CAPACITY_WH
+    v = battery_voltage if battery_voltage > 1 else BATTERY_NOMINAL_V
+    return max(100.0, BATTERY_CAPACITY_AH * v)
 
 def _extract_phase_powers(data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -338,6 +362,7 @@ def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, An
             "midday_avg": float(midday_avg),
             "daily_peak_p75": float(monthly_peak_p75),
             "evening_soc_p40": float(evening_soc_p40),
+            "hourly_prod_mean": {str(h): float(statistics.mean(vals)) for h, vals in hourly_prod.items() if vals},
         }
 
     print(
@@ -397,6 +422,7 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
             "late_day_reserve_soc": 80,
             "should_preserve_battery": now.hour >= 15 and battery_charge < 80,
             "headroom_good": current_power >= 2500,
+            "hourly_prod_mean": {},
         }
 
     daylight_span = int(month_cfg.get("daylight_span", 8))
@@ -431,6 +457,67 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
         "late_day_reserve_soc": late_day_reserve_soc,
         "should_preserve_battery": should_preserve_battery,
         "headroom_good": headroom_good,
+        "hourly_prod_mean": month_cfg.get("hourly_prod_mean", {}),
+    }
+
+
+def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_power: float,
+                                sunrise_dt: datetime, sunset_dt: datetime,
+                                hist: Dict[str, Any], battery_voltage: float) -> Dict[str, Any]:
+    """
+    Prevent rapid ON/OFF cycles near minimum SOC by requiring enough battery energy
+    to bridge the period until typical PV can continuously feed the miner load.
+    """
+    min_stop_soc = float(hist.get("min_stop_soc", BATTERY_FLOOR_SOC))
+    hourly_prod_mean = hist.get("hourly_prod_mean", {}) if isinstance(hist, dict) else {}
+    if not isinstance(hourly_prod_mean, dict):
+        hourly_prod_mean = {}
+
+    if battery_charge <= min_stop_soc:
+        return {
+            "allow_start": False,
+            "usable_wh": 0.0,
+            "deficit_w": max(0.0, MINER_POWER_W - current_power),
+            "bridge_minutes": 0.0,
+            "eta_minutes": 999.0,
+            "reason": "soc_below_min_stop",
+        }
+
+    capacity_wh = _effective_battery_capacity_wh(battery_voltage)
+    usable_wh = max(0.0, (battery_charge - min_stop_soc) / 100.0 * capacity_wh)
+    deficit_w = max(0.0, MINER_POWER_W - max(0.0, current_power))
+    bridge_minutes = 999.0 if deficit_w <= 0 else (usable_wh / deficit_w) * 60.0
+
+    eta_minutes = 999.0
+    if deficit_w <= 0:
+        eta_minutes = 0.0
+    else:
+        # From current hour forward, find first hour where historical mean PV covers miner load.
+        for h in range(now.hour, 24):
+            p = _safe_float(hourly_prod_mean.get(str(h), 0.0), 0.0)
+            if p >= MINER_POWER_W:
+                base = now.replace(minute=0, second=0, microsecond=0)
+                target = base + timedelta(hours=(h - now.hour))
+                eta_minutes = max(0.0, (target - now).total_seconds() / 60.0)
+                break
+
+        # If no historical hourly signal found, fall back to sunrise proximity heuristic.
+        if eta_minutes >= 999.0:
+            if now < sunrise_dt:
+                eta_minutes = max(0.0, (sunrise_dt - now).total_seconds() / 60.0) + 90.0
+            elif now < sunset_dt:
+                eta_minutes = 90.0
+
+    allow_start = bridge_minutes >= eta_minutes
+    return {
+        "allow_start": allow_start,
+        "usable_wh": round(usable_wh, 2),
+        "deficit_w": round(deficit_w, 2),
+        "bridge_minutes": round(bridge_minutes, 2),
+        "eta_minutes": round(eta_minutes, 2),
+        "reason": "ok" if allow_start else "insufficient_bridge_energy",
+        "capacity_wh": round(capacity_wh, 2),
+        "battery_voltage": round(max(0.0, battery_voltage), 2),
     }
 
 def _runtime_info() -> str:
@@ -1071,6 +1158,11 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         battery_charge = _find_value(dl, "BMS_SOC", 0)
         current_power = _find_value(dl, "S_P_T", 0)
         internal_power = _find_value(dl, "GS_T", 0)
+        battery_voltage = _find_first_value(
+            dl,
+            ["BMS_B_V1", "B_V1", "BMS_V", "BMS_U", "BAT_V", "BAT_U", "BMS Voltage", "Battery Voltage"],
+            BATTERY_NOMINAL_V,
+        )
 
         # per-phase inverter outputs (W)
         inv_l1 = _find_value(dl, "INV_O_P_L1", 0.0)
@@ -1082,6 +1174,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         print(f"Current production (PV total): {current_power}W")
         print(f"Inverter output per phase: L1={int(inv_l1)}W, L2={int(inv_l2)}W, L3={int(inv_l3)}W, Total={int(inv_lt)}W")
         print(f"Internal Power: {internal_power}W")
+        print(f"Battery voltage: {battery_voltage:.2f}V")
 
         now = datetime.now(tz=budapest_tz)
         hist = _history_recommendation(now, battery_charge, current_power, sunrise, sunset)
@@ -1091,6 +1184,20 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             f"min_stop_soc={hist['min_stop_soc']}% late_reserve={hist['late_day_reserve_soc']}% "
             f"headroom_good={hist['headroom_good']} preserve={hist['should_preserve_battery']}"
         )
+        start_guard = _compute_start_bridge_guard(now, battery_charge, current_power, sunrise, sunset, hist, battery_voltage)
+        print(
+            "[Start guard] "
+            f"allow={start_guard['allow_start']} reason={start_guard['reason']} "
+            f"capacity={start_guard['capacity_wh']}Wh usable_wh={start_guard['usable_wh']}Wh "
+            f"deficit={start_guard['deficit_w']}W bridge={start_guard['bridge_minutes']}min eta={start_guard['eta_minutes']}min"
+        )
+        hist.update({
+            "start_guard_allow": bool(start_guard.get("allow_start", False)),
+            "start_guard_reason": str(start_guard.get("reason", "unknown")),
+            "start_guard_bridge_minutes": float(start_guard.get("bridge_minutes", 0.0)),
+            "start_guard_eta_minutes": float(start_guard.get("eta_minutes", 0.0)),
+            "start_guard_capacity_wh": float(start_guard.get("capacity_wh", 0.0)),
+        })
 
         solar_keywords = [
             'sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds',
@@ -1150,20 +1257,22 @@ ________________________________
                 if is_rpi:
                     press_power_button(16, 0.55)
         elif (
-            (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 65 and now.hour < 13)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 55 and now.hour < 12)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 45 and now.hour < 11)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 65 and now.hour < 13)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 55 and now.hour < 12)
-            or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 45 and now.hour < 11)
-            or (hist["headroom_good"] and battery_charge >= hist["early_start_soc"] and now.hour < 14)
-            or (battery_charge >= 60 and current_power >= 2500 and now.hour < 11)
-            or (battery_charge >= 70 and current_power >= 2250 and now.hour < 12)
-            or (battery_charge >= 80 and current_power >= 2000 and now.hour < 13)
-            or (battery_charge >= 50 and current_power >= 3000 and now.hour < 14)
-            or (battery_charge > 90 and current_power > 50)
+            start_guard["allow_start"] and (
+                (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13)
+                or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 65 and now.hour < 13)
+                or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 55 and now.hour < 12)
+                or (any(k in current_condition for k in solar_keywords) and any(k in f1_cond for k in solar_keywords) and battery_charge >= 45 and now.hour < 11)
+                or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13)
+                or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 65 and now.hour < 13)
+                or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 55 and now.hour < 12)
+                or (any(k in current_condition for k in solar_keywords) and any(k in f3_cond for k in solar_keywords) and battery_charge >= 45 and now.hour < 11)
+                or (hist["headroom_good"] and battery_charge >= hist["early_start_soc"] and now.hour < 14)
+                or (battery_charge >= 60 and current_power >= 2500 and now.hour < 11)
+                or (battery_charge >= 70 and current_power >= 2250 and now.hour < 12)
+                or (battery_charge >= 80 and current_power >= 2000 and now.hour < 13)
+                or (battery_charge >= 50 and current_power >= 3000 and now.hour < 14)
+                or (battery_charge > 90 and current_power > 50)
+            )
         ):
             print("Crypto production ready!")
             state = "production"
@@ -1172,6 +1281,9 @@ ________________________________
                 uptime = now
                 if is_rpi:
                     press_power_button(16, 0.55)
+        elif (not start_guard["allow_start"]) and prev_state != "production":
+            print("Start trigger blocked by battery bridge guard.")
+            state = "stop"
         elif (
             (battery_charge <= max(90, hist["late_day_reserve_soc"]))
             or (current_power <= 150)
