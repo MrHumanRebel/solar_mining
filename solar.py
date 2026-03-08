@@ -1362,7 +1362,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             ("SOC>=60 and PV>=2500W, before 11h", battery_charge >= 60 and current_power >= 2500 and now.hour < 11),
             ("SOC>=70 and PV>=2250W, before 12h", battery_charge >= 70 and current_power >= 2250 and now.hour < 12),
             ("SOC>=80 and PV>=2000W, before 13h", battery_charge >= 80 and current_power >= 2000 and now.hour < 13),
-            ("SOC>=50 and PV>=3000W, before 14h", battery_charge >= 50 and current_power >= 3000 and now.hour < 14),
+            ("SOC>=40 and PV>=3000W, before 14h", battery_charge >= 40 and current_power >= 3000 and now.hour < 14),
             ("SOC>90 and PV>50W", battery_charge > 90 and current_power > 50),
         ]
         for label, ok in start_rules:
@@ -1379,7 +1379,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 stop_rule_hits.append(label)
 
         stop_runtime_rules = [
-            ("SOC <= max(90, late-day reserve)", battery_charge <= max(90, hist["late_day_reserve_soc"])),
+            ("Late-day reserve reached (after 14h, while running)", prev_state == "production" and now.hour >= 14 and battery_charge <= hist["late_day_reserve_soc"]),
             ("PV <= 150W", current_power <= 150),
             ("Current weather non-solar + battery<=95 + PV<=1000W", non_solar_now and battery_charge <= 95 and current_power <= 1000),
             ("1H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f1 and battery_charge <= 95 and current_power <= 1000),
