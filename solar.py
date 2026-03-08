@@ -924,15 +924,12 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             "soc_below_min_stop": "SOC below minimum stop",
             "insufficient_bridge_energy": "Insufficient bridge energy",
         }.get(start_guard_reason_raw, start_guard_reason_raw)
-        start_guard_reason_hu = {
-            "ok": "Rendben",
-            "soc_below_min_stop": "SOC minimum alatt",
-            "insufficient_bridge_energy": "Nincs elég áthidaló energia",
-        }.get(start_guard_reason_raw, start_guard_reason_raw)
         start_guard_bridge = _safe_float(hints.get("start_guard_bridge_minutes", 0.0), 0.0)
         start_guard_eta = _safe_float(hints.get("start_guard_eta_minutes", 0.0), 0.0)
         start_guard_capacity = _safe_float(hints.get("start_guard_capacity_wh", 0.0), 0.0)
         start_guard_usable = _safe_float(hints.get("start_guard_usable_wh", 0.0), 0.0)
+        start_guard_needed_time = _safe_float(hints.get("start_guard_needed_bridge_minutes", 0.0), 0.0)
+        start_guard_needed_capacity = _safe_float(hints.get("start_guard_needed_bridge_wh", 0.0), 0.0)
         start_guard_ah = _safe_float(hints.get("start_guard_battery_ah", 0.0), 0.0)
         start_guard_voltage = _safe_float(hints.get("start_guard_battery_voltage", 0.0), 0.0)
 
@@ -962,13 +959,15 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"• Late-day reserve SOC: {hints.get('late_day_reserve_soc', 'N/A')}%\n"
             f"• Preserve battery: {preserve_battery_label}\n"
             f"• Headroom good: {headroom_good_label}\n\n"
-            f"🛡️ Start guard / Indítási védelem\n"
-            f"• Start allowed / Indítás engedélyezve: {start_guard_allow}\n"
-            f"• Reason / Indok: {start_guard_reason_en} / {start_guard_reason_hu}\n"
-            f"• Bridge / Áthidalás: {start_guard_bridge:.1f} min / perc\n"
-            f"• ETA / Várható indulás: {start_guard_eta:.1f} min / perc\n"
-            f"• Capacity / Kapacitás: {start_guard_capacity:.1f}Wh ({start_guard_ah:.1f}Ah @ {start_guard_voltage:.2f}V)\n"
-            f"• Usable / Felhasználható: {start_guard_usable:.1f}Wh\n\n"
+            f"🛡️ Start guard\n"
+            f"• Start allowed: {start_guard_allow}\n"
+            f"• Reason: {start_guard_reason_en}\n"
+            f"• Bridge: {start_guard_bridge:.1f} min\n"
+            f"• ETA: {start_guard_eta:.1f} min\n"
+            f"• Capacity: {start_guard_capacity:.1f}Wh ({start_guard_ah:.1f}Ah @ {start_guard_voltage:.2f}V)\n"
+            f"• Usable: {start_guard_usable:.1f}Wh\n"
+            f"• Needed time: {start_guard_needed_time:.1f} min\n"
+            f"• Needed capacity: {start_guard_needed_capacity:.1f}Wh\n\n"
             f"🖥️ System\n"
             f"• IP: {ip}\n"
             f"• RAM usage: {ram}\n"
