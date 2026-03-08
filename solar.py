@@ -108,9 +108,8 @@ _shared_snapshot = {
     },
 }
 
-# 6 months @ 5-minute cycle hard cap ≈ 51,840 points
-MAX_HISTORY_POINTS = int(os.getenv("MY_HISTORY_MAX_POINTS", "51840"))
-telemetry_history: deque = deque(maxlen=MAX_HISTORY_POINTS)
+# Unbounded in-memory telemetry history (no MAX_HISTORY_POINTS cap).
+telemetry_history: deque = deque()
 
 
 def _resolve_telemetry_file() -> Path:
@@ -1432,7 +1431,7 @@ def _load_telemetry_from_file() -> int:
                 print(f"[Telemetry] Ignoring non-list telemetry payload in {fp}.")
                 continue
 
-            for item in payload[-MAX_HISTORY_POINTS:]:
+            for item in payload:
                 if not isinstance(item, dict):
                     continue
                 ts = str(item.get("ts", "")).strip()
@@ -1444,7 +1443,7 @@ def _load_telemetry_from_file() -> int:
 
         sorted_hist = sorted(list(telemetry_history), key=lambda x: str(x.get("ts", "")))
         telemetry_history.clear()
-        telemetry_history.extend(sorted_hist[-MAX_HISTORY_POINTS:])
+        telemetry_history.extend(sorted_hist)
 
         # Heal/seed both telemetry stores so restarts always have a consistent source.
         _write_full_telemetry_history(telemetry_history)
@@ -1529,9 +1528,6 @@ def _persist_telemetry_record_to_file(target_file: Path, record: Dict[str, Any])
                 print(f"[Telemetry] Could not read telemetry file {target_file}, recreating: {err}")
 
         existing.append(record)
-        if len(existing) > MAX_HISTORY_POINTS:
-            existing = existing[-MAX_HISTORY_POINTS:]
-
         tmp_file = target_file.with_suffix(target_file.suffix + ".tmp")
         with tmp_file.open("w", encoding="utf-8") as fh:
             json.dump(existing, fh, ensure_ascii=False)
@@ -1541,7 +1537,7 @@ def _persist_telemetry_record_to_file(target_file: Path, record: Dict[str, Any])
 
 
 def _write_full_telemetry_history(history: deque) -> None:
-    payload = list(history)[-MAX_HISTORY_POINTS:]
+    payload = list(history)
     for target_file in {TELEMETRY_FILE, TELEMETRY_BACKUP_FILE}:
         try:
             target_file.parent.mkdir(parents=True, exist_ok=True)
