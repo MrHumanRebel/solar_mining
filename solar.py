@@ -585,12 +585,11 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
     elif deficit_w <= 0:
         eta_minutes = 0.0
 
-    # Morning-only relevance: once full supply is reached, bridge metrics are informationally obsolete.
+    # Morning-only relevance: after full supply, current bridge/LTA is obsolete,
+    # but daily needed bridge stats remain useful as day-level requirements.
     if now >= sunrise_dt and eta_minutes <= 0.0:
         bridge_minutes = 0.0
         eta_minutes = 0.0
-        needed_bridge_minutes = 0.0
-        needed_bridge_wh = 0.0
 
     allow_start = battery_charge > min_stop_soc and bridge_minutes >= eta_minutes
     return {
