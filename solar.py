@@ -105,6 +105,8 @@ _shared_snapshot = {
         "start_guard_battery_ah": 0,
         "start_guard_battery_voltage": 0,
         "start_guard_usable_wh": 0,
+        "start_guard_needed_bridge_minutes": 0,
+        "start_guard_needed_bridge_wh": 0,
     },
 }
 
@@ -489,19 +491,6 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
 
     capacity_wh = _effective_battery_capacity_wh(battery_voltage, battery_ah)
 
-    if battery_charge <= min_stop_soc:
-        return {
-            "allow_start": False,
-            "usable_wh": 0.0,
-            "deficit_w": max(0.0, MINER_POWER_W - current_power),
-            "bridge_minutes": 0.0,
-            "eta_minutes": 999.0,
-            "reason": "soc_below_min_stop",
-            "capacity_wh": round(capacity_wh, 2),
-            "battery_voltage": round(max(0.0, battery_voltage), 2),
-            "battery_ah": round(max(0.0, battery_ah), 2),
-        }
-
     usable_wh = max(0.0, (battery_charge - min_stop_soc) / 100.0 * capacity_wh)
     deficit_w = max(0.0, MINER_POWER_W - max(0.0, current_power))
     bridge_minutes = 999.0 if deficit_w <= 0 else (usable_wh / deficit_w) * 60.0
@@ -526,14 +515,19 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
             elif now < sunset_dt:
                 eta_minutes = 90.0
 
-    allow_start = bridge_minutes >= eta_minutes
+    needed_bridge_minutes = max(0.0, eta_minutes)
+    needed_bridge_wh = 0.0 if deficit_w <= 0 else (needed_bridge_minutes / 60.0) * deficit_w
+
+    allow_start = battery_charge > min_stop_soc and bridge_minutes >= eta_minutes
     return {
         "allow_start": allow_start,
         "usable_wh": round(usable_wh, 2),
         "deficit_w": round(deficit_w, 2),
         "bridge_minutes": round(bridge_minutes, 2),
         "eta_minutes": round(eta_minutes, 2),
-        "reason": "ok" if allow_start else "insufficient_bridge_energy",
+        "needed_bridge_minutes": round(needed_bridge_minutes, 2),
+        "needed_bridge_wh": round(needed_bridge_wh, 2),
+        "reason": "ok" if allow_start else ("soc_below_min_stop" if battery_charge <= min_stop_soc else "insufficient_bridge_energy"),
         "capacity_wh": round(capacity_wh, 2),
         "battery_voltage": round(max(0.0, battery_voltage), 2),
         "battery_ah": round(max(0.0, battery_ah), 2),
@@ -1251,6 +1245,8 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             "start_guard_battery_ah": float(start_guard.get("battery_ah", 0.0)),
             "start_guard_battery_voltage": float(start_guard.get("battery_voltage", 0.0)),
             "start_guard_usable_wh": float(start_guard.get("usable_wh", 0.0)),
+            "start_guard_needed_bridge_minutes": float(start_guard.get("needed_bridge_minutes", 0.0)),
+            "start_guard_needed_bridge_wh": float(start_guard.get("needed_bridge_wh", 0.0)),
         })
 
         solar_keywords = [
@@ -1630,15 +1626,16 @@ input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8
 .chart-card{height:360px;display:flex;flex-direction:column;overflow:hidden}
 .chart-card canvas{width:100% !important;flex:1 1 auto;min-height:0}
 .hints-panel{padding:16px}
-.hints-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-.hint-section-title{margin:0 0 10px;font-size:.86rem;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);font-weight:700}
-.hint-group + .hint-group{margin-top:14px}
-.hint-card{background:linear-gradient(165deg,rgba(99,102,241,.18),rgba(14,165,233,.12));border:1px solid var(--border);border-radius:16px;padding:14px;box-shadow:0 12px 26px rgba(2,6,23,.2);min-height:112px}
+.hints-wrap{width:min(1280px,100%);margin:0 auto;display:grid;grid-template-columns:repeat(2,minmax(340px,1fr));gap:16px;align-items:start}
+.hints-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.hint-section-title{margin:0 0 10px;font-size:.86rem;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);font-weight:700;text-align:center}
+.hint-card{background:linear-gradient(165deg,rgba(99,102,241,.18),rgba(14,165,233,.12));border:1px solid var(--border);border-radius:16px;padding:14px;box-shadow:0 12px 26px rgba(2,6,23,.2);min-height:112px;display:flex;flex-direction:column;justify-content:center}
 .hint-title{font-size:.8rem;color:var(--muted);margin-bottom:8px;display:flex;align-items:center;gap:8px}
 .hint-value{font-size:1.15rem;font-weight:800;line-height:1.2}
 .hint-sub{margin-top:6px;color:var(--muted);font-size:.8rem}
-@media(max-width:1100px){.charts{grid-template-columns:1fr}.hints-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:320px}.hints-grid{grid-template-columns:1fr}}
+@media(max-width:1100px){.charts{grid-template-columns:1fr}.hints-wrap{grid-template-columns:1fr}}
+@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:320px}.hints-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.hints-grid{grid-template-columns:1fr}}
 </style></head>
 <body data-theme="dark"><div class="wrap">
 <div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
@@ -1655,7 +1652,7 @@ input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8
 <button id="btnForce" class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
 </div></div>
 <div id="actionResult" class="k"></div>
-<div class="panel hints-panel"><div class="hints-grid" id="historyHints"></div></div>
+<div class="panel hints-panel"><div class="hints-wrap" id="historyHints"></div></div>
 <div class="charts"><div class="card chart-card"><div class="chart-head"><div id="chPower" class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div id="chPowerSub" class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chPhase" class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div id="chPhaseSub" class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
 <div class="card chart-card"><div class="chart-head"><div id="chBattery" class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Mining Rig</div><div id="chBatterySub" class="chart-sub">Charge level and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chEnv" class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div id="chEnvSub" class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chHistSoc" class="chart-title"><i class="fa-solid fa-layer-group"></i> Historical SOC Thresholds</div><div id="chHistSocSub" class="chart-sub">Dynamic SOC logic over time</div></div><canvas id="histSocChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chHistFlags" class="chart-title"><i class="fa-solid fa-chart-line"></i> Historical Decision Flags</div><div id="chHistFlagsSub" class="chart-sub">Battery preserve / headroom / month quality</div></div><canvas id="histFlagsChart"></canvas></div></div></div>
 <script>
@@ -1666,10 +1663,10 @@ let currentLang='en';
 const I18N={
   en:{title:'Solar Mining Dashboard',theme:'Theme',downloadTelemetry:'Telemetry JSON',from:'From',to:'To',last30:'Last 30 days',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',
       state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
-      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Bridge time',startGuardEta:'ETA',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
+      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Bridge time',startGuardEta:'ETA',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy',neededBridgeTime:'Needed bridge time',neededBridgeEnergy:'Needed bridge energy',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
   hu:{title:'Solar Bányászat Dashboard',theme:'Téma',downloadTelemetry:'Telemetry JSON letöltése',from:'Ettől',to:'Eddig',last30:'Utolsó 30 nap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',
       state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
-      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Áthidalási idő',startGuardEta:'Várható indulás',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
+      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Áthidalási idő',startGuardEta:'Várható indulás',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia',neededBridgeTime:'Szükséges áthidalási idő',neededBridgeEnergy:'Szükséges áthidalási energia',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
 const t=(k)=>I18N[currentLang][k]||k;
 function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
@@ -1746,7 +1743,9 @@ const startGuardBridge=`${Number(hints.start_guard_bridge_minutes||0).toFixed(1)
 const startGuardEta=`${Number(hints.start_guard_eta_minutes||0).toFixed(1)} ${t('unitMin')}`;
 const startGuardCapacity=`${Number(hints.start_guard_capacity_wh||0).toFixed(1)} ${t('unitWh')} (${Number(hints.start_guard_battery_ah||0).toFixed(1)}Ah @ ${Number(hints.start_guard_battery_voltage||0).toFixed(2)}V)`;
 const startGuardUsable=`${Number(hints.start_guard_usable_wh||0).toFixed(1)} ${t('unitWh')}`;
-document.getElementById('historyHints').innerHTML=`<div class='hint-group'><div class='hint-section-title'>${t('hintHistoryTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-calendar-days'></i> ${t('monthQuality')}</div><div class='hint-value'>${qText}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt'></i> ${t('earlyStart')}</div><div class='hint-value'>${Number(hints.early_start_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-stop'></i> ${t('minStop')}</div><div class='hint-value'>${Number(hints.min_stop_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-end'></i> ${t('lateReserve')}</div><div class='hint-value'>${Number(hints.late_day_reserve_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-shield-heart'></i> ${t('preserveBattery')}</div><div class='hint-value'>${boolTxt(!!hints.should_preserve_battery)}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-gauge-high'></i> ${t('headroomGood')}</div><div class='hint-value'>${boolTxt(!!hints.headroom_good)}</div></div></div></div><div class='hint-group'><div class='hint-section-title'>${t('hintStartGuardTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-play-circle'></i> ${t('startGuardAllow')}</div><div class='hint-value'>${startGuardAllow}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-info'></i> ${t('startGuardReason')}</div><div class='hint-value'>${reasonTxt}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-start'></i> ${t('startGuardBridge')}</div><div class='hint-value'>${startGuardBridge}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-half'></i> ${t('startGuardEta')}</div><div class='hint-value'>${startGuardEta}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-car-battery'></i> ${t('startGuardCapacity')}</div><div class='hint-value'>${startGuardCapacity}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-three-quarters'></i> ${t('startGuardUsable')}</div><div class='hint-value'>${startGuardUsable}</div></div></div></div>`;
+const neededBridgeTime=`${Number(hints.start_guard_needed_bridge_minutes||0).toFixed(1)} ${t('unitMin')}`;
+const neededBridgeEnergy=`${Number(hints.start_guard_needed_bridge_wh||0).toFixed(1)} ${t('unitWh')}`;
+document.getElementById('historyHints').innerHTML=`<div class='hint-section'><div class='hint-section-title'>${t('hintHistoryTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-calendar-days'></i> ${t('monthQuality')}</div><div class='hint-value'>${qText}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt'></i> ${t('earlyStart')}</div><div class='hint-value'>${Number(hints.early_start_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-stop'></i> ${t('minStop')}</div><div class='hint-value'>${Number(hints.min_stop_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-end'></i> ${t('lateReserve')}</div><div class='hint-value'>${Number(hints.late_day_reserve_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-shield-heart'></i> ${t('preserveBattery')}</div><div class='hint-value'>${boolTxt(!!hints.should_preserve_battery)}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-gauge-high'></i> ${t('headroomGood')}</div><div class='hint-value'>${boolTxt(!!hints.headroom_good)}</div></div></div></div><div class='hint-section'><div class='hint-section-title'>${t('hintStartGuardTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-play-circle'></i> ${t('startGuardAllow')}</div><div class='hint-value'>${startGuardAllow}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-info'></i> ${t('startGuardReason')}</div><div class='hint-value'>${reasonTxt}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-start'></i> ${t('startGuardBridge')}</div><div class='hint-value'>${startGuardBridge}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-half'></i> ${t('startGuardEta')}</div><div class='hint-value'>${startGuardEta}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-car-battery'></i> ${t('startGuardCapacity')}</div><div class='hint-value'>${startGuardCapacity}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-three-quarters'></i> ${t('startGuardUsable')}</div><div class='hint-value'>${startGuardUsable}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-business-time'></i> ${t('neededBridgeTime')}</div><div class='hint-value'>${neededBridgeTime}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt-lightning'></i> ${t('neededBridgeEnergy')}</div><div class='hint-value'>${neededBridgeEnergy}</div></div></div></div>`;
 powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
 phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
 batteryChart.data.labels=labels; batteryChart.data.datasets[0].data=h.map(x=>x.battery); batteryChart.data.datasets[1].data=h.map(x=>x.state==='production'?100:0); batteryChart.update();
