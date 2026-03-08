@@ -504,7 +504,13 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
             p = _safe_float(hourly_prod_mean.get(str(h), 0.0), 0.0)
             if p >= MINER_POWER_W:
                 base = now.replace(minute=0, second=0, microsecond=0)
-                target = base + timedelta(hours=(h - now.hour))
+                # If this exact hour is usually strong enough but the current instantaneous
+                # power is still below miner demand, require bridging until the next hour.
+                # This avoids returning 0 min/Wh for "needed bridge" during temporary dips.
+                hour_offset = (h - now.hour)
+                if hour_offset == 0:
+                    hour_offset = 1
+                target = base + timedelta(hours=hour_offset)
                 eta_minutes = max(0.0, (target - now).total_seconds() / 60.0)
                 break
 
