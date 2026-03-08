@@ -4,3 +4,5 @@ token.txt
 state.json
 solarman_data.json
 quote_usage.json
+solarminer_json/*.json
+!solarminer_json/.gitkeep

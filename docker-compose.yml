@@ -22,7 +22,7 @@ services:
       - MY_QUOTE_FILE=/app/quote_usage.json
       - MY_STATE_FILE=/app/state.json
       - MY_SOLARMAN_FILE=/app/solarman_data.json
-      - MY_TELEMETRY_FILE=/app/solarman_json/telemetry_history.json
+      - MY_TELEMETRY_FILE=/app/solarminer_json/telemetry_history.json
       - WALLET_ADDRESS=${WALLET_ADDRESS}
       - MY_HISTORY_DIR=/app/solarman_json
       - MY_WEB_PORT=9000
@@ -34,6 +34,7 @@ services:
       - ./solarman_data.json:/app/solarman_data.json
       - ./quote_usage.json:/app/quote_usage.json
       - ./solarman_json:/app/solarman_json
+      - ./solarminer_json:/app/solarminer_json
     devices:
       - "/dev/gpiomem:/dev/gpiomem"
       - "/dev/i2c-1:/dev/i2c-1"
