@@ -50,7 +50,6 @@ STATE_FILE = os.environ['MY_STATE_FILE']
 SOLARMAN_FILE = os.environ['MY_SOLARMAN_FILE']
 WALLET_ADDRESS = os.environ['WALLET_ADDRESS']
 HISTORY_DIR = os.getenv('MY_HISTORY_DIR', 'solarman_json')
-BATTERY_CAPACITY_WH = float(os.getenv("MY_BATTERY_CAPACITY_WH", "0"))
 BATTERY_CAPACITY_AH = float(os.getenv("MY_BATTERY_CAPACITY_AH", "200"))
 BATTERY_NOMINAL_V = float(os.getenv("MY_BATTERY_NOMINAL_V", "55.2"))
 MINER_POWER_W = float(os.getenv("MY_MINER_POWER_W", "1000"))
@@ -202,11 +201,11 @@ def _find_first_value(data_list: List[Dict[str, Any]], keys: List[str], default:
     return float(default)
 
 
-def _effective_battery_capacity_wh(battery_voltage: float) -> float:
-    if BATTERY_CAPACITY_WH > 0:
-        return BATTERY_CAPACITY_WH
+def _effective_battery_capacity_wh(battery_voltage: float, battery_ah: float) -> float:
+    # System requirement: Wh is derived from Ah * V (no fixed Wh input).
     v = battery_voltage if battery_voltage > 1 else BATTERY_NOMINAL_V
-    return max(100.0, BATTERY_CAPACITY_AH * v)
+    ah = battery_ah if battery_ah > 0 else BATTERY_CAPACITY_AH
+    return max(100.0, ah * v)
 
 def _extract_phase_powers(data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -471,7 +470,7 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
 
 def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_power: float,
                                 sunrise_dt: datetime, sunset_dt: datetime,
-                                hist: Dict[str, Any], battery_voltage: float) -> Dict[str, Any]:
+                                hist: Dict[str, Any], battery_voltage: float, battery_ah: float) -> Dict[str, Any]:
     """
     Prevent rapid ON/OFF cycles near minimum SOC by requiring enough battery energy
     to bridge the period until typical PV can continuously feed the miner load.
@@ -481,6 +480,8 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
     if not isinstance(hourly_prod_mean, dict):
         hourly_prod_mean = {}
 
+    capacity_wh = _effective_battery_capacity_wh(battery_voltage, battery_ah)
+
     if battery_charge <= min_stop_soc:
         return {
             "allow_start": False,
@@ -489,9 +490,11 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
             "bridge_minutes": 0.0,
             "eta_minutes": 999.0,
             "reason": "soc_below_min_stop",
+            "capacity_wh": round(capacity_wh, 2),
+            "battery_voltage": round(max(0.0, battery_voltage), 2),
+            "battery_ah": round(max(0.0, battery_ah), 2),
         }
 
-    capacity_wh = _effective_battery_capacity_wh(battery_voltage)
     usable_wh = max(0.0, (battery_charge - min_stop_soc) / 100.0 * capacity_wh)
     deficit_w = max(0.0, MINER_POWER_W - max(0.0, current_power))
     bridge_minutes = 999.0 if deficit_w <= 0 else (usable_wh / deficit_w) * 60.0
@@ -526,6 +529,7 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
         "reason": "ok" if allow_start else "insufficient_bridge_energy",
         "capacity_wh": round(capacity_wh, 2),
         "battery_voltage": round(max(0.0, battery_voltage), 2),
+        "battery_ah": round(max(0.0, battery_ah), 2),
     }
 
 def _runtime_info() -> str:
@@ -1171,6 +1175,11 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             ["BMS_B_V1", "B_V1", "BMS_V", "BMS_U", "BAT_V", "BAT_U", "BMS Voltage", "Battery Voltage"],
             BATTERY_NOMINAL_V,
         )
+        battery_ah = _find_first_value(
+            dl,
+            ["BRC", "Battery Rated Capacity", "BMS_B_AH", "B_AH"],
+            BATTERY_CAPACITY_AH,
+        )
 
         # per-phase inverter outputs (W)
         inv_l1 = _find_value(dl, "INV_O_P_L1", 0.0)
@@ -1183,6 +1192,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         print(f"Inverter output per phase: L1={int(inv_l1)}W, L2={int(inv_l2)}W, L3={int(inv_l3)}W, Total={int(inv_lt)}W")
         print(f"Internal Power: {internal_power}W")
         print(f"Battery voltage: {battery_voltage:.2f}V")
+        print(f"Battery capacity: {battery_ah:.2f}Ah")
 
         now = datetime.now(tz=budapest_tz)
         hist = _history_recommendation(now, battery_charge, current_power, sunrise, sunset)
@@ -1192,12 +1202,12 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             f"min_stop_soc={hist['min_stop_soc']}% late_reserve={hist['late_day_reserve_soc']}% "
             f"headroom_good={hist['headroom_good']} preserve={hist['should_preserve_battery']}"
         )
-        start_guard = _compute_start_bridge_guard(now, battery_charge, current_power, sunrise, sunset, hist, battery_voltage)
+        start_guard = _compute_start_bridge_guard(now, battery_charge, current_power, sunrise, sunset, hist, battery_voltage, battery_ah)
         print(
             "[Start guard] "
             f"allow={start_guard['allow_start']} reason={start_guard['reason']} "
-            f"capacity={start_guard['capacity_wh']}Wh usable_wh={start_guard['usable_wh']}Wh "
-            f"deficit={start_guard['deficit_w']}W bridge={start_guard['bridge_minutes']}min eta={start_guard['eta_minutes']}min"
+            f"capacity={start_guard['capacity_wh']}Wh ({start_guard['battery_ah']}Ah @ {start_guard['battery_voltage']}V) "
+            f"usable_wh={start_guard['usable_wh']}Wh deficit={start_guard['deficit_w']}W bridge={start_guard['bridge_minutes']}min eta={start_guard['eta_minutes']}min"
         )
         hist.update({
             "start_guard_allow": bool(start_guard.get("allow_start", False)),
@@ -1205,6 +1215,8 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             "start_guard_bridge_minutes": float(start_guard.get("bridge_minutes", 0.0)),
             "start_guard_eta_minutes": float(start_guard.get("eta_minutes", 0.0)),
             "start_guard_capacity_wh": float(start_guard.get("capacity_wh", 0.0)),
+            "start_guard_battery_ah": float(start_guard.get("battery_ah", 0.0)),
+            "start_guard_battery_voltage": float(start_guard.get("battery_voltage", 0.0)),
         })
 
         solar_keywords = [
@@ -1345,7 +1357,15 @@ ________________________________
 
     except Exception as e:
         print(f"Error while checking production conditions: {e}")
-        return None, None, state, sunrise, sunset
+        # Keep tuple arity stable for caller unpacking.
+        now_fallback = datetime.now(tz=budapest_tz)
+        safe_sunrise = sunrise if isinstance(sunrise, datetime) else now_fallback
+        safe_sunset = sunset if isinstance(sunset, datetime) else now_fallback
+        return (
+            None, None, state, "unknown", safe_sunrise, safe_sunset, 0,
+            "unknown", 0, "",
+            "unknown", 0, "", {}
+        )
 
 
 def _load_telemetry_from_file() -> int:
