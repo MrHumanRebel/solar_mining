@@ -54,6 +54,8 @@ BATTERY_CAPACITY_AH = float(os.getenv("MY_BATTERY_CAPACITY_AH", "200"))
 BATTERY_NOMINAL_V = float(os.getenv("MY_BATTERY_NOMINAL_V", "55.2"))
 MINER_POWER_W = float(os.getenv("MY_MINER_POWER_W", "1050"))
 BATTERY_FLOOR_SOC = float(os.getenv("MY_BATTERY_FLOOR_SOC", "20"))
+HIGH_SOC_STOP_SOC = float(os.getenv("MY_HIGH_SOC_STOP_SOC", "90"))
+HIGH_SOC_STOP_MAX_PV_W = float(os.getenv("MY_HIGH_SOC_STOP_MAX_PV_W", "400"))
 
 print(platform.machine())
 print(platform.system())
@@ -1441,6 +1443,10 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
 
         stop_runtime_rules = [
             ("Late-day reserve reached (after 14h, while running)", prev_state == "production" and now.hour >= 14 and battery_charge <= hist["late_day_reserve_soc"]),
+            (
+                f"High-SOC bridge drained (SOC<{HIGH_SOC_STOP_SOC:.0f}% and PV<={HIGH_SOC_STOP_MAX_PV_W:.0f}W while running)",
+                prev_state == "production" and battery_charge < HIGH_SOC_STOP_SOC and current_power <= HIGH_SOC_STOP_MAX_PV_W,
+            ),
             ("PV <= 150W", current_power <= 150),
             ("Current weather non-solar + battery<=95 + PV<=1000W", non_solar_now and battery_charge <= 95 and current_power <= 1000),
             ("1H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f1 and battery_charge <= 95 and current_power <= 1000),
