@@ -1408,11 +1408,33 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             and bool(start_guard.get("energy_cover_ok", False))
         )
 
+        # Intelligent real-time start: require meaningful PV headroom and seasonal SOC discipline.
+        # This prevents autumn/winter starts from eating into battery recharge.
+        month_quality = str(hist.get("month_quality", "neutral")).lower()
+        season_margin_w = 150 if month_quality == "strong" else (300 if month_quality == "neutral" else 500)
+        season_soc_floor = (
+            max(hist["early_start_soc"], hist["min_stop_soc"] + 6)
+            if month_quality == "strong"
+            else (max(hist["early_start_soc"], 60) if month_quality == "neutral" else max(hist["early_start_soc"], 72))
+        )
+        season_time_ok = now.hour < (13 if month_quality == "strong" else (12 if month_quality == "neutral" else 11))
+        smart_bridge_pv_start = (
+            bool(start_guard.get("allow_start", False))
+            and current_power >= (MINER_POWER_W + season_margin_w)
+            and battery_charge >= season_soc_floor
+            and season_time_ok
+            and not hist.get("should_preserve_battery", False)
+        )
+
         start_rule_hits: List[str] = []
         stop_rule_hits: List[str] = []
 
         start_rules = [
             ("Summer clear-day fast start: usable bridge energy covers needed bridge energy", summer_fast_start),
+            (
+                "Bridge guard OK + PV headroom + seasonal SOC/time gate",
+                smart_bridge_pv_start,
+            ),
             ("Sunny+1H forecast, PV>0, SOC>=early_start, before 13h", solar_now and solar_f1 and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13),
             ("Sunny+1H forecast, SOC>=65, before 13h", solar_now and solar_f1 and battery_charge >= 65 and now.hour < 13),
             ("Sunny+1H forecast, SOC>=55, before 12h", solar_now and solar_f1 and battery_charge >= 55 and now.hour < 12),
