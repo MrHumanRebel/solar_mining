@@ -95,6 +95,7 @@ _shared_snapshot = {
     "battery": 0, "power": 0, "state": "init", "current_condition": "unknown",
     "sunrise": datetime.now(tz=budapest_tz), "sunset": datetime.now(tz=budapest_tz),
     "clouds": 0, "garage_temp": 0, "garage_hum": 0,
+    "inv_l1": 0, "inv_l2": 0, "inv_l3": 0, "inv_lt": 0,
     "historical_hints": {
         "month_quality": "neutral",
         "early_start_soc": 55,
@@ -120,6 +121,34 @@ _shared_snapshot = {
         "decision_summary": "unknown",
     },
 }
+
+
+def _idle_historical_hints() -> Dict[str, Any]:
+    """Reset hint payload during sleep/idle so /now does not show stale decisions."""
+    return {
+        "month_quality": "neutral",
+        "early_start_soc": 0,
+        "min_stop_soc": 0,
+        "late_day_reserve_soc": 0,
+        "should_preserve_battery": False,
+        "headroom_good": False,
+        "start_guard_allow": False,
+        "start_guard_reason": "idle",
+        "start_guard_bridge_minutes": 0,
+        "start_guard_eta_minutes": 0,
+        "start_guard_capacity_wh": 0,
+        "start_guard_battery_ah": 0,
+        "start_guard_battery_voltage": 0,
+        "start_guard_usable_wh": 0,
+        "start_guard_bms_floor_soc": 0,
+        "start_guard_bms_window_wh": 0,
+        "start_guard_needed_bridge_minutes": 0,
+        "start_guard_needed_bridge_wh": 0,
+        "decision_state": "sleep",
+        "decision_start_rules": [],
+        "decision_stop_rules": ["Idle window"],
+        "decision_summary": "SLEEP: outside active hours",
+    }
 
 # Unbounded in-memory telemetry history (no MAX_HISTORY_POINTS cap).
 telemetry_history: deque = deque()
@@ -933,18 +962,25 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         temps = get_temperatures()
         percentage = (used_quote / QUOTE_LIMIT) * 100 if QUOTE_LIMIT else 0
 
-        # read last saved phase powers
-        l1 = l2 = l3 = lt = None
+        # read inverter phase powers from live snapshot first; fall back to saved file.
+        l1 = l2 = l3 = lt = 0 if (_safe_float(power, 0.0) == 0 and str(state).lower() in {"stop", "sleep"}) else None
         unit = "W"
+        with snapshot_lock:
+            snap = dict(_shared_snapshot)
+        if l1 is None:
+            l1 = snap.get("inv_l1")
+            l2 = snap.get("inv_l2")
+            l3 = snap.get("inv_l3")
+            lt = snap.get("inv_lt")
         try:
-            if os.path.exists(SOLARMAN_FILE):
+            if (l1 is None or l2 is None or l3 is None or lt is None) and os.path.exists(SOLARMAN_FILE):
                 with open(SOLARMAN_FILE, 'r', encoding='utf-8') as f:
                     saved = json.load(f)
                 phase = saved.get("phasePowers", {})
-                l1 = phase.get("L1")
-                l2 = phase.get("L2")
-                l3 = phase.get("L3")
-                lt = phase.get("LT")
+                l1 = phase.get("L1") if l1 is None else l1
+                l2 = phase.get("L2") if l2 is None else l2
+                l3 = phase.get("L3") if l3 is None else l3
+                lt = phase.get("LT") if lt is None else lt
                 unit = phase.get("unit", "W")
         except Exception as e:
             print(f"/now phase read error: {e}")
@@ -2326,6 +2362,10 @@ def main_loop():
                         "current_condition": current_condition or "unknown",
                         "sunrise": sunrise, "sunset": sunset, "clouds": clouds or 0,
                         "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0,
+                        "inv_l1": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L1", 0.0)),
+                        "inv_l2": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L2", 0.0)),
+                        "inv_l3": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L3", 0.0)),
+                        "inv_lt": float(_find_value((data or {}).get("dataList", []), "INV_O_P_T", 0.0)),
                         "historical_hints": hist_hints or {}
                     })
 
@@ -2386,7 +2426,8 @@ def main_loop():
                     "current_condition": current_condition or "unknown",
                     "sunrise": sunrise, "sunset": sunset, "clouds": clouds or 0,
                     "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0,
-                    "historical_hints": _history_recommendation(now, 0, 0, sunrise, sunset)
+                    "inv_l1": 0, "inv_l2": 0, "inv_l3": 0, "inv_lt": 0,
+                    "historical_hints": _idle_historical_hints()
                 })
 
             pct = (used_quote / QUOTE_LIMIT) * 100 if QUOTE_LIMIT else 0
