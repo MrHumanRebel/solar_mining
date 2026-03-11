@@ -56,6 +56,9 @@ MINER_POWER_W = float(os.getenv("MY_MINER_POWER_W", "1050"))
 BATTERY_FLOOR_SOC = float(os.getenv("MY_BATTERY_FLOOR_SOC", "20"))
 HIGH_SOC_STOP_SOC = float(os.getenv("MY_HIGH_SOC_STOP_SOC", "90"))
 HIGH_SOC_STOP_MAX_PV_W = float(os.getenv("MY_HIGH_SOC_STOP_MAX_PV_W", "400"))
+BATTERY_PROTECT_SOC = float(os.getenv("MY_BATTERY_PROTECT_SOC", "90"))
+PV_COVERAGE_RATIO_STOP = float(os.getenv("MY_PV_COVERAGE_RATIO_STOP", "0.9"))
+PV_COVERAGE_RATIO_START = float(os.getenv("MY_PV_COVERAGE_RATIO_START", "0.75"))
 
 print(platform.machine())
 print(platform.system())
@@ -1428,6 +1431,9 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
 
         start_rule_hits: List[str] = []
         stop_rule_hits: List[str] = []
+        pv_start_threshold = max(150.0, MINER_POWER_W * PV_COVERAGE_RATIO_START)
+        pv_stop_threshold = max(150.0, MINER_POWER_W * PV_COVERAGE_RATIO_STOP)
+        pv_covers_miner = current_power >= pv_stop_threshold
 
         start_rules = [
             ("Summer clear-day fast start: usable bridge energy covers needed bridge energy", summer_fast_start),
@@ -1436,19 +1442,19 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 smart_bridge_pv_start,
             ),
             ("Sunny+1H forecast, PV>0, SOC>=early_start, before 13h", solar_now and solar_f1 and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13),
-            ("Sunny+1H forecast, SOC>=65, before 13h", solar_now and solar_f1 and battery_charge >= 65 and now.hour < 13),
-            ("Sunny+1H forecast, SOC>=55, before 12h", solar_now and solar_f1 and battery_charge >= 55 and now.hour < 12),
-            ("Sunny+1H forecast, SOC>=35, before 11h", solar_now and solar_f1 and battery_charge >= 35 and now.hour < 11),
+            (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=65, before 13h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 65 and now.hour < 13),
+            (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=55, before 12h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 55 and now.hour < 12),
+            (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=35, before 11h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 35 and now.hour < 11),
             ("Sunny+3H forecast, PV>0, SOC>=early_start, before 13h", solar_now and solar_f3 and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13),
-            ("Sunny+3H forecast, SOC>=65, before 13h", solar_now and solar_f3 and battery_charge >= 65 and now.hour < 13),
-            ("Sunny+3H forecast, SOC>=55, before 12h", solar_now and solar_f3 and battery_charge >= 55 and now.hour < 12),
-            ("Sunny+3H forecast, SOC>=35, before 11h", solar_now and solar_f3 and battery_charge >= 35 and now.hour < 11),
+            (f"Sunny+3H forecast, PV>={pv_start_threshold:.0f}W, SOC>=65, before 13h", solar_now and solar_f3 and current_power >= pv_start_threshold and battery_charge >= 65 and now.hour < 13),
+            (f"Sunny+3H forecast, PV>={pv_start_threshold:.0f}W, SOC>=55, before 12h", solar_now and solar_f3 and current_power >= pv_start_threshold and battery_charge >= 55 and now.hour < 12),
+            (f"Sunny+3H forecast, PV>={pv_start_threshold:.0f}W, SOC>=35, before 11h", solar_now and solar_f3 and current_power >= pv_start_threshold and battery_charge >= 35 and now.hour < 11),
             ("Historical headroom good + SOC>=early_start, before 14h", hist["headroom_good"] and battery_charge >= hist["early_start_soc"] and now.hour < 14),
             ("SOC>=60 and PV>=2500W, before 11h", battery_charge >= 60 and current_power >= 2500 and now.hour < 11),
             ("SOC>=70 and PV>=2250W, before 12h", battery_charge >= 70 and current_power >= 2250 and now.hour < 12),
             ("SOC>=80 and PV>=2000W, before 13h", battery_charge >= 80 and current_power >= 2000 and now.hour < 13),
             ("SOC>=40 and PV>=3000W, before 14h", battery_charge >= 40 and current_power >= 3000 and now.hour < 14),
-            ("SOC>90 and PV>50W", battery_charge > 90 and current_power > 50),
+            (f"SOC>{BATTERY_PROTECT_SOC:.0f}% and PV>={pv_start_threshold:.0f}W", battery_charge > BATTERY_PROTECT_SOC and current_power >= pv_start_threshold),
         ]
         for label, ok in start_rules:
             if ok:
@@ -1464,6 +1470,10 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 stop_rule_hits.append(label)
 
         stop_runtime_rules = [
+            (
+                f"Battery<{BATTERY_PROTECT_SOC:.0f}% and PV<{pv_stop_threshold:.0f}W (insufficient solar cover) while running",
+                prev_state == "production" and battery_charge < BATTERY_PROTECT_SOC and not pv_covers_miner,
+            ),
             ("Late-day reserve reached (after 14h, while running)", prev_state == "production" and now.hour >= 14 and battery_charge <= hist["late_day_reserve_soc"]),
             (
                 f"High-SOC bridge drained (SOC<{HIGH_SOC_STOP_SOC:.0f}% and PV<={HIGH_SOC_STOP_MAX_PV_W:.0f}W while running)",
@@ -1522,6 +1532,8 @@ ________________________________
                     f3_cond, f3_clouds, f3_ts, hist)
 
         # ===== existing logic continues below =====
+        matched_runtime_stops = [label for label, ok in stop_runtime_rules if ok]
+
         if stop_rule_hits:
             print("Battery emergency shutdown.")
             decision_summary = "STOP: battery protection"
@@ -1533,6 +1545,17 @@ ________________________________
                     prev_state = state
                     uptime = now
                     save_prev_state(prev_state, uptime)
+                if is_rpi:
+                    press_power_button(16, 0.55)
+        elif matched_runtime_stops:
+            stop_rule_hits = matched_runtime_stops
+            decision_summary = "STOP: runtime stop rules satisfied"
+            print("Crypto production over.")
+            state = "stop"
+            decision_state = state
+            if prev_state == "production":
+                print("Trying to press power button.")
+                uptime = now
                 if is_rpi:
                     press_power_button(16, 0.55)
         elif start_guard["allow_start"] and start_rule_hits:
@@ -1552,20 +1575,7 @@ ________________________________
             state = "stop"
             decision_state = state
         else:
-            matched_runtime_stops = [label for label, ok in stop_runtime_rules if ok]
-            if matched_runtime_stops:
-                stop_rule_hits = matched_runtime_stops
-                decision_summary = "STOP: runtime stop rules satisfied"
-                print("Crypto production over.")
-                state = "stop"
-                decision_state = state
-                if prev_state == "production":
-                    print("Trying to press power button.")
-                    uptime = now
-                    if is_rpi:
-                        press_power_button(16, 0.55)
-            else:
-                print("No change!")
+            print("No change!")
 
         hist.update({
             "decision_state": decision_state,
