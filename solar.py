@@ -1494,7 +1494,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             check_uptime(now, prev_state)
 
         # IMMEDIATE POWER-BASED STOP RULE MINER IS ON L2 and L3
-        if (inv_l2 > 2000) or (inv_l3 > 2000) or (inv_lt > 5000):
+        if (inv_l2 > 2500) or (inv_l3 > 2500) or (inv_lt > 5000):
             stop_rule_hits = ["Power safety threshold exceeded (L2/L3/Total inverter output)"]
             decision_summary = "STOP: power safety"
             print("Power safety threshold exceeded → Crypto production over (STOP).")
