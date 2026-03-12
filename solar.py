@@ -559,25 +559,124 @@ def _estimate_minutes_for_energy_budget(sunrise_dt: datetime, hourly_profile: Di
     return max(0.0, (end - start).total_seconds() / 60.0)
 
 
+def _telemetry_context_for_history(now: datetime) -> Dict[str, Any]:
+    """Recent telemetry context (fresh/runtime signal) to blend with long-range Solarman history."""
+    items = list(telemetry_history)
+    if not items:
+        return {
+            "samples": 0,
+            "fresh_midday_pv": 0.0,
+            "fresh_charge_rate_pct_per_hour": 0.0,
+            "fresh_clouds": 100.0,
+            "fresh_soc_floor": 0.0,
+            "fresh_month_quality": "neutral",
+            "confidence": 0.0,
+        }
+
+    points: List[Dict[str, Any]] = []
+    for rec in items[-1200:]:  # cap scan cost
+        try:
+            ts = datetime.fromisoformat(str(rec.get("ts", "")))
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=budapest_tz)
+
+        # Prefer fresh data from the same month and within ~10 days.
+        age_h = (now - ts).total_seconds() / 3600.0
+        if age_h < 0 or age_h > 24 * 10:
+            continue
+        if ts.month != now.month:
+            continue
+
+        points.append({
+            "ts": ts,
+            "battery": _safe_float(rec.get("battery"), 0.0),
+            "power": _safe_float(rec.get("power"), 0.0),
+            "clouds": _safe_float(rec.get("clouds"), 100.0),
+        })
+
+    if len(points) < 8:
+        return {
+            "samples": len(points),
+            "fresh_midday_pv": 0.0,
+            "fresh_charge_rate_pct_per_hour": 0.0,
+            "fresh_clouds": 100.0,
+            "fresh_soc_floor": 0.0,
+            "fresh_month_quality": "neutral",
+            "confidence": 0.2 if points else 0.0,
+        }
+
+    points.sort(key=lambda x: x["ts"])
+    midday = [x["power"] for x in points if 10 <= x["ts"].hour <= 14]
+    fresh_midday_pv = statistics.median(midday) if midday else statistics.median([x["power"] for x in points])
+
+    charge_rates: List[float] = []
+    for i in range(1, len(points)):
+        p0 = points[i - 1]
+        p1 = points[i]
+        dt_h = (p1["ts"] - p0["ts"]).total_seconds() / 3600.0
+        if dt_h <= 0 or dt_h > 0.5:
+            continue
+        if max(p0["power"], p1["power"]) < 700:
+            continue
+        rate = (p1["battery"] - p0["battery"]) / dt_h
+        if 0.05 <= rate <= 18:
+            charge_rates.append(rate)
+
+    fresh_charge_rate = statistics.median(charge_rates) if charge_rates else 0.0
+    fresh_clouds = statistics.median([x["clouds"] for x in points])
+
+    # Recent low-SOC behavior during active hours to shape reserve discipline.
+    active_soc = [x["battery"] for x in points if 9 <= x["ts"].hour <= 18]
+    fresh_soc_floor = statistics.quantiles(active_soc, n=5)[1] if len(active_soc) >= 5 else (min(active_soc) if active_soc else 0.0)
+
+    if fresh_midday_pv >= 2300 and fresh_charge_rate >= 2.2 and fresh_clouds <= 70:
+        fresh_month_quality = "strong"
+    elif fresh_midday_pv <= 1500 or fresh_charge_rate <= 1.0 or fresh_clouds >= 85:
+        fresh_month_quality = "weak"
+    else:
+        fresh_month_quality = "neutral"
+
+    confidence = min(1.0, len(points) / 120.0)
+    return {
+        "samples": len(points),
+        "fresh_midday_pv": float(fresh_midday_pv),
+        "fresh_charge_rate_pct_per_hour": float(fresh_charge_rate),
+        "fresh_clouds": float(fresh_clouds),
+        "fresh_soc_floor": float(fresh_soc_floor),
+        "fresh_month_quality": fresh_month_quality,
+        "confidence": float(confidence),
+    }
+
+
 def _history_recommendation(now: datetime, battery_charge: float, current_power: float,
                             sunrise_dt: datetime, sunset_dt: datetime) -> Dict[str, Any]:
     """
     Creates dynamic decision hints from historical production behavior for current month.
+    Blends long-range Solarman history with fresh runtime telemetry context.
     """
     global historical_profile
     months = (historical_profile or {}).get("months", {})
     month_cfg = _interpolate_month_config(now.month, months)
     interpolated_hourly = _interpolate_hourly_profile_for_month(now.month, months)
+    telem_ctx = _telemetry_context_for_history(now)
 
     if not month_cfg:
         return {
-            "month_quality": "neutral",
+            "month_quality": telem_ctx.get("fresh_month_quality", "neutral"),
             "early_start_soc": 55,
             "min_stop_soc": 20,
             "late_day_reserve_soc": 80,
             "should_preserve_battery": now.hour >= 15 and battery_charge < 80,
             "headroom_good": current_power >= 2500,
             "hourly_prod_mean": {},
+            "predicted_minutes_to_full": None,
+            "predicted_full_charge_time": None,
+            "can_refill_before_sunset": False,
+            "telemetry_samples": int(telem_ctx.get("samples", 0)),
+            "telemetry_confidence": float(telem_ctx.get("confidence", 0.0)),
+            "telemetry_month_quality": str(telem_ctx.get("fresh_month_quality", "neutral")),
         }
 
     daylight_span = int(month_cfg.get("daylight_span", 8))
@@ -586,12 +685,27 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
     solar_start_hour = int(month_cfg.get("solar_start_hour", sunrise_dt.hour))
     evening_soc_p40 = float(month_cfg.get("evening_soc_p40", 45.0))
 
-    strong_month = daylight_span >= 9 and midday_avg >= 2400
-    weak_month = daylight_span <= 7 or midday_avg <= 1700
+    # Blend historical (slow) with telemetry (fresh) for stronger adaptivity.
+    telem_weight = min(0.45, max(0.0, float(telem_ctx.get("confidence", 0.0)) * 0.45))
+    blended_midday = (1.0 - telem_weight) * midday_avg + telem_weight * float(telem_ctx.get("fresh_midday_pv", midday_avg))
+
+    strong_month = daylight_span >= 9 and blended_midday >= 2300
+    weak_month = daylight_span <= 7 or blended_midday <= 1650
+
+    telem_quality = str(telem_ctx.get("fresh_month_quality", "neutral"))
+    if telem_quality == "strong" and not weak_month:
+        strong_month = True
+    if telem_quality == "weak":
+        weak_month = True
+        strong_month = False
 
     early_start_soc = 32 if strong_month else (58 if weak_month else 45)
     min_stop_soc = 26 if weak_month else 20
     late_day_reserve_soc = max(72, int(evening_soc_p40 + (8 if weak_month else 4)))
+
+    fresh_floor = float(telem_ctx.get("fresh_soc_floor", 0.0))
+    if fresh_floor > 0:
+        late_day_reserve_soc = max(late_day_reserve_soc, int(min(92.0, fresh_floor + (10 if weak_month else 6))))
 
     headroom_good = (
         current_power >= max(1800.0, 0.55 * daily_peak_p75)
@@ -605,6 +719,16 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
         and current_power < max(1400.0, 0.4 * daily_peak_p75)
     )
 
+    full_charge_pred = _predict_time_to_full_charge(now, battery_charge, current_power, sunrise_dt, sunset_dt, interpolated_hourly)
+
+    # If history suggests the battery will refill before sunset, allow slightly earlier starts.
+    if full_charge_pred.get("can_refill_before_sunset", False) and full_charge_pred.get("minutes_to_full") is not None:
+        margin_min = float(full_charge_pred.get("sunset_margin_minutes", 0.0))
+        if margin_min >= 45:
+            early_start_soc = max(min_stop_soc + 6, early_start_soc - 8)
+        elif margin_min >= 15:
+            early_start_soc = max(min_stop_soc + 8, early_start_soc - 4)
+
     return {
         "month_quality": "strong" if strong_month else ("weak" if weak_month else "neutral"),
         "early_start_soc": early_start_soc,
@@ -613,7 +737,127 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
         "should_preserve_battery": should_preserve_battery,
         "headroom_good": headroom_good,
         "hourly_prod_mean": month_cfg.get("hourly_prod_mean", {}) or interpolated_hourly,
+        "predicted_minutes_to_full": full_charge_pred.get("minutes_to_full"),
+        "predicted_full_charge_time": full_charge_pred.get("full_charge_time"),
+        "can_refill_before_sunset": bool(full_charge_pred.get("can_refill_before_sunset", False)),
+        "sunset_margin_minutes": float(full_charge_pred.get("sunset_margin_minutes", 0.0)),
+        "predicted_charge_rate_pct_per_hour": float(full_charge_pred.get("rate_pct_per_hour", 0.0)),
+        "telemetry_samples": int(telem_ctx.get("samples", 0)),
+        "telemetry_confidence": float(telem_ctx.get("confidence", 0.0)),
+        "telemetry_month_quality": telem_quality,
+        "blended_midday_pv": float(blended_midday),
     }
+
+
+def _predict_time_to_full_charge(now: datetime, battery_charge: float, current_power: float,
+                                 sunrise_dt: datetime, sunset_dt: datetime,
+                                 hourly_prod_mean: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Estimate minutes to 100% SOC based on recent telemetry trend and historical month profile.
+    This is intentionally conservative: it only allows early-start relaxation when refill
+    is likely before sunset.
+    """
+    if battery_charge >= 99.5:
+        return {
+            "minutes_to_full": 0.0,
+            "full_charge_time": now.isoformat(),
+            "can_refill_before_sunset": True,
+            "sunset_margin_minutes": max(0.0, (sunset_dt - now).total_seconds() / 60.0),
+            "rate_pct_per_hour": 0.0,
+        }
+
+    # 1) Learn charge-rate from telemetry deltas (same month, daytime, positive charging periods).
+    rates: List[float] = []
+    hist_items = list(telemetry_history)
+    for i in range(1, len(hist_items)):
+        prev = hist_items[i - 1]
+        cur = hist_items[i]
+        try:
+            t0 = datetime.fromisoformat(str(prev.get("ts", "")))
+            t1 = datetime.fromisoformat(str(cur.get("ts", "")))
+        except Exception:
+            continue
+
+        if t0.tzinfo is None:
+            t0 = t0.replace(tzinfo=budapest_tz)
+        if t1.tzinfo is None:
+            t1 = t1.replace(tzinfo=budapest_tz)
+
+        if t1 <= t0 or t1.month != now.month:
+            continue
+
+        dt_h = (t1 - t0).total_seconds() / 3600.0
+        if dt_h <= 0 or dt_h > 0.5:
+            continue
+
+        b0 = _safe_float(prev.get("battery"), -1)
+        b1 = _safe_float(cur.get("battery"), -1)
+        if not (0 <= b0 <= 100 and 0 <= b1 <= 100):
+            continue
+
+        p0 = _safe_float(prev.get("power"), 0)
+        p1 = _safe_float(cur.get("power"), 0)
+        c0 = _safe_float(prev.get("clouds"), 100)
+        c1 = _safe_float(cur.get("clouds"), 100)
+
+        # Prefer segments where PV is meaningful and weather is not heavily overcast.
+        if max(p0, p1) < 700 or max(c0, c1) > 90:
+            continue
+
+        rate = (b1 - b0) / dt_h
+        if 0.05 <= rate <= 18.0:
+            rates.append(rate)
+
+    rate_pct_per_hour = statistics.median(rates) if rates else 0.0
+
+    # 2) Blend with profile confidence from expected hourly PV around "now".
+    expected_now_pv = _pv_estimate_at(now, hourly_prod_mean) if hourly_prod_mean else 0.0
+    if rate_pct_per_hour <= 0.0 and expected_now_pv > MINER_POWER_W * 0.8:
+        # fallback conservative synthetic rate when telemetry is sparse
+        rate_pct_per_hour = 2.8 if now.month in (4, 5, 6, 7, 8) else 1.8
+
+    if rate_pct_per_hour <= 0.0:
+        return {
+            "minutes_to_full": None,
+            "full_charge_time": None,
+            "can_refill_before_sunset": False,
+            "sunset_margin_minutes": 0.0,
+            "rate_pct_per_hour": 0.0,
+        }
+
+    missing_pct = max(0.0, 100.0 - battery_charge)
+    minutes_to_full = (missing_pct / rate_pct_per_hour) * 60.0
+    full_dt = now + timedelta(minutes=minutes_to_full)
+    margin_min = (sunset_dt - full_dt).total_seconds() / 60.0
+
+    return {
+        "minutes_to_full": round(max(0.0, minutes_to_full), 2),
+        "full_charge_time": full_dt.isoformat(),
+        "can_refill_before_sunset": margin_min >= 0,
+        "sunset_margin_minutes": round(margin_min, 2),
+        "rate_pct_per_hour": round(rate_pct_per_hour, 3),
+    }
+
+
+def _has_solarman_payload(data: Optional[Dict[str, Any]]) -> bool:
+    return bool(isinstance(data, dict) and isinstance(data.get("dataList"), list) and len(data.get("dataList")) > 0)
+
+
+def _with_daytime_data_fallback(data: Dict[str, Any], now: datetime,
+                                sunrise_dt: datetime, sunset_dt: datetime) -> Tuple[Dict[str, Any], bool]:
+    """During active daylight window, keep the previous non-empty payload if API returns empty dataList."""
+    if _has_solarman_payload(data):
+        return data, False
+
+    if not _is_active_window(now, sunrise_dt, sunset_dt):
+        return data, False
+
+    previous = load_data()
+    if _has_solarman_payload(previous):
+        print("[Fallback] Empty Solarman dataList in daytime -> using previous stored payload to avoid false stop/start toggles.")
+        return previous, True
+
+    return data, False
 
 
 def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_power: float,
@@ -1390,7 +1634,10 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             "[History tuning] "
             f"month={hist['month_quality']} early_start_soc={hist['early_start_soc']}% "
             f"min_stop_soc={hist['min_stop_soc']}% late_reserve={hist['late_day_reserve_soc']}% "
-            f"headroom_good={hist['headroom_good']} preserve={hist['should_preserve_battery']}"
+            f"headroom_good={hist['headroom_good']} preserve={hist['should_preserve_battery']} "
+            f"telem_q={hist.get('telemetry_month_quality', 'neutral')} samples={hist.get('telemetry_samples', 0)} "
+            f"conf={float(hist.get('telemetry_confidence', 0.0)):.2f} blended_midday={float(hist.get('blended_midday_pv', 0.0)):.0f}W "
+            f"full_eta_min={hist.get('predicted_minutes_to_full')}"
         )
         start_guard = _compute_start_bridge_guard(now, battery_charge, current_power, sunrise, sunset, hist, battery_voltage, battery_ah)
         print(
@@ -2339,7 +2586,8 @@ def main_loop():
                      f3_cond, f3_clouds, f3_ts) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
                 # Fetch device data (depends on token)
-                data = fetch_current_data(token) if token else {}
+                raw_data = fetch_current_data(token) if token else {}
+                data, used_previous_payload = _with_daytime_data_fallback(raw_data or {}, now, sunrise, sunset)
                 store_data(data)  # attaches phasePowers
 
                 (battery, power, state, current_condition, sunrise, sunset, clouds,
@@ -2347,9 +2595,11 @@ def main_loop():
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
 
-                has_usable_solarman_data = bool((data or {}).get("dataList"))
+                has_usable_solarman_data = _has_solarman_payload(data)
                 if not has_usable_solarman_data:
                     print("[Telemetry] Solarman dataList is empty for this cycle; saving fallback telemetry row.")
+                elif used_previous_payload:
+                    print("[Telemetry] API payload empty during daytime; telemetry uses previous valid Solarman snapshot.")
                 _record_telemetry(now, data or {}, battery or 0, power or 0, state or "unknown",
                                   current_condition or "unknown", clouds or 0, garage_temp, garage_hum, hist_hints, sunrise, sunset)
 
