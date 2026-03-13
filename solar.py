@@ -701,11 +701,17 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
 
     early_start_soc = 32 if strong_month else (58 if weak_month else 45)
     min_stop_soc = 26 if weak_month else 20
-    late_day_reserve_soc = max(72, int(evening_soc_p40 + (8 if weak_month else 4)))
+    late_day_reserve_soc = max(70, int(evening_soc_p40 + (8 if weak_month else 4)))
 
     fresh_floor = float(telem_ctx.get("fresh_soc_floor", 0.0))
     if fresh_floor > 0:
-        late_day_reserve_soc = max(late_day_reserve_soc, int(min(92.0, fresh_floor + (10 if weak_month else 6))))
+        late_day_reserve_soc = max(late_day_reserve_soc, int(min(88.0, fresh_floor + (8 if weak_month else 5))))
+
+    # Keep reserve discipline realistic so the miner does not stop too early on good days.
+    # In non-export systems an overfilled battery causes PV curtailment; reserve should not
+    # be so high that we waste midday/afternoon production windows.
+    reserve_cap = 88 if weak_month else (86 if strong_month else 87)
+    late_day_reserve_soc = min(reserve_cap, late_day_reserve_soc)
 
     headroom_good = (
         current_power >= max(1800.0, 0.55 * daily_peak_p75)
@@ -915,6 +921,17 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
 
     energy_cover_ok = needed_bridge_wh > 0 and usable_wh >= needed_bridge_wh
     allow_start = battery_charge > min_stop_soc and (bridge_minutes >= eta_minutes or energy_cover_ok)
+
+    # If historical profile predicts refill before sunset, relax morning start conservatively
+    # to avoid missing production windows in non-export systems.
+    refill_relax = (
+        bool(hist.get("can_refill_before_sunset", False))
+        and battery_charge >= (min_stop_soc + 10)
+        and current_power >= max(300.0, MINER_POWER_W * 0.30)
+    )
+    if (not allow_start) and refill_relax:
+        allow_start = True
+
     return {
         "allow_start": allow_start,
         "energy_cover_ok": bool(energy_cover_ok),
@@ -924,7 +941,7 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
         "eta_minutes": round(eta_minutes, 2),
         "needed_bridge_minutes": round(needed_bridge_minutes, 2),
         "needed_bridge_wh": round(needed_bridge_wh, 2),
-        "reason": "ok" if allow_start else ("soc_below_min_stop" if battery_charge <= min_stop_soc else "insufficient_bridge_energy"),
+        "reason": "ok" if allow_start and not refill_relax else ("refill_confident_relaxation" if allow_start and refill_relax else ("soc_below_min_stop" if battery_charge <= min_stop_soc else "insufficient_bridge_energy")),
         "capacity_wh": round(capacity_wh, 2),
         "battery_voltage": round(max(0.0, battery_voltage), 2),
         "battery_ah": round(max(0.0, battery_ah), 2),
@@ -1697,13 +1714,13 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         # Intelligent real-time start: require meaningful PV headroom and seasonal SOC discipline.
         # This prevents autumn/winter starts from eating into battery recharge.
         month_quality = str(hist.get("month_quality", "neutral")).lower()
-        season_margin_w = 150 if month_quality == "strong" else (300 if month_quality == "neutral" else 500)
+        season_margin_w = 50 if month_quality == "strong" else (180 if month_quality == "neutral" else 350)
         season_soc_floor = (
-            max(hist["early_start_soc"], hist["min_stop_soc"] + 6)
+            max(hist["min_stop_soc"] + 4, hist["early_start_soc"] - 6)
             if month_quality == "strong"
-            else (max(hist["early_start_soc"], 60) if month_quality == "neutral" else max(hist["early_start_soc"], 72))
+            else (max(hist["early_start_soc"] - 2, 52) if month_quality == "neutral" else max(hist["early_start_soc"], 68))
         )
-        season_time_ok = now.hour < (13 if month_quality == "strong" else (12 if month_quality == "neutral" else 11))
+        season_time_ok = now.hour < (15 if month_quality == "strong" else (14 if month_quality == "neutral" else 12))
         smart_bridge_pv_start = (
             bool(start_guard.get("allow_start", False))
             and current_power >= (MINER_POWER_W + season_margin_w)
@@ -1728,6 +1745,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=65, before 13h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 65 and now.hour < 13),
             (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=55, before 12h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 55 and now.hour < 12),
             (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=35, before 11h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 35 and now.hour < 11),
+            ("Bridge-friendly morning start: SOC>=min_stop+12 and PV>=450W before 11h", battery_charge >= (hist["min_stop_soc"] + 12) and current_power >= 450 and now.hour < 11),
             ("Sunny+3H forecast, PV>0, SOC>=early_start, before 13h", solar_now and solar_f3 and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13),
             (f"Sunny+3H forecast, PV>={pv_start_threshold:.0f}W, SOC>=65, before 13h", solar_now and solar_f3 and current_power >= pv_start_threshold and battery_charge >= 65 and now.hour < 13),
             (f"Sunny+3H forecast, PV>={pv_start_threshold:.0f}W, SOC>=55, before 12h", solar_now and solar_f3 and current_power >= pv_start_threshold and battery_charge >= 55 and now.hour < 12),
@@ -1752,21 +1770,28 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             if ok:
                 stop_rule_hits.append(label)
 
+        curtailment_prevent_window = (
+            prev_state == "production"
+            and now.hour < 17
+            and battery_charge >= 96
+            and current_power >= max(350.0, MINER_POWER_W * 0.35)
+        )
+
         stop_runtime_rules = [
             (
                 f"Battery<{BATTERY_PROTECT_SOC:.0f}% and PV<{pv_stop_threshold:.0f}W (insufficient solar cover) while running",
-                prev_state == "production" and battery_charge < BATTERY_PROTECT_SOC and not pv_covers_miner,
+                prev_state == "production" and battery_charge < BATTERY_PROTECT_SOC and not pv_covers_miner and not curtailment_prevent_window,
             ),
-            ("Late-day reserve reached (after 14h, while running)", prev_state == "production" and now.hour >= 14 and battery_charge <= hist["late_day_reserve_soc"]),
+            ("Late-day reserve reached (after 14h, while running)", prev_state == "production" and now.hour >= 14 and battery_charge <= hist["late_day_reserve_soc"] and not curtailment_prevent_window),
             (
                 f"High-SOC bridge drained (SOC<{HIGH_SOC_STOP_SOC:.0f}% and PV<={HIGH_SOC_STOP_MAX_PV_W:.0f}W while running)",
-                prev_state == "production" and battery_charge < HIGH_SOC_STOP_SOC and current_power <= HIGH_SOC_STOP_MAX_PV_W,
+                prev_state == "production" and battery_charge < HIGH_SOC_STOP_SOC and current_power <= HIGH_SOC_STOP_MAX_PV_W and not curtailment_prevent_window,
             ),
-            ("PV <= 150W", current_power <= 150),
-            ("Current weather non-solar + battery<=95 + PV<=1000W", non_solar_now and battery_charge <= 95 and current_power <= 1000),
-            ("1H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f1 and battery_charge <= 95 and current_power <= 1000),
-            ("3H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f3 and battery_charge <= 95 and current_power <= 1000),
-            ("Historical preserve-battery after 14h", hist["should_preserve_battery"] and now.hour >= 14),
+            ("PV <= 150W", current_power <= 150 and not curtailment_prevent_window),
+            ("Current weather non-solar + battery<=95 + PV<=1000W", non_solar_now and battery_charge <= 95 and current_power <= 1000 and not curtailment_prevent_window),
+            ("1H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f1 and battery_charge <= 95 and current_power <= 1000 and not curtailment_prevent_window),
+            ("3H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f3 and battery_charge <= 95 and current_power <= 1000 and not curtailment_prevent_window),
+            ("Historical preserve-battery after 14h", hist["should_preserve_battery"] and now.hour >= 14 and not curtailment_prevent_window),
         ]
 
         decision_summary = "No state change"
@@ -2181,10 +2206,10 @@ let currentLang='en';
 const I18N={
   en:{title:'Solar Mining Dashboard',theme:'Theme',downloadTelemetry:'Telemetry JSON',from:'From',to:'To',last30:'Last 30 days',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',
       state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
-      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
+      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardFullEta:'ETA to 100% battery charge',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
   hu:{title:'Solar Bányászat Dashboard',theme:'Téma',downloadTelemetry:'Telemetry JSON letöltése',from:'Ettől',to:'Eddig',last30:'Utolsó 30 nap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',
       state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
-      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
+      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardFullEta:'Várható idő 100% akku töltésig',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
 const t=(k)=>I18N[currentLang][k]||k;
 function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
@@ -2261,6 +2286,8 @@ const bridgeMinutes=Number(hints.start_guard_bridge_minutes||0);
 const etaMinutes=Number(hints.start_guard_eta_minutes||0);
 const startGuardBridge=`${bridgeMinutes.toFixed(1)} ${t('unitMin')}`;
 const startGuardEta=`${etaMinutes.toFixed(1)} ${t('unitMin')}`;
+const predictedMinutesToFull=Number(hints.predicted_minutes_to_full);
+const startGuardFullEta=Number.isFinite(predictedMinutesToFull)&&predictedMinutesToFull>=0?`${predictedMinutesToFull.toFixed(1)} ${t('unitMin')}`:'--';
 const startGuardCapacity=`${Number(hints.start_guard_capacity_wh||0).toFixed(1)} ${t('unitWh')} (${Number(hints.start_guard_battery_ah||0).toFixed(1)}Ah @ ${Number(hints.start_guard_battery_voltage||0).toFixed(2)}V)`;
 const startGuardUsable=`${Number(hints.start_guard_usable_wh||0).toFixed(1)} ${t('unitWh')}`;
 const startGuardUsableFormula=`${Number(hints.start_guard_soc_window_pct||0).toFixed(0)}% = ${Number(d.battery||0).toFixed(0)}% - ${Number(hints.start_guard_min_stop_soc||0).toFixed(0)}%`;
@@ -2274,7 +2301,7 @@ const stopRules=Array.isArray(hints.decision_stop_rules)?hints.decision_stop_rul
 const renderRuleList=(arr)=>arr.length?`<ul class='hint-list'>${arr.map(x=>`<li>${String(x)}</li>`).join('')}</ul>`:`<div class='hint-sub'>${t('decisionNone')}</div>`;
 const startGuardBridgeView=startGuardBridge;
 const startGuardEtaView=startGuardEta;
-document.getElementById('historyHints').innerHTML=`<div class='hint-section'><div class='hint-section-title'>${t('hintHistoryTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-calendar-days'></i> ${t('monthQuality')}</div><div class='hint-value'>${qText}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt'></i> ${t('earlyStart')}</div><div class='hint-value'>${Number(hints.early_start_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-stop'></i> ${t('minStop')}</div><div class='hint-value'>${Number(hints.min_stop_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-end'></i> ${t('lateReserve')}</div><div class='hint-value'>${Number(hints.late_day_reserve_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-shield-heart'></i> ${t('preserveBattery')}</div><div class='hint-value'>${boolTxt(!!hints.should_preserve_battery)}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-gauge-high'></i> ${t('headroomGood')}</div><div class='hint-value'>${boolTxt(!!hints.headroom_good)}</div></div></div><div class='hint-card decision-card'><div class='hint-title'><i class='fa-solid fa-list-check'></i> ${t('hintDecisionTitle')}</div><div class='hint-sub'><strong>${t('decisionState')}:</strong> ${decisionState}</div><div class='hint-sub'><strong>${t('decisionSummary')}:</strong> ${decisionSummary}</div><div class='hint-sub'><strong>${t('decisionStartRules')}:</strong></div>${renderRuleList(startRules)}<div class='hint-sub'><strong>${t('decisionStopRules')}:</strong></div>${renderRuleList(stopRules)}</div></div><div class='hint-section'><div class='hint-section-title'>${t('hintStartGuardTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-play-circle'></i> ${t('startGuardAllow')}</div><div class='hint-value'>${startGuardAllow}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-info'></i> ${t('startGuardReason')}</div><div class='hint-value'>${reasonTxt}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-start'></i> ${t('startGuardBridge')}</div><div class='hint-value'>${startGuardBridgeView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-half'></i> ${t('startGuardEta')}</div><div class='hint-value'>${startGuardEtaView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-car-battery'></i> ${t('startGuardCapacity')}</div><div class='hint-value'>${startGuardCapacity}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-three-quarters'></i> ${t('startGuardUsable')}</div><div class='hint-value'>${startGuardUsable}</div><div class='hint-sub'><strong>${t('usableFormula')}:</strong> ${startGuardUsableFormula}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-business-time'></i> ${t('neededBridgeTime')}</div><div class='hint-value'>${neededBridgeTime}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt-lightning'></i> ${t('neededBridgeEnergy')}</div><div class='hint-value'>${neededBridgeEnergy}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div></div></div>`;
+document.getElementById('historyHints').innerHTML=`<div class='hint-section'><div class='hint-section-title'>${t('hintHistoryTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-calendar-days'></i> ${t('monthQuality')}</div><div class='hint-value'>${qText}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt'></i> ${t('earlyStart')}</div><div class='hint-value'>${Number(hints.early_start_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-stop'></i> ${t('minStop')}</div><div class='hint-value'>${Number(hints.min_stop_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-end'></i> ${t('lateReserve')}</div><div class='hint-value'>${Number(hints.late_day_reserve_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-shield-heart'></i> ${t('preserveBattery')}</div><div class='hint-value'>${boolTxt(!!hints.should_preserve_battery)}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-gauge-high'></i> ${t('headroomGood')}</div><div class='hint-value'>${boolTxt(!!hints.headroom_good)}</div></div></div><div class='hint-card decision-card'><div class='hint-title'><i class='fa-solid fa-list-check'></i> ${t('hintDecisionTitle')}</div><div class='hint-sub'><strong>${t('decisionState')}:</strong> ${decisionState}</div><div class='hint-sub'><strong>${t('decisionSummary')}:</strong> ${decisionSummary}</div><div class='hint-sub'><strong>${t('decisionStartRules')}:</strong></div>${renderRuleList(startRules)}<div class='hint-sub'><strong>${t('decisionStopRules')}:</strong></div>${renderRuleList(stopRules)}</div></div><div class='hint-section'><div class='hint-section-title'>${t('hintStartGuardTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-play-circle'></i> ${t('startGuardAllow')}</div><div class='hint-value'>${startGuardAllow}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-info'></i> ${t('startGuardReason')}</div><div class='hint-value'>${reasonTxt}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-start'></i> ${t('startGuardBridge')}</div><div class='hint-value'>${startGuardBridgeView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-half'></i> ${t('startGuardEta')}</div><div class='hint-value'>${startGuardEtaView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-full'></i> ${t('startGuardFullEta')}</div><div class='hint-value'>${startGuardFullEta}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-car-battery'></i> ${t('startGuardCapacity')}</div><div class='hint-value'>${startGuardCapacity}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-three-quarters'></i> ${t('startGuardUsable')}</div><div class='hint-value'>${startGuardUsable}</div><div class='hint-sub'><strong>${t('usableFormula')}:</strong> ${startGuardUsableFormula}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-business-time'></i> ${t('neededBridgeTime')}</div><div class='hint-value'>${neededBridgeTime}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt-lightning'></i> ${t('neededBridgeEnergy')}</div><div class='hint-value'>${neededBridgeEnergy}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div></div></div>`;
 powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
 phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
 batteryChart.data.labels=labels; batteryChart.data.datasets[0].data=h.map(x=>x.battery); batteryChart.data.datasets[1].data=h.map(x=>x.state==='production'?100:0); batteryChart.update();
