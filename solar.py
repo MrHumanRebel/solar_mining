@@ -148,6 +148,91 @@ def _idle_historical_hints() -> Dict[str, Any]:
         "decision_start_rules": [],
         "decision_stop_rules": ["Idle window"],
         "decision_summary": "SLEEP: outside active hours",
+        "weather_risk_15d": "unknown",
+        "weather_risk_30d": "unknown",
+        "weather_sunny_ratio_15d": 0.0,
+        "weather_bad_ratio_15d": 0.0,
+    }
+
+
+def _classify_weather_condition(condition: str) -> str:
+    c = str(condition or "").lower()
+    if any(k in c for k in ["snow", "sleet", "blizzard", "freezing"]):
+        return "snow"
+    if any(k in c for k in ["rain", "drizzle", "storm", "thunder", "shower"]):
+        return "rain"
+    if any(k in c for k in ["overcast", "cloud", "fog", "mist", "haze", "smoke", "dust"]):
+        return "cloud"
+    if any(k in c for k in ["clear", "sun", "fair"]):
+        return "sun"
+    return "mixed"
+
+
+def _summarize_free_weather_outlook(forecast_payload: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    Build 15-day and 30-day risk outlook from FREE OpenWeather 2.5 endpoints only.
+    OWM 16/30-day forecast APIs are paid, therefore we extrapolate from 5-day/3h
+    forecast probabilities and mark confidence accordingly.
+    """
+    if now is None:
+        now = datetime.now(tz=budapest_tz)
+
+    entries = forecast_payload.get("list", []) if isinstance(forecast_payload, dict) else []
+    if not entries:
+        return {
+            "source": "owm_free_2.5_forecast_extrapolated",
+            "confidence": 0.0,
+            "summary_15d": "unknown",
+            "summary_30d": "unknown",
+            "sunny_ratio_15d": 0.0,
+            "bad_ratio_15d": 0.0,
+            "sunny_ratio_30d": 0.0,
+            "bad_ratio_30d": 0.0,
+            "score_15d": 0.0,
+            "score_30d": 0.0,
+        }
+
+    counts = {"sun": 0, "cloud": 0, "rain": 0, "snow": 0, "mixed": 0}
+    for ent in entries:
+        cond = ((ent.get("weather") or [{}])[0] or {}).get("description", "")
+        kind = _classify_weather_condition(cond)
+        counts[kind] = counts.get(kind, 0) + 1
+
+    total = float(max(1, sum(counts.values())))
+    ratios = {k: counts.get(k, 0) / total for k in counts}
+    bad_ratio = ratios.get("rain", 0.0) + ratios.get("snow", 0.0) + 0.5 * ratios.get("cloud", 0.0)
+    sunny_ratio = ratios.get("sun", 0.0)
+
+    score_5d = (
+        sunny_ratio * 1.0
+        - ratios.get("cloud", 0.0) * 0.35
+        - ratios.get("rain", 0.0) * 0.85
+        - ratios.get("snow", 0.0) * 1.0
+    )
+
+    month_season_boost = 0.08 if now.month in (5, 6, 7, 8) else (-0.08 if now.month in (11, 12, 1, 2) else 0.0)
+    score_15d = score_5d + month_season_boost
+    score_30d = score_5d * 0.92 + month_season_boost
+
+    def _risk_label(score: float) -> str:
+        if score >= 0.18:
+            return "solar_friendly"
+        if score <= -0.18:
+            return "solar_weak"
+        return "mixed"
+
+    return {
+        "source": "owm_free_2.5_forecast_extrapolated",
+        "confidence": min(0.62, total / 40.0),
+        "summary_15d": _risk_label(score_15d),
+        "summary_30d": _risk_label(score_30d),
+        "sunny_ratio_15d": round(sunny_ratio, 3),
+        "bad_ratio_15d": round(bad_ratio, 3),
+        "sunny_ratio_30d": round(max(0.0, sunny_ratio * 0.96), 3),
+        "bad_ratio_30d": round(min(1.0, bad_ratio * 1.04), 3),
+        "score_15d": round(score_15d, 3),
+        "score_30d": round(score_30d, 3),
+        "samples_5d": int(total),
     }
 
 # Unbounded in-memory telemetry history (no MAX_HISTORY_POINTS cap).
@@ -651,7 +736,8 @@ def _telemetry_context_for_history(now: datetime) -> Dict[str, Any]:
 
 
 def _history_recommendation(now: datetime, battery_charge: float, current_power: float,
-                            sunrise_dt: datetime, sunset_dt: datetime) -> Dict[str, Any]:
+                            sunrise_dt: datetime, sunset_dt: datetime,
+                            weather_outlook: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Creates dynamic decision hints from historical production behavior for current month.
     Blends long-range Solarman history with fresh runtime telemetry context.
@@ -661,6 +747,9 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
     month_cfg = _interpolate_month_config(now.month, months)
     interpolated_hourly = _interpolate_hourly_profile_for_month(now.month, months)
     telem_ctx = _telemetry_context_for_history(now)
+    wx = weather_outlook or {}
+    wx15 = str(wx.get("summary_15d", "unknown")).lower()
+    wx30 = str(wx.get("summary_30d", "unknown")).lower()
 
     if not month_cfg:
         return {
@@ -677,6 +766,11 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
             "telemetry_samples": int(telem_ctx.get("samples", 0)),
             "telemetry_confidence": float(telem_ctx.get("confidence", 0.0)),
             "telemetry_month_quality": str(telem_ctx.get("fresh_month_quality", "neutral")),
+            "weather_risk_15d": wx15,
+            "weather_risk_30d": wx30,
+            "weather_sunny_ratio_15d": float(wx.get("sunny_ratio_15d", 0.0)),
+            "weather_bad_ratio_15d": float(wx.get("bad_ratio_15d", 0.0)),
+            "weather_confidence": float(wx.get("confidence", 0.0)),
         }
 
     daylight_span = int(month_cfg.get("daylight_span", 8))
@@ -696,6 +790,13 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
     if telem_quality == "strong" and not weak_month:
         strong_month = True
     if telem_quality == "weak":
+        weak_month = True
+        strong_month = False
+
+    if wx15 == "solar_friendly" and wx30 != "solar_weak":
+        strong_month = True
+        weak_month = False if telem_quality != "weak" else weak_month
+    elif wx15 == "solar_weak" or wx30 == "solar_weak":
         weak_month = True
         strong_month = False
 
@@ -739,6 +840,12 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
             full_charge_dt = None
 
     # If history suggests the battery will refill before sunset, allow earlier starts.
+    if wx15 == "solar_weak":
+        early_start_soc = max(early_start_soc, min_stop_soc + 8)
+        late_day_reserve_soc = min(90, max(late_day_reserve_soc, 82))
+    elif wx15 == "solar_friendly":
+        early_start_soc = max(min_stop_soc + 4, early_start_soc - 3)
+
     if full_charge_pred.get("can_refill_before_sunset", False) and full_charge_pred.get("minutes_to_full") is not None:
         margin_min = float(full_charge_pred.get("sunset_margin_minutes", 0.0))
 
@@ -771,6 +878,12 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
         "telemetry_confidence": float(telem_ctx.get("confidence", 0.0)),
         "telemetry_month_quality": telem_quality,
         "blended_midday_pv": float(blended_midday),
+        "weather_risk_15d": wx15,
+        "weather_risk_30d": wx30,
+        "weather_sunny_ratio_15d": float(wx.get("sunny_ratio_15d", 0.0)),
+        "weather_bad_ratio_15d": float(wx.get("bad_ratio_15d", 0.0)),
+        "weather_confidence": float(wx.get("confidence", 0.0)),
+        "weather_source": str(wx.get("source", "none")),
     }
 
 
@@ -1327,6 +1440,10 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         telem_confidence = _safe_float(hints.get("telemetry_confidence", 0.0), 0.0)
         telem_quality = str(hints.get("telemetry_month_quality", "neutral"))
         blended_midday = _safe_float(hints.get("blended_midday_pv", 0.0), 0.0)
+        weather_risk_15d = str(hints.get("weather_risk_15d", "unknown"))
+        weather_risk_30d = str(hints.get("weather_risk_30d", "unknown"))
+        weather_sunny_ratio_15d = 100.0 * _safe_float(hints.get("weather_sunny_ratio_15d", 0.0), 0.0)
+        weather_bad_ratio_15d = 100.0 * _safe_float(hints.get("weather_bad_ratio_15d", 0.0), 0.0)
         battery_pct = _safe_float(battery, 0.0)
 
         message = (
@@ -1376,7 +1493,9 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"• Samples: {telem_samples}\n"
             f"• Confidence: {telem_confidence:.2f}\n"
             f"• Fresh month quality: {telem_quality}\n"
-            f"• Blended midday PV: {blended_midday:.0f}W\n\n"
+            f"• Blended midday PV: {blended_midday:.0f}W\n"
+            f"• 15-day risk: {weather_risk_15d} (sunny: {weather_sunny_ratio_15d:.0f}%, bad: {weather_bad_ratio_15d:.0f}%)\n"
+            f"• 30-day risk: {weather_risk_30d}\n\n"
             f"🖥️ System\n"
             f"• IP: {ip}\n"
             f"• RAM usage: {ram}\n"
@@ -1584,6 +1703,7 @@ def get_current_weather(api_key, location_lat, location_lon):
 
         f1_clouds, f1_cond, f1_ts = _pick(0)
         f3_clouds, f3_cond, f3_ts = _pick(1)
+        outlook = _summarize_free_weather_outlook(fd)
 
     except (requests.RequestException, KeyError, IndexError, ValueError) as e:
         print(f"[Warning] Weather request failed: {e}")
@@ -1594,11 +1714,13 @@ def get_current_weather(api_key, location_lat, location_lon):
         sunset_dt = now.replace(hour=18, minute=0, second=0)
         f1_cond = "unknown"; f1_clouds = 0; f1_ts = now.strftime("%Y-%m-%d %H:%M:%S")
         f3_cond = "unknown"; f3_clouds = 0; f3_ts = (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+        outlook = _summarize_free_weather_outlook({"list": []}, now)
 
     return (
         current_condition, sunrise_dt, sunset_dt, clouds,
         f1_cond, f1_clouds, f1_ts,
-        f3_cond, f3_clouds, f3_ts
+        f3_cond, f3_clouds, f3_ts,
+        outlook,
     )
 
 def press_power_button(gpio_pin, press_time):
@@ -1666,7 +1788,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
     try:
         (current_condition, sunrise, sunset, clouds,
          f1_cond, f1_clouds, f1_ts,
-         f3_cond, f3_clouds, f3_ts) = get_current_weather(weather_api_key, location_lat, location_lon)
+         f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(weather_api_key, location_lat, location_lon)
 
         print(f"\nCurrent weather: {current_condition}, | Clouds: {clouds}%")
         print(f"1H forecast: {f1_cond}, | Clouds: {f1_clouds}% | Time:{f1_ts}")
@@ -1707,7 +1829,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         print(f"Battery capacity: {battery_ah:.2f}Ah")
 
         now = datetime.now(tz=budapest_tz)
-        hist = _history_recommendation(now, battery_charge, current_power, sunrise, sunset)
+        hist = _history_recommendation(now, battery_charge, current_power, sunrise, sunset, weather_outlook)
         print(
             "[History tuning] "
             f"month={hist['month_quality']} early_start_soc={hist['early_start_soc']}% "
@@ -1715,7 +1837,9 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             f"headroom_good={hist['headroom_good']} preserve={hist['should_preserve_battery']} "
             f"telem_q={hist.get('telemetry_month_quality', 'neutral')} samples={hist.get('telemetry_samples', 0)} "
             f"conf={float(hist.get('telemetry_confidence', 0.0)):.2f} blended_midday={float(hist.get('blended_midday_pv', 0.0)):.0f}W "
-            f"full_eta_min={hist.get('predicted_minutes_to_full')}"
+            f"full_eta_min={hist.get('predicted_minutes_to_full')} "
+            f"wx15={hist.get('weather_risk_15d', 'unknown')} wx30={hist.get('weather_risk_30d', 'unknown')} "
+            f"wx_conf={float(hist.get('weather_confidence', 0.0)):.2f}"
         )
         start_guard = _compute_start_bridge_guard(now, battery_charge, current_power, sunrise, sunset, hist, battery_voltage, battery_ah)
         print(
@@ -1788,13 +1912,22 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         # Intelligent real-time start: require meaningful PV headroom and seasonal SOC discipline.
         # This prevents autumn/winter starts from eating into battery recharge.
         month_quality = str(hist.get("month_quality", "neutral")).lower()
+        weather_risk_15d = str(hist.get("weather_risk_15d", "unknown")).lower()
         season_margin_w = 50 if month_quality == "strong" else (180 if month_quality == "neutral" else 350)
+        if weather_risk_15d == "solar_weak":
+            season_margin_w += 140
+        elif weather_risk_15d == "solar_friendly":
+            season_margin_w = max(30, season_margin_w - 40)
         season_soc_floor = (
             max(hist["min_stop_soc"] + 4, hist["early_start_soc"] - 6)
             if month_quality == "strong"
             else (max(hist["early_start_soc"] - 2, 52) if month_quality == "neutral" else max(hist["early_start_soc"], 68))
         )
+        if weather_risk_15d == "solar_weak":
+            season_soc_floor = max(season_soc_floor, hist["min_stop_soc"] + 12)
         season_time_ok = now.hour < (15 if month_quality == "strong" else (14 if month_quality == "neutral" else 12))
+        if weather_risk_15d == "solar_weak":
+            season_time_ok = season_time_ok and now.hour < 12
         smart_bridge_pv_start = (
             bool(start_guard.get("allow_start", False))
             and current_power >= (MINER_POWER_W + season_margin_w)
@@ -1867,6 +2000,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             ("1H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f1 and battery_charge <= 95 and current_power <= 1000 and not curtailment_prevent_window),
             ("3H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f3 and battery_charge <= 95 and current_power <= 1000 and not curtailment_prevent_window),
             ("Historical preserve-battery after 14h", hist["should_preserve_battery"] and now.hour >= 14 and not curtailment_prevent_window),
+            ("15-day weather risk is solar_weak + PV<70% miner", weather_risk_15d == "solar_weak" and current_power < (MINER_POWER_W * 0.7) and not curtailment_prevent_window),
         ]
 
         decision_summary = "No state change"
@@ -2096,6 +2230,10 @@ def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power
         "late_day_reserve_soc": float((historical_hints or {}).get("late_day_reserve_soc", 80)),
         "should_preserve_battery": bool((historical_hints or {}).get("should_preserve_battery", False)),
         "headroom_good": bool((historical_hints or {}).get("headroom_good", False)),
+        "weather_risk_15d": str((historical_hints or {}).get("weather_risk_15d", "unknown")),
+        "weather_risk_30d": str((historical_hints or {}).get("weather_risk_30d", "unknown")),
+        "weather_sunny_ratio_15d": float((historical_hints or {}).get("weather_sunny_ratio_15d", 0.0)),
+        "weather_bad_ratio_15d": float((historical_hints or {}).get("weather_bad_ratio_15d", 0.0)),
     }
     telemetry_history.append(record)
     _append_telemetry_to_file(record)
@@ -2583,7 +2721,7 @@ def main_loop():
     used_quote = load_quote_usage()
     (current_condition, sunrise, sunset, clouds,
      f1_cond, f1_clouds, f1_ts,
-     f3_cond, f3_clouds, f3_ts) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
+     f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
     # START TELEGRAM THREAD ONCE
     t_thread = threading.Thread(target=_telegram_loop, name="telegram-poller", daemon=True)
@@ -2681,11 +2819,11 @@ def main_loop():
                 try:
                     (current_condition, sunrise, sunset, clouds,
                      f1_cond, f1_clouds, f1_ts,
-                     f3_cond, f3_clouds, f3_ts) = fut_weather.result(timeout=10)
+                     f3_cond, f3_clouds, f3_ts, weather_outlook) = fut_weather.result(timeout=10)
                 except Exception:
                     (current_condition, sunrise, sunset, clouds,
                      f1_cond, f1_clouds, f1_ts,
-                     f3_cond, f3_clouds, f3_ts) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
+                     f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
                 # Fetch device data (depends on token)
                 raw_data = fetch_current_data(token) if token else {}
@@ -2749,7 +2887,7 @@ def main_loop():
 
             (current_condition, sunrise, sunset, clouds,
              f1_cond, f1_clouds, f1_ts,
-             f3_cond, f3_clouds, f3_ts) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
+             f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
             state = "stop"
             if prev_state == "production":
