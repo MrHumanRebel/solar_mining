@@ -354,6 +354,25 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+
+def _format_minutes_human(minutes: float) -> str:
+    if minutes is None:
+        return "--"
+    try:
+        total_minutes = float(minutes)
+    except (TypeError, ValueError):
+        return "--"
+    if not math.isfinite(total_minutes) or total_minutes < 0:
+        return "--"
+
+    total_minutes = max(0.0, total_minutes)
+    hours = int(total_minutes // 60)
+    mins = int(round(total_minutes - (hours * 60)))
+    if mins == 60:
+        hours += 1
+        mins = 0
+    return f"{total_minutes:.1f} min ({hours}h {mins}m)"
+
 def _find_value(data_list: List[Dict[str, Any]], key: str, default: float = 0.0) -> float:
     for e in data_list:
         if e.get("key") == key:
@@ -1495,7 +1514,7 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         start_guard_bms_window = _safe_float(hints.get("start_guard_bms_window_wh", 0.0), 0.0)
         predicted_minutes_to_full = hints.get("predicted_minutes_to_full")
         predicted_minutes_to_full = _safe_float(predicted_minutes_to_full, -1.0) if predicted_minutes_to_full is not None else -1.0
-        predicted_eta_full = f"{predicted_minutes_to_full:.1f} min" if predicted_minutes_to_full >= 0 else "--"
+        predicted_eta_full = _format_minutes_human(predicted_minutes_to_full)
         decision_state = str(hints.get("decision_state", "unknown"))
         decision_summary = str(hints.get("decision_summary", "No matched rules"))
         decision_start_rules = hints.get("decision_start_rules", []) if isinstance(hints.get("decision_start_rules", []), list) else []
@@ -2063,11 +2082,22 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             and battery_charge >= 96
             and current_power >= max(350.0, MINER_POWER_W * 0.35)
         )
+        cannot_refill_before_sunset_while_running = (
+            prev_state == "production"
+            and _safe_float(hist.get("predicted_minutes_to_full"), -1.0) >= 0.0
+            and not bool(hist.get("can_refill_before_sunset", False))
+            and _safe_float(hist.get("sunset_margin_minutes"), 0.0) < -5.0
+            and not curtailment_prevent_window
+        )
 
         stop_runtime_rules = [
             (
                 f"Battery<{BATTERY_PROTECT_SOC:.0f}% and PV<{pv_stop_threshold:.0f}W (insufficient solar cover) while running",
                 prev_state == "production" and battery_charge < BATTERY_PROTECT_SOC and not pv_covers_miner and not curtailment_prevent_window,
+            ),
+            (
+                "Predicted full charge is after sunset while running (sunset refill protection)",
+                cannot_refill_before_sunset_while_running,
             ),
             ("Late-day reserve reached (after 14h, while running)", prev_state == "production" and now.hour >= 14 and battery_charge <= hist["late_day_reserve_soc"] and not curtailment_prevent_window),
             (
@@ -2577,6 +2607,15 @@ const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',da
 const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets.map(s=>styledSet(s.label,s.color,s.tension??.2))},options:chartOpts});
 function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Charge %',color:'#a78bfa'},{label:'Mining Rig ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);histSocChart=mkMulti('histSocChart',[{label:t('dsHistEarly'),color:'#22d3ee'},{label:t('dsHistMinStop'),color:'#f59e0b'},{label:t('dsHistLate'),color:'#a78bfa'}]);histFlagsChart=mkMulti('histFlagsChart',[{label:t('dsFlagPreserve'),color:'#ef4444'},{label:t('dsFlagHeadroom'),color:'#22c55e'},{label:t('dsFlagMonth'),color:'#60a5fa'}]);setDefaultRange();}
 function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});} 
+function formatDurationMinutes(mins){
+const m=Number(mins);
+if(!Number.isFinite(m)||m<0)return '--';
+const total=Math.max(0,m);
+let h=Math.floor(total/60);
+let mm=Math.round(total-(h*60));
+if(mm===60){h+=1;mm=0;}
+return `${total.toFixed(1)} ${t('unitMin')} (${h}h ${mm}m)`;
+}
 function formatDate(d){return d.toISOString().slice(0,10)}
 function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
@@ -2596,7 +2635,7 @@ const etaMinutes=Number(hints.start_guard_eta_minutes||0);
 const startGuardBridge=`${bridgeMinutes.toFixed(1)} ${t('unitMin')}`;
 const startGuardEta=`${etaMinutes.toFixed(1)} ${t('unitMin')}`;
 const predictedMinutesToFull=Number(hints.predicted_minutes_to_full);
-const startGuardFullEta=Number.isFinite(predictedMinutesToFull)&&predictedMinutesToFull>=0?`${predictedMinutesToFull.toFixed(1)} ${t('unitMin')}`:'--';
+const startGuardFullEta=formatDurationMinutes(predictedMinutesToFull);
 const startGuardCapacity=`${Number(hints.start_guard_capacity_wh||0).toFixed(1)} ${t('unitWh')} (${Number(hints.start_guard_battery_ah||0).toFixed(1)}Ah @ ${Number(hints.start_guard_battery_voltage||0).toFixed(2)}V)`;
 const startGuardUsable=`${Number(hints.start_guard_usable_wh||0).toFixed(1)} ${t('unitWh')}`;
 const startGuardUsableFormula=`${Number(hints.start_guard_soc_window_pct||0).toFixed(0)}% = ${Number(d.battery||0).toFixed(0)}% - ${Number(hints.start_guard_min_stop_soc||0).toFixed(0)}%`;
