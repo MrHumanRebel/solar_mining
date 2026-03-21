@@ -682,6 +682,31 @@ def _estimate_minutes_for_energy_budget(sunrise_dt: datetime, hourly_profile: Di
     return max(0.0, (end - start).total_seconds() / 60.0)
 
 
+def _estimate_bridge_energy_between(start_dt: datetime, end_dt: datetime,
+                                    hourly_profile: Dict[str, Any]) -> float:
+    """Estimate required bridge energy (Wh) between two timestamps."""
+    if not hourly_profile or not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
+        return 0.0
+
+    start = start_dt.replace(second=0, microsecond=0)
+    end = end_dt.replace(second=0, microsecond=0)
+    if end <= start:
+        return 0.0
+
+    t = start
+    step_min = 5
+    needed_wh = 0.0
+
+    while t < end:
+        next_t = min(t + timedelta(minutes=step_min), end)
+        pv = _pv_estimate_at(t, hourly_profile)
+        deficit = max(0.0, MINER_POWER_W - pv)
+        needed_wh += deficit * ((next_t - t).total_seconds() / 3600.0)
+        t = next_t
+
+    return max(0.0, needed_wh)
+
+
 def _telemetry_context_for_history(now: datetime) -> Dict[str, Any]:
     """Recent telemetry context (fresh/runtime signal) to blend with long-range Solarman history."""
     items = list(telemetry_history)
@@ -1066,9 +1091,11 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
         # Remaining time from now until expected full PV supply.
         eta_minutes = max(0.0, (estimated_full_supply_dt - now).total_seconds() / 60.0)
 
-        # Daily requirement from sunrise to full-supply moment.
-        needed_bridge_minutes = max(0.0, (estimated_full_supply_dt - sunrise_dt).total_seconds() / 60.0)
-        needed_bridge_wh = max(0.0, daily_needed_bridge_wh)
+        # Remaining requirement from now to full-supply moment.
+        needed_bridge_minutes = max(0.0, eta_minutes)
+        needed_bridge_wh = _estimate_bridge_energy_between(now, estimated_full_supply_dt, hourly_prod_mean)
+        if needed_bridge_wh <= 0.0:
+            needed_bridge_wh = max(0.0, daily_needed_bridge_wh)
     elif deficit_w <= 0:
         eta_minutes = 0.0
 
@@ -1078,7 +1105,10 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
     bms_window_wh = (bms_window_pct / 100.0) * capacity_wh
     if needed_bridge_wh > bms_window_wh:
         needed_bridge_wh = bms_window_wh
-        needed_bridge_minutes = _estimate_minutes_for_energy_budget(sunrise_dt, hourly_prod_mean, needed_bridge_wh)
+        needed_bridge_minutes = min(
+            needed_bridge_minutes,
+            _estimate_minutes_for_energy_budget(sunrise_dt, hourly_prod_mean, needed_bridge_wh)
+        )
 
     # Morning-only relevance: after full supply, current bridge/LTA is obsolete,
     # but daily needed bridge stats remain useful as day-level requirements.
