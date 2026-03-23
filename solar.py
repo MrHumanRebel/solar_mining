@@ -660,17 +660,17 @@ def _estimate_full_supply_and_energy(sunrise_dt: datetime, now: datetime,
     while t < end:
         pv = _pv_estimate_at(t, hourly_profile)
         deficit = max(0.0, MINER_POWER_W - pv)
-        if full_supply_dt is None and deficit <= 1e-6:
+        # We need a future full-supply point for runtime start-guard decisions.
+        if full_supply_dt is None and t >= now and deficit <= 1e-6:
             full_supply_dt = t
             break
         needed_wh += deficit * (step_min / 60.0)
         t += timedelta(minutes=step_min)
 
     if full_supply_dt is None:
-        # if we never reached full feed in the modeled window, use a conservative fallback
-        full_supply_dt = now.replace(hour=min(23, sunrise_dt.hour + 3), minute=0, second=0, microsecond=0)
-        if full_supply_dt < sunrise_dt:
-            full_supply_dt = sunrise_dt + timedelta(hours=3)
+        # if we never reach full feed in modeled window, use conservative future fallback
+        base = max(now, sunrise_dt).replace(second=0, microsecond=0)
+        full_supply_dt = base + timedelta(hours=3)
     return full_supply_dt, max(0.0, needed_wh)
 
 
@@ -1091,14 +1091,19 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
 
     capacity_wh = _effective_battery_capacity_wh(battery_voltage, battery_ah)
 
-    # Usable bridge energy is intentionally measured only above min_stop_soc reserve.
+    # Usable bridge energy for start permission is intentionally measured only above min_stop_soc reserve.
     # Example: at 100% SOC and 26% min-stop reserve, usable window is 74% of capacity.
     soc_window_pct = max(0.0, battery_charge - min_stop_soc)
     usable_wh = max(0.0, soc_window_pct / 100.0 * capacity_wh)
+    # Operational bridge runtime should reflect the actual BMS floor window (20-100%).
+    bms_floor_soc = 20.0
+    bridge_soc_window_pct = max(0.0, battery_charge - bms_floor_soc)
+    bridge_usable_wh = max(0.0, bridge_soc_window_pct / 100.0 * capacity_wh)
     deficit_w = max(0.0, MINER_POWER_W - max(0.0, current_power))
-    bridge_minutes = 999.0 if deficit_w <= 0 else (usable_wh / deficit_w) * 60.0
+    guard_bridge_minutes = 999.0 if deficit_w <= 0 else (usable_wh / deficit_w) * 60.0
+    bridge_minutes = 999.0 if deficit_w <= 0 else (bridge_usable_wh / deficit_w) * 60.0
 
-    estimated_full_supply_dt, daily_needed_bridge_wh = _estimate_full_supply_and_energy(
+    estimated_full_supply_dt, _daily_needed_bridge_wh = _estimate_full_supply_and_energy(
         sunrise_dt, now, hourly_prod_mean
     )
 
@@ -1112,14 +1117,20 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
 
         # Remaining requirement from now to full-supply moment.
         needed_bridge_minutes = max(0.0, eta_minutes)
-        needed_bridge_wh = _estimate_bridge_energy_between(now, estimated_full_supply_dt, hourly_prod_mean)
-        if needed_bridge_wh <= 0.0:
-            needed_bridge_wh = max(0.0, daily_needed_bridge_wh)
+        needed_bridge_wh = (
+            _estimate_bridge_energy_between(now, estimated_full_supply_dt, hourly_prod_mean)
+            if needed_bridge_minutes > 0.0 else 0.0
+        )
     elif deficit_w <= 0:
         eta_minutes = 0.0
 
+    # Avoid zero ETA when real-time PV is still below miner demand.
+    if deficit_w > 0.0 and eta_minutes <= 0.0:
+        eta_minutes = 5.0
+        needed_bridge_minutes = max(needed_bridge_minutes, eta_minutes)
+        needed_bridge_wh = max(needed_bridge_wh, deficit_w * (eta_minutes / 60.0))
+
     # BMS floor applies system-wide: battery operational bridge window is 20-100% SOC.
-    bms_floor_soc = 20.0
     bms_window_pct = max(0.0, 100.0 - bms_floor_soc)
     bms_window_wh = (bms_window_pct / 100.0) * capacity_wh
     if needed_bridge_wh > bms_window_wh:
@@ -1136,7 +1147,7 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
         eta_minutes = 0.0
 
     energy_cover_ok = needed_bridge_wh > 0 and usable_wh >= needed_bridge_wh
-    allow_start = battery_charge > min_stop_soc and (bridge_minutes >= eta_minutes or energy_cover_ok)
+    allow_start = battery_charge > min_stop_soc and (guard_bridge_minutes >= eta_minutes or energy_cover_ok)
 
     # If historical profile predicts refill before sunset, relax morning start conservatively
     # to avoid missing production windows in non-export systems.
