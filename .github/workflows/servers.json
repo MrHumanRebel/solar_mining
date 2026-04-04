@@ -1,0 +1,8 @@
+{
+  "servers": [
+    {
+      "name": "Overlab Omnisette",
+      "address": "https://overlab-ani.duckdns.org"
+    }
+  ]
+}
