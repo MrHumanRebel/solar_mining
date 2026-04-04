@@ -2,7 +2,7 @@
   "servers": [
     {
       "name": "Overlab Omnisette",
-      "address": "https://overlab-ani.duckdns.org"
+      "address": "https://sidestore.overlab.duckdns.org"
     }
   ]
 }
