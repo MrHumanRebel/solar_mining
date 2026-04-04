@@ -1,0 +1,8 @@
+{
+  "servers": [
+    {
+      "name": "Overlab Omnisette",
+      "address": "https://sidestore.overlab.duckdns.org"
+    }
+  ]
+}
