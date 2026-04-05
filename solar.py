@@ -233,6 +233,11 @@ def _summarize_free_weather_outlook(forecast_payload: Dict[str, Any], now: Optio
 
 # Unbounded in-memory telemetry history (no MAX_HISTORY_POINTS cap).
 telemetry_history: deque = deque()
+_pending_transition_state: Optional[str] = None
+_pending_transition_since: Optional[datetime] = None
+_pending_transition_hits: int = 0
+
+
 def _last_state_change_ts() -> Optional[datetime]:
     """Find the last timestamp where persisted telemetry state changed."""
     items = list(telemetry_history)
@@ -255,13 +260,17 @@ def _last_state_change_ts() -> Optional[datetime]:
     return None
 
 
-def _apply_transition_guard(prev_state_val: str, desired_state: str, now: datetime) -> Tuple[str, bool, str]:
+def _apply_transition_guard(prev_state_val: str, desired_state: str, now: datetime,
+                            confirmed: bool = True) -> Tuple[str, bool, str]:
     """
     Time-based transition guard to avoid fast ON/OFF thrashing from short PV/weather noise.
     Returns (effective_state, blocked, reason).
     """
     if desired_state == prev_state_val:
         return desired_state, False, "no_transition_needed"
+
+    if not confirmed:
+        return prev_state_val, True, "confirmation_pending"
 
     last_change_ts = _last_state_change_ts()
     if last_change_ts is None:
@@ -1106,34 +1115,38 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
     bridge_usable_wh = max(0.0, bridge_soc_window_pct / 100.0 * capacity_wh)
     deficit_w = max(0.0, MINER_POWER_W - max(0.0, current_power))
     guard_bridge_minutes = 999.0 if deficit_w <= 0 else (usable_wh / deficit_w) * 60.0
-    bridge_minutes = 999.0 if deficit_w <= 0 else (bridge_usable_wh / deficit_w) * 60.0
+    current_bridge_minutes = 0.0 if deficit_w <= 0 else (bridge_usable_wh / deficit_w) * 60.0
 
-    estimated_full_supply_dt, _daily_needed_bridge_wh = _estimate_full_supply_and_energy(
+    estimated_full_supply_dt, daily_needed_bridge_wh = _estimate_full_supply_and_energy(
         sunrise_dt, now, hourly_prod_mean
+    )
+    daily_needed_bridge_minutes = (
+        _estimate_minutes_for_energy_budget(sunrise_dt, hourly_prod_mean, daily_needed_bridge_wh)
+        if daily_needed_bridge_wh > 0 else 0.0
     )
 
     eta_minutes = 999.0
-    needed_bridge_minutes = 0.0
-    needed_bridge_wh = 0.0
+    needed_bridge_minutes = daily_needed_bridge_minutes
+    needed_bridge_wh = daily_needed_bridge_wh
 
     if estimated_full_supply_dt is not None:
         # Remaining time from now until expected full PV supply.
         eta_minutes = max(0.0, (estimated_full_supply_dt - now).total_seconds() / 60.0)
 
-        # Remaining requirement from now to full-supply moment.
-        needed_bridge_minutes = max(0.0, eta_minutes)
-        needed_bridge_wh = (
+        # Remaining requirement from now to full-supply moment for runtime safety checks.
+        remaining_bridge_wh = (
             _estimate_bridge_energy_between(now, estimated_full_supply_dt, hourly_prod_mean)
-            if needed_bridge_minutes > 0.0 else 0.0
+            if eta_minutes > 0.0 else 0.0
         )
-    elif deficit_w <= 0:
-        eta_minutes = 0.0
+    else:
+        remaining_bridge_wh = 0.0
+        if deficit_w <= 0:
+            eta_minutes = 0.0
 
     # Avoid zero ETA when real-time PV is still below miner demand.
     if deficit_w > 0.0 and eta_minutes <= 0.0:
         eta_minutes = 5.0
-        needed_bridge_minutes = max(needed_bridge_minutes, eta_minutes)
-        needed_bridge_wh = max(needed_bridge_wh, deficit_w * (eta_minutes / 60.0))
+        remaining_bridge_wh = max(remaining_bridge_wh, deficit_w * (eta_minutes / 60.0))
 
     # BMS floor applies system-wide: battery operational bridge window is 20-100% SOC.
     bms_window_pct = max(0.0, 100.0 - bms_floor_soc)
@@ -1144,14 +1157,15 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
             needed_bridge_minutes,
             _estimate_minutes_for_energy_budget(sunrise_dt, hourly_prod_mean, needed_bridge_wh)
         )
+    remaining_bridge_wh = min(remaining_bridge_wh, bms_window_wh)
 
     # Morning-only relevance: after full supply, current bridge/LTA is obsolete,
     # but daily needed bridge stats remain useful as day-level requirements.
     if now >= sunrise_dt and eta_minutes <= 0.0:
-        bridge_minutes = 0.0
+        current_bridge_minutes = 0.0
         eta_minutes = 0.0
 
-    energy_cover_ok = needed_bridge_wh > 0 and usable_wh >= needed_bridge_wh
+    energy_cover_ok = remaining_bridge_wh > 0 and usable_wh >= remaining_bridge_wh
     allow_start = battery_charge > min_stop_soc and (guard_bridge_minutes >= eta_minutes or energy_cover_ok)
 
     # If historical profile predicts refill before sunset, relax morning start conservatively
@@ -1170,18 +1184,36 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
     if (not allow_start) and refill_relax:
         allow_start = True
 
+    refill_feasibility_block = (
+        not bool(hist.get("can_refill_before_sunset", True))
+        and now.hour >= 10
+        and battery_charge < max(min_stop_soc + 18, 48.0)
+        and current_power < max(320.0, MINER_POWER_W * 0.30)
+    )
+    if allow_start and refill_feasibility_block:
+        allow_start = False
+
     refill_reason = "refill_confident_morning_relaxation" if refill_confident_morning else "refill_confident_relaxation"
+    if refill_feasibility_block:
+        reason = "cannot_refill_before_sunset_guard"
+    elif allow_start and not refill_relax:
+        reason = "ok"
+    elif allow_start and refill_relax:
+        reason = refill_reason
+    else:
+        reason = "soc_below_min_stop" if battery_charge <= min_stop_soc else "insufficient_bridge_energy"
 
     return {
         "allow_start": allow_start,
         "energy_cover_ok": bool(energy_cover_ok),
         "usable_wh": round(usable_wh, 2),
         "deficit_w": round(deficit_w, 2),
-        "bridge_minutes": round(bridge_minutes, 2),
+        "bridge_minutes": round(current_bridge_minutes, 2),
         "eta_minutes": round(eta_minutes, 2),
         "needed_bridge_minutes": round(needed_bridge_minutes, 2),
         "needed_bridge_wh": round(needed_bridge_wh, 2),
-        "reason": "ok" if allow_start and not refill_relax else (refill_reason if allow_start and refill_relax else ("soc_below_min_stop" if battery_charge <= min_stop_soc else "insufficient_bridge_energy")),
+        "remaining_bridge_wh": round(remaining_bridge_wh, 2),
+        "reason": reason,
         "capacity_wh": round(capacity_wh, 2),
         "battery_voltage": round(max(0.0, battery_voltage), 2),
         "battery_ah": round(max(0.0, battery_ah), 2),
@@ -1511,6 +1543,7 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             "ok": "OK",
             "soc_below_min_stop": "SOC below minimum stop",
             "insufficient_bridge_energy": "Insufficient bridge energy",
+            "cannot_refill_before_sunset_guard": "Likely cannot refill battery before sunset",
             "refill_confident_relaxation": "Confident refill relaxation",
             "refill_confident_morning_relaxation": "Confident morning refill relaxation",
             "bridge_energy_confident_sunny_day_relaxation": "Bridge-energy confident sunny-day relaxation",
@@ -1889,6 +1922,7 @@ def check_uptime(now, prev_state_val):
 
 def check_crypto_production_conditions(data, weather_api_key, location_lat, location_lon):
     global prev_state, state, used_quote, sunrise, sunset, uptime
+    global _pending_transition_state, _pending_transition_since, _pending_transition_hits
     prev_state, uptime = load_prev_state()
 
     try:
@@ -2055,6 +2089,14 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             and season_time_ok
             and not hist.get("should_preserve_battery", False)
         )
+        predictive_early_start = (
+            bool(start_guard.get("allow_start", False))
+            and bool(hist.get("can_refill_before_sunset", False))
+            and weather_risk_5d in {"solar_friendly", "mixed"}
+            and now.hour < 12
+            and battery_charge >= (hist["min_stop_soc"] + 6)
+            and current_power >= max(120.0, MINER_POWER_W * 0.10)
+        )
 
         start_rule_hits: List[str] = []
         stop_rule_hits: List[str] = []
@@ -2070,6 +2112,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 "Bridge guard OK + PV headroom + seasonal SOC/time gate",
                 smart_bridge_pv_start,
             ),
+            ("Predictive early start: refill before sunset is likely", predictive_early_start),
             ("Sunny+1H forecast, PV>0, SOC>=early_start, before 13h", solar_now and solar_f1 and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13),
             (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=65, before 13h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 65 and now.hour < 13),
             (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=55, before 12h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 55 and now.hour < 12),
@@ -2231,7 +2274,33 @@ ________________________________
         desired_state = state or prev_state or "stop"
         stable_prev_state = prev_state or "stop"
         if not emergency_stop:
-            effective_state, blocked, gate_reason = _apply_transition_guard(stable_prev_state, desired_state, now)
+            confirmation_needed = 2 if desired_state == "production" else 3
+            min_hold_minutes = 10 if desired_state == "production" else 12
+
+            if desired_state == stable_prev_state:
+                _pending_transition_state = None
+                _pending_transition_since = None
+                _pending_transition_hits = 0
+                transition_confirmed = True
+            else:
+                if _pending_transition_state != desired_state:
+                    _pending_transition_state = desired_state
+                    _pending_transition_since = now
+                    _pending_transition_hits = 1
+                else:
+                    _pending_transition_hits += 1
+                pending_age_min = (
+                    (now - _pending_transition_since).total_seconds() / 60.0
+                    if isinstance(_pending_transition_since, datetime) else 0.0
+                )
+                transition_confirmed = (
+                    _pending_transition_hits >= confirmation_needed
+                    and pending_age_min >= min_hold_minutes
+                )
+
+            effective_state, blocked, gate_reason = _apply_transition_guard(
+                stable_prev_state, desired_state, now, confirmed=transition_confirmed
+            )
             if blocked and effective_state != desired_state:
                 state = effective_state
                 decision_state = state
@@ -2243,6 +2312,10 @@ ________________________________
             else:
                 state = effective_state
                 decision_state = state
+                if state == desired_state:
+                    _pending_transition_state = None
+                    _pending_transition_since = None
+                    _pending_transition_hits = 0
 
         hist.update({
             "decision_state": decision_state,
@@ -2568,10 +2641,10 @@ let currentLang='en';
 const I18N={
   en:{title:'Solar Mining Dashboard',theme:'Theme',downloadTelemetry:'Telemetry JSON',from:'From',to:'To',last30:'Last 30 days',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',
       state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
-      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardFullEta:'ETA to 100% battery charge',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',reasonRefillRelaxation:'Confident refill relaxation',reasonRefillMorningRelaxation:'Confident morning refill relaxation',reasonBridgeEnergySunnyRelaxation:'Bridge-energy confident sunny-day relaxation',reasonAggressiveMorningRefillStart:'Aggressive morning refill start',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
+      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardFullEta:'ETA to 100% battery charge',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',reasonCannotRefillBeforeSunset:'Likely cannot refill battery before sunset',reasonRefillRelaxation:'Confident refill relaxation',reasonRefillMorningRelaxation:'Confident morning refill relaxation',reasonBridgeEnergySunnyRelaxation:'Bridge-energy confident sunny-day relaxation',reasonAggressiveMorningRefillStart:'Aggressive morning refill start',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
   hu:{title:'Solar Bányászat Dashboard',theme:'Téma',downloadTelemetry:'Telemetry JSON letöltése',from:'Ettől',to:'Eddig',last30:'Utolsó 30 nap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',
       state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
-      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardFullEta:'Várható idő 100% akku töltésig',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',reasonRefillRelaxation:'Magabiztos visszatöltési lazítás',reasonRefillMorningRelaxation:'Magabiztos reggeli visszatöltési lazítás',reasonBridgeEnergySunnyRelaxation:'Bridge energia + napsütés miatti lazítás',reasonAggressiveMorningRefillStart:'Agresszív reggeli indítás (visszatöltés biztos)',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
+      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardFullEta:'Várható idő 100% akku töltésig',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',reasonCannotRefillBeforeSunset:'Várhatóan nem tölt vissza napnyugtáig',reasonRefillRelaxation:'Magabiztos visszatöltési lazítás',reasonRefillMorningRelaxation:'Magabiztos reggeli visszatöltési lazítás',reasonBridgeEnergySunnyRelaxation:'Bridge energia + napsütés miatti lazítás',reasonAggressiveMorningRefillStart:'Agresszív reggeli indítás (visszatöltés biztos)',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
 const t=(k)=>I18N[currentLang][k]||k;
 function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
@@ -2650,7 +2723,7 @@ const monthQ=String(hints.month_quality||'neutral');
 const qText=t(monthQ==='strong'?'strong':(monthQ==='weak'?'weak':'neutral'));
 const boolTxt=(v)=>v?t('yes'):t('no');
 const reasonRaw=String(hints.start_guard_reason||'unknown');
-const reasonMap={ok:'reasonOk',soc_below_min_stop:'reasonSocBelowMinStop',insufficient_bridge_energy:'reasonInsufficientBridgeEnergy',refill_confident_relaxation:'reasonRefillRelaxation',refill_confident_morning_relaxation:'reasonRefillMorningRelaxation',bridge_energy_confident_sunny_day_relaxation:'reasonBridgeEnergySunnyRelaxation',aggressive_morning_refill_start:'reasonAggressiveMorningRefillStart'};
+const reasonMap={ok:'reasonOk',soc_below_min_stop:'reasonSocBelowMinStop',insufficient_bridge_energy:'reasonInsufficientBridgeEnergy',cannot_refill_before_sunset_guard:'reasonCannotRefillBeforeSunset',refill_confident_relaxation:'reasonRefillRelaxation',refill_confident_morning_relaxation:'reasonRefillMorningRelaxation',bridge_energy_confident_sunny_day_relaxation:'reasonBridgeEnergySunnyRelaxation',aggressive_morning_refill_start:'reasonAggressiveMorningRefillStart'};
 const reasonTxt=t(reasonMap[reasonRaw]||reasonRaw);
 const startGuardAllow=boolTxt(!!hints.start_guard_allow);
 const bridgeMinutes=Number(hints.start_guard_bridge_minutes||0);
