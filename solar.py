@@ -57,6 +57,8 @@ BATTERY_FLOOR_SOC = float(os.getenv("MY_BATTERY_FLOOR_SOC", "20"))
 HIGH_SOC_STOP_SOC = float(os.getenv("MY_HIGH_SOC_STOP_SOC", "90"))
 HIGH_SOC_STOP_MAX_PV_W = float(os.getenv("MY_HIGH_SOC_STOP_MAX_PV_W", "400"))
 BATTERY_PROTECT_SOC = float(os.getenv("MY_BATTERY_PROTECT_SOC", "90"))
+HARD_AFTERNOON_STOP_SOC = float(os.getenv("MY_HARD_AFTERNOON_STOP_SOC", "90"))
+HARD_AFTERNOON_STOP_HOUR = int(os.getenv("MY_HARD_AFTERNOON_STOP_HOUR", "14"))
 PV_COVERAGE_RATIO_STOP = float(os.getenv("MY_PV_COVERAGE_RATIO_STOP", "0.9"))
 PV_COVERAGE_RATIO_START = float(os.getenv("MY_PV_COVERAGE_RATIO_START", "0.75"))
 MIN_RUN_MINUTES = int(os.getenv("MY_MIN_RUN_MINUTES", "18"))
@@ -2184,6 +2186,45 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         # Optional ping supervision
         if is_rpi and uptime and (now - uptime) > timedelta(minutes=3):
             check_uptime(now, prev_state)
+
+        # HARD RULE: after configured afternoon hour, SOC under threshold must stop immediately.
+        # This is intentionally unconditional and bypasses forecast/curtailment relaxations.
+        if now.hour >= HARD_AFTERNOON_STOP_HOUR and battery_charge < HARD_AFTERNOON_STOP_SOC:
+            stop_rule_hits = [f"Hard afternoon cutoff: SOC<{HARD_AFTERNOON_STOP_SOC:.0f}% after {HARD_AFTERNOON_STOP_HOUR}:00"]
+            decision_summary = "STOP: hard afternoon SOC cutoff"
+            print("Hard afternoon SOC cutoff triggered → forcing STOP.")
+            state = "stop"
+            decision_state = state
+            if prev_state == "production":
+                print("Trying to press power button.")
+                uptime = now
+                if is_rpi:
+                    press_power_button(16, 0.55)
+            hist.update({
+                "decision_state": decision_state,
+                "decision_start_rules": start_rule_hits,
+                "decision_stop_rules": stop_rule_hits,
+                "decision_summary": decision_summary,
+            })
+            if state != prev_state:
+                prev_state = state
+                save_prev_state(prev_state, now)
+                send_telegram_message(
+                    f""" Production stopped (hard afternoon SOC cutoff).
+________________________________
+________________________________
+ Battery: {battery_charge}%
+ Current power: {current_power}W
+ Rule: SOC<{HARD_AFTERNOON_STOP_SOC:.0f}% after {HARD_AFTERNOON_STOP_HOUR}:00
+________________________________
+ Weather: {current_condition}
+ Temperature: {temperature}
+ Humidity: {humidity}%
+"""
+                )
+            return (battery_charge, current_power, state, current_condition, sunrise, sunset, clouds,
+                    f1_cond, f1_clouds, f1_ts,
+                    f3_cond, f3_clouds, f3_ts, hist)
 
         # IMMEDIATE POWER-BASED STOP RULE MINER IS ON L2 and L3
         if (inv_l2 > 2500) or (inv_l3 > 2500) or (inv_lt > 5000):
