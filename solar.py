@@ -1460,8 +1460,9 @@ def _guess_notification_level(message: str) -> str:
     return "info"
 
 
-def send_telegram_message(message, max_retries=15, keyboard=True):
-    _push_web_notification(message, level=_guess_notification_level(message))
+def send_telegram_message(message, max_retries=15, keyboard=True, mirror_web=True):
+    if mirror_web:
+        _push_web_notification(message, level=_guess_notification_level(message))
     url = f'{TELEGRAM_BASE}/sendMessage'
     payload = {'chat_id': CHAT_ID, 'text': message}
     if keyboard:
@@ -1489,6 +1490,20 @@ def send_telegram_message(message, max_retries=15, keyboard=True):
                 backoff = min(backoff * 2, 60)
             else:
                 print("All retry attempts failed.")
+
+
+def send_telegram_message_async(message, max_retries=4, keyboard=True, mirror_web=False):
+    threading.Thread(
+        target=send_telegram_message,
+        kwargs={
+            "message": message,
+            "max_retries": max_retries,
+            "keyboard": keyboard,
+            "mirror_web": mirror_web,
+        },
+        daemon=True,
+        name="telegram-send-async",
+    ).start()
 
 def handle_telegram_messages(battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum, historical_hints=None):
     """
@@ -2613,7 +2628,8 @@ def _miner_action(action: str) -> Dict[str, Any]:
         with gpio_lock:
             press_power_button(16, duration)
         msg = f"{action} signal sent ({duration}s)"
-        send_telegram_message(f"GUI action: {msg}")
+        _push_web_notification(f"✅ GUI action: {msg}", level="success")
+        send_telegram_message_async(f"GUI action: {msg}", max_retries=4, keyboard=True, mirror_web=False)
         return {"ok": True, "message": msg, "ts": now}
     except Exception as err:
         err_msg = str(err)
@@ -2839,7 +2855,7 @@ function renderNotifications(items){
     box.innerHTML=`<div class='notice-empty'>${t('notifEmpty')}</div>`;
     return;
   }
-  box.innerHTML=list.slice(0,14).map((n)=>{
+  box.innerHTML=list.slice(0,5).map((n)=>{
     const lvl=String(n.level||'info');
     const ts=n.ts?new Date(n.ts).toLocaleString():'';
     const icon=lvl==='success'?'fa-circle-check':(lvl==='warn'?'fa-triangle-exclamation':(lvl==='error'?'fa-circle-xmark':'fa-circle-info'));
@@ -2920,7 +2936,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
     with snapshot_lock:
         snap = dict(_shared_snapshot)
         hist = list(telemetry_history)
-    notices = list(web_notifications)[:24]
+    notices = list(web_notifications)[:5]
 
     now = datetime.now(tz=budapest_tz)
     start_ts = None
