@@ -2,7 +2,10 @@
 import argparse
 import ast
 import json
+import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -30,10 +33,48 @@ def sanitize_filename(name: str) -> str:
 
 
 def clipboard_text() -> str:
-    try:
-        return subprocess.check_output(["pbpaste"], text=True)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read clipboard via pbpaste: {e}")
+    """
+    Cross-platform clipboard reader.
+    Supports macOS, Linux (X11/Wayland), Windows and WSL.
+    """
+    system = platform.system().lower()
+    attempts: list[tuple[str, list[str]]] = []
+
+    if system == "darwin":
+        attempts.append(("pbpaste", ["pbpaste"]))
+    elif system == "windows":
+        attempts.append(("powershell", ["powershell", "-NoProfile", "-Command", "Get-Clipboard"]))
+    else:
+        if os.environ.get("WSL_DISTRO_NAME"):
+            attempts.extend([
+                ("powershell.exe", ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"]),
+                ("clip.exe+pwsh", ["pwsh.exe", "-NoProfile", "-Command", "Get-Clipboard"]),
+            ])
+        attempts.extend([
+            ("wl-paste", ["wl-paste", "-n"]),
+            ("xclip", ["xclip", "-selection", "clipboard", "-o"]),
+            ("xsel", ["xsel", "--clipboard", "--output"]),
+        ])
+
+    errors = []
+    for name, cmd in attempts:
+        exe = cmd[0]
+        if shutil.which(exe) is None:
+            errors.append(f"{name}: not installed")
+            continue
+        try:
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+            if out and out.strip():
+                return out
+            errors.append(f"{name}: clipboard is empty")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+
+    raise RuntimeError(
+        "Failed to read clipboard. "
+        "Install one clipboard tool for your OS (macOS: pbpaste, Linux: wl-paste/xclip/xsel, Windows: powershell Get-Clipboard). "
+        f"Tried: {'; '.join(errors) if errors else 'no methods available'}"
+    )
 
 
 def extract_fetch_parts(fetch_text: str):

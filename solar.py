@@ -61,6 +61,11 @@ PV_COVERAGE_RATIO_STOP = float(os.getenv("MY_PV_COVERAGE_RATIO_STOP", "0.9"))
 PV_COVERAGE_RATIO_START = float(os.getenv("MY_PV_COVERAGE_RATIO_START", "0.75"))
 MIN_RUN_MINUTES = int(os.getenv("MY_MIN_RUN_MINUTES", "18"))
 MIN_RESTART_DELAY_MINUTES = int(os.getenv("MY_MIN_RESTART_DELAY_MINUTES", "10"))
+MINER_IPS = [
+    ip.strip()
+    for ip in os.getenv("MY_MINER_IPS", "192.168.0.200,192.168.0.201").split(",")
+    if ip.strip()
+]
 
 print(platform.machine())
 print(platform.system())
@@ -1837,20 +1842,26 @@ def press_power_button(gpio_pin, press_time):
 
 def check_uptime(now, prev_state_val):
     global uptime
-    miner_ip = "192.168.0.200"
+    miner_ips = MINER_IPS or ["192.168.0.200"]
     if uptime is None:
         uptime = now
     difference = now - uptime
     hours, remainder = divmod(difference.seconds, 3600)
     minutes, _ = divmod(remainder, 60)
 
-    print(f"Pinging {miner_ip} to check uptime...")
+    print(f"Pinging miner IPs: {', '.join(miner_ips)} to check uptime...")
     try:
-        result = subprocess.run(["ping", "-c", "1", "-W", "2", miner_ip], stdout=subprocess.DEVNULL)
-        if result.returncode != 0:
+        reachable_ip = None
+        for miner_ip in miner_ips:
+            result = subprocess.run(["ping", "-c", "1", "-W", "2", miner_ip], stdout=subprocess.DEVNULL)
+            if result.returncode == 0:
+                reachable_ip = miner_ip
+                break
+
+        if reachable_ip is None:
             print("No reply!")
             if prev_state_val == "production":
-                print(f"No reply from {miner_ip}. Attempting restart sequence...")
+                print(f"No reply from any configured IP ({', '.join(miner_ips)}). Attempting restart sequence...")
                 press_power_button(16, 10)
                 time.sleep(15)
                 press_power_button(16, 0.55)
@@ -1858,9 +1869,9 @@ def check_uptime(now, prev_state_val):
                 uptime = now
                 save_prev_state(prev_state_val, uptime)
         else:
-            print("Reply!")
+            print(f"Reply from {reachable_ip}!")
             if prev_state_val == "stop":
-                print(f"Reply from {miner_ip}. Attempting force shutdown sequence...")
+                print(f"Reply from {reachable_ip}. Attempting force shutdown sequence...")
                 press_power_button(16, 10)
                 time.sleep(5)
                 print("Force shutdown completed.")
@@ -1868,10 +1879,11 @@ def check_uptime(now, prev_state_val):
                 save_prev_state(prev_state_val, uptime)
 
         total_hours = difference.days * 24 + hours
+        status_target = reachable_ip or f"any configured IP ({', '.join(miner_ips)})"
         if prev_state_val == "production":
-            print(f"{miner_ip} is online for {total_hours} hours and {minutes} minutes")
+            print(f"{status_target} is online for {total_hours} hours and {minutes} minutes")
         elif prev_state_val == "stop":
-            print(f"{miner_ip} is offline for {total_hours} hours and {minutes} minutes")
+            print(f"{status_target} is offline for {total_hours} hours and {minutes} minutes")
     except Exception as e:
         print(f"Error during uptime check: {e}")
 
