@@ -238,6 +238,7 @@ telemetry_history: deque = deque()
 _pending_transition_state: Optional[str] = None
 _pending_transition_since: Optional[datetime] = None
 _pending_transition_hits: int = 0
+web_notifications: deque = deque(maxlen=160)
 
 
 def _last_state_change_ts() -> Optional[datetime]:
@@ -1434,7 +1435,34 @@ def sleep_until_next_5min(offset_seconds=60):
     print(f"Sleeping for {sleep_seconds} seconds...")
     time.sleep(sleep_seconds)
 
-def send_telegram_message(message, max_retries=15, keyboard=True):
+
+def _push_web_notification(message: str, level: str = "info") -> None:
+    msg = str(message or "").strip()
+    if not msg:
+        return
+    cleaned = re.sub(r"\s+", " ", msg).strip()
+    short = cleaned[:240] + "…" if len(cleaned) > 240 else cleaned
+    web_notifications.appendleft({
+        "ts": datetime.now(tz=budapest_tz).isoformat(),
+        "level": level if level in {"info", "success", "warn", "error"} else "info",
+        "message": short,
+    })
+
+
+def _guess_notification_level(message: str) -> str:
+    m = str(message or "").lower()
+    if any(k in m for k in ["error", "failed", "hiba", "exception", "❌"]):
+        return "error"
+    if any(k in m for k in ["warning", "warn", "⚠️", "ping hiba"]):
+        return "warn"
+    if any(k in m for k in ["started", "stopped", "elküldve", "✅", "ready"]):
+        return "success"
+    return "info"
+
+
+def send_telegram_message(message, max_retries=15, keyboard=True, mirror_web=True):
+    if mirror_web:
+        _push_web_notification(message, level=_guess_notification_level(message))
     url = f'{TELEGRAM_BASE}/sendMessage'
     payload = {'chat_id': CHAT_ID, 'text': message}
     if keyboard:
@@ -1462,6 +1490,20 @@ def send_telegram_message(message, max_retries=15, keyboard=True):
                 backoff = min(backoff * 2, 60)
             else:
                 print("All retry attempts failed.")
+
+
+def send_telegram_message_async(message, max_retries=4, keyboard=True, mirror_web=False):
+    threading.Thread(
+        target=send_telegram_message,
+        kwargs={
+            "message": message,
+            "max_retries": max_retries,
+            "keyboard": keyboard,
+            "mirror_web": mirror_web,
+        },
+        daemon=True,
+        name="telegram-send-async",
+    ).start()
 
 def handle_telegram_messages(battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum, historical_hints=None):
     """
@@ -1897,19 +1939,27 @@ def check_uptime(now, prev_state_val):
             print("No reply!")
             if prev_state_val == "production":
                 print(f"No reply from any configured IP ({', '.join(miner_ips)}). Attempting restart sequence...")
+                send_telegram_message(
+                    f"⚠️ Miner ping hiba production módban ({', '.join(miner_ips)}). Újraindítási szekvencia indul."
+                )
                 press_power_button(16, 10)
                 time.sleep(15)
                 press_power_button(16, 0.55)
                 print("Restart sequence completed.")
+                send_telegram_message("✅ Miner restart szekvencia lefutott (ping hiba után).")
                 uptime = now
                 save_prev_state(prev_state_val, uptime)
         else:
             print(f"Reply from {reachable_ip}!")
             if prev_state_val == "stop":
                 print(f"Reply from {reachable_ip}. Attempting force shutdown sequence...")
+                send_telegram_message(
+                    f"⚠️ Miner válaszol ({reachable_ip}) STOP állapotban. Kényszerleállítás indul."
+                )
                 press_power_button(16, 10)
                 time.sleep(5)
                 print("Force shutdown completed.")
+                send_telegram_message("✅ STOP védelmi kényszerleállítás lefutott.")
                 uptime = now
                 save_prev_state(prev_state_val, uptime)
 
@@ -2570,14 +2620,21 @@ def _miner_action(action: str) -> Dict[str, Any]:
         return {"ok": False, "message": "invalid action", "ts": now}
 
     if not is_rpi:
-        return {"ok": False, "message": "GPIO unavailable (not Raspberry Pi runtime)", "ts": now}
+        msg = "GPIO unavailable (not Raspberry Pi runtime)"
+        _push_web_notification(f"❌ {action}: {msg}", level="error")
+        return {"ok": False, "message": msg, "ts": now}
 
     try:
         with gpio_lock:
             press_power_button(16, duration)
-        return {"ok": True, "message": f"{action} signal sent ({duration}s)", "ts": now}
+        msg = f"{action} signal sent ({duration}s)"
+        _push_web_notification(f"✅ GUI action: {msg}", level="success")
+        send_telegram_message_async(f"GUI action: {msg}", max_retries=4, keyboard=True, mirror_web=False)
+        return {"ok": True, "message": msg, "ts": now}
     except Exception as err:
-        return {"ok": False, "message": str(err), "ts": now}
+        err_msg = str(err)
+        _push_web_notification(f"❌ {action}: {err_msg}", level="error")
+        return {"ok": False, "message": err_msg, "ts": now}
 
 
 def _weather_icon(condition: str) -> str:
@@ -2629,15 +2686,39 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 .field label{font-size:.82rem;color:var(--muted)}
 .field input,.btn{border-radius:10px;border:1px solid var(--border);padding:10px 12px;font-size:.95rem}
 .field input{background:var(--input);color:var(--txt)}
-input[type="date"]{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.04));border:1px solid rgba(148,163,184,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 8px 18px rgba(2,6,23,.22);font-weight:700;letter-spacing:.02em;color:var(--txt);min-height:42px;color-scheme:dark}
+input[type="date"]{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.04));border:1px solid rgba(148,163,184,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 8px 18px rgba(2,6,23,.22);font-weight:700;letter-spacing:.02em;color:var(--txt);min-height:42px;color-scheme:dark;padding-right:36px}
 [data-theme="light"] input[type="date"]{background:linear-gradient(180deg,#ffffff,#eef4ff);border-color:rgba(71,85,105,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 6px 14px rgba(15,23,42,.08);color-scheme:light}
 input[type="date"]:hover{border-color:rgba(96,165,250,.75)}
 input[type="date"]:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25),0 10px 22px rgba(59,130,246,.2)}
-input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8%) saturate(321%) hue-rotate(178deg) brightness(102%) contrast(96%);cursor:pointer;opacity:.95}
-[data-theme="light"] input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(25%) sepia(8%) saturate(1510%) hue-rotate(178deg) brightness(94%) contrast(85%)}
+input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
+.field-date{position:relative}
+.field-date .calendar-icon{position:absolute;right:12px;bottom:12px;color:rgba(226,232,240,.95);font-size:.92rem;pointer-events:none;text-shadow:0 1px 2px rgba(2,6,23,.65)}
+[data-theme="light"] .field-date .calendar-icon{color:#334155;text-shadow:none}
 .actions{display:flex;gap:8px;flex-wrap:wrap}
-.btn{color:#fff;cursor:pointer;background:transparent}
+.btn{color:#fff;cursor:pointer;background:transparent;padding:7px 11px;font-size:.84rem;min-height:34px;line-height:1.2;transition:transform .15s ease,box-shadow .15s ease,opacity .15s ease}
+.btn:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(2,6,23,.24)}
+.btn:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none}
 .btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}.btn.ghost{background:transparent;color:var(--txt)}
+.toolbar-actions{justify-content:flex-end;align-items:center}
+.range-shortcuts{display:flex;gap:6px;flex-wrap:wrap}
+.range-shortcuts .btn{font-size:.8rem;min-height:30px;padding:6px 10px}
+#actionResult{margin-top:8px;min-height:22px;padding:6px 10px;border-radius:10px;border:1px solid transparent;display:none}
+#actionResult.show{display:flex;align-items:center;gap:8px}
+#actionResult.ok{background:rgba(34,197,94,.14);border-color:rgba(34,197,94,.42);color:#86efac}
+#actionResult.warn{background:rgba(245,158,11,.14);border-color:rgba(245,158,11,.42);color:#facc15}
+#actionResult.err{background:rgba(239,68,68,.14);border-color:rgba(239,68,68,.45);color:#fda4af}
+[data-theme="light"] #actionResult.ok{color:#166534}
+[data-theme="light"] #actionResult.warn{color:#92400e}
+[data-theme="light"] #actionResult.err{color:#991b1b}
+.notice-panel{margin-top:8px}
+.notice-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.notice-list{display:grid;gap:8px;max-height:200px;overflow:auto;padding-right:4px}
+.notice-item{border:1px solid var(--border);border-radius:10px;padding:8px 10px;background:rgba(255,255,255,.03)}
+.notice-item.warn{border-color:rgba(245,158,11,.5)}
+.notice-item.error{border-color:rgba(239,68,68,.5)}
+.notice-item.success{border-color:rgba(34,197,94,.48)}
+.notice-meta{font-size:.74rem;color:var(--muted);margin-bottom:4px}
+.notice-empty{font-size:.82rem;color:var(--muted);padding:10px;border:1px dashed var(--border);border-radius:10px}
 .charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .chart-card{height:360px;display:flex;flex-direction:column;overflow:hidden}
 .chart-card canvas{width:100% !important;flex:1 1 auto;min-height:0}
@@ -2663,15 +2744,16 @@ input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(86%) sepia(8
 <div class="grid metrics-grid" id="metrics"></div>
 <div class="panel hints-panel"><div class="hints-wrap" id="historyHints"></div></div>
 <div class="panel toolbar"><div class="filters">
-<div class="field"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="date" /></div>
-<div class="field"><label id="lblTo" for="toDate">To</label><input id="toDate" type="date" /></div>
-<div class="actions"><button class="btn ghost" id="resetRange"><i class="fa-solid fa-rotate-left"></i> Last 30 days</button><button class="btn ok" id="applyRange"><i class="fa-solid fa-filter"></i> Apply range</button></div>
-</div><div class="actions">
+<div class="field field-date"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="date" /><i class="fa-solid fa-calendar-days calendar-icon"></i></div>
+<div class="field field-date"><label id="lblTo" for="toDate">To</label><input id="toDate" type="date" /><i class="fa-solid fa-calendar-days calendar-icon"></i></div>
+<div class="actions"><div class="range-shortcuts"><button class="btn ghost" id="shortcutDay"><i class="fa-solid fa-clock"></i> Last Day</button><button class="btn ghost" id="shortcutWeek"><i class="fa-solid fa-calendar-week"></i> Last Week</button><button class="btn ghost" id="shortcutMonth"><i class="fa-solid fa-calendar-days"></i> Last Month</button></div><button class="btn ok" id="applyRange"><i class="fa-solid fa-filter"></i> Apply range</button></div>
+</div><div class="actions toolbar-actions">
 <button id="btnStart" class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
 <button id="btnStop" class="btn warn" onclick="act('stop')"><i class="fa-solid fa-stop"></i> Stop miner</button>
 <button id="btnForce" class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
 </div></div>
 <div id="actionResult" class="k"></div>
+<div class="panel notice-panel"><div class="notice-head"><div id="notifTitle" class="chart-title"><i class="fa-solid fa-bell"></i> Notifications</div></div><div id="notifList" class="notice-list"></div></div>
 <div class="charts"><div class="card chart-card"><div class="chart-head"><div id="chPower" class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div id="chPowerSub" class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chPhase" class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div id="chPhaseSub" class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
 <div class="card chart-card"><div class="chart-head"><div id="chBattery" class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Mining Rig</div><div id="chBatterySub" class="chart-sub">Charge level and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chEnv" class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div id="chEnvSub" class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chHistSoc" class="chart-title"><i class="fa-solid fa-layer-group"></i> Historical SOC Thresholds</div><div id="chHistSocSub" class="chart-sub">Dynamic SOC logic over time</div></div><canvas id="histSocChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chHistFlags" class="chart-title"><i class="fa-solid fa-chart-line"></i> Historical Decision Flags</div><div id="chHistFlagsSub" class="chart-sub">Battery preserve / headroom / month quality</div></div><canvas id="histFlagsChart"></canvas></div></div></div>
 <script>
@@ -2680,10 +2762,10 @@ const defaultLastDays=30;
 let currentRange={from:null,to:null};
 let currentLang='en';
 const I18N={
-  en:{title:'Solar Mining Dashboard',theme:'Theme',downloadTelemetry:'Telemetry JSON',from:'From',to:'To',last30:'Last 30 days',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',
+  en:{title:'Solar Mining Dashboard',theme:'Theme',downloadTelemetry:'Telemetry JSON',from:'From',to:'To',lastDay:'Last Day',lastWeek:'Last Week',lastMonth:'Last Month',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',actionInProgress:'Sending command…',actionStartOk:'Miner start command sent successfully.',actionStopOk:'Miner stop command sent successfully.',actionForceOk:'Force stop command sent successfully.',actionError:'Command failed',notifTitle:'Notifications',notifEmpty:'No notifications yet.',
       state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
       chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardFullEta:'ETA to 100% battery charge',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',reasonCannotRefillBeforeSunset:'Likely cannot refill battery before sunset',reasonRefillRelaxation:'Confident refill relaxation',reasonRefillMorningRelaxation:'Confident morning refill relaxation',reasonBridgeEnergySunnyRelaxation:'Bridge-energy confident sunny-day relaxation',reasonAggressiveMorningRefillStart:'Aggressive morning refill start',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
-  hu:{title:'Solar Bányászat Dashboard',theme:'Téma',downloadTelemetry:'Telemetry JSON letöltése',from:'Ettől',to:'Eddig',last30:'Utolsó 30 nap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',
+  hu:{title:'Solar Bányászat Dashboard',theme:'Téma',downloadTelemetry:'Telemetry JSON letöltése',from:'Ettől',to:'Eddig',lastDay:'Elmúlt nap',lastWeek:'Elmúlt hét',lastMonth:'Elmúlt hónap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',actionInProgress:'Parancs küldése…',actionStartOk:'Indítási parancs elküldve.',actionStopOk:'Leállítási parancs elküldve.',actionForceOk:'Kényszerleállítási parancs elküldve.',actionError:'Parancs hiba',notifTitle:'Értesítések',notifEmpty:'Még nincs értesítés.',
       state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
       chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardFullEta:'Várható idő 100% akku töltésig',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',reasonCannotRefillBeforeSunset:'Várhatóan nem tölt vissza napnyugtáig',reasonRefillRelaxation:'Magabiztos visszatöltési lazítás',reasonRefillMorningRelaxation:'Magabiztos reggeli visszatöltési lazítás',reasonBridgeEnergySunnyRelaxation:'Bridge energia + napsütés miatti lazítás',reasonAggressiveMorningRefillStart:'Agresszív reggeli indítás (visszatöltés biztos)',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
@@ -2719,11 +2801,14 @@ function applyI18n(){
   document.getElementById('downloadTelemetry').innerHTML=`<i class="fa-solid fa-download"></i> ${t('downloadTelemetry')}`;
   document.getElementById('lblFrom').textContent=t('from');
   document.getElementById('lblTo').textContent=t('to');
-  document.getElementById('resetRange').innerHTML=`<i class="fa-solid fa-rotate-left"></i> ${t('last30')}`;
+  document.getElementById('shortcutDay').innerHTML=`<i class="fa-solid fa-clock"></i> ${t('lastDay')}`;
+  document.getElementById('shortcutWeek').innerHTML=`<i class="fa-solid fa-calendar-week"></i> ${t('lastWeek')}`;
+  document.getElementById('shortcutMonth').innerHTML=`<i class="fa-solid fa-calendar-days"></i> ${t('lastMonth')}`;
   document.getElementById('applyRange').innerHTML=`<i class="fa-solid fa-filter"></i> ${t('apply')}`;
   document.getElementById('btnStart').innerHTML=`<i class="fa-solid fa-play"></i> ${t('start')}`;
   document.getElementById('btnStop').innerHTML=`<i class="fa-solid fa-stop"></i> ${t('stop')}`;
   document.getElementById('btnForce').innerHTML=`<i class="fa-solid fa-power-off"></i> ${t('force')}`;
+  document.getElementById('notifTitle').innerHTML=`<i class="fa-solid fa-bell"></i> ${t('notifTitle')}`;
   document.getElementById('chPower').innerHTML=`<i class="fa-solid fa-solar-panel"></i> ${t('chPower')}`;
   document.getElementById('chPowerSub').textContent=t('chPowerSub');
   document.getElementById('chPhase').innerHTML=`<i class="fa-solid fa-bolt"></i> ${t('chPhase')}`;
@@ -2754,8 +2839,31 @@ if(mm===60){h+=1;mm=0;}
 return `${total.toFixed(1)} ${t('unitMin')} (${h}h ${mm}m)`;
 }
 function formatDate(d){return d.toISOString().slice(0,10)}
+function setRangeDays(days){const to=new Date();const from=new Date();from.setDate(to.getDate()-days);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
 function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
+function showActionResult(msg,type='warn',details=''){
+  const el=document.getElementById('actionResult');
+  const icon=type==='ok'?'fa-circle-check':(type==='err'?'fa-triangle-exclamation':'fa-circle-info');
+  const extra=details?` <span class='chart-sub'>${details}</span>`:'';
+  el.className=`k show ${type}`;
+  el.innerHTML=`<i class='fa-solid ${icon}'></i> <span>${msg}</span>${extra}`;
+}
+function renderNotifications(items){
+  const box=document.getElementById('notifList');
+  const list=Array.isArray(items)?items:[];
+  if(!list.length){
+    box.innerHTML=`<div class='notice-empty'>${t('notifEmpty')}</div>`;
+    return;
+  }
+  box.innerHTML=list.slice(0,5).map((n)=>{
+    const lvl=String(n.level||'info');
+    const ts=n.ts?new Date(n.ts).toLocaleString():'';
+    const icon=lvl==='success'?'fa-circle-check':(lvl==='warn'?'fa-triangle-exclamation':(lvl==='error'?'fa-circle-xmark':'fa-circle-info'));
+    return `<div class='notice-item ${lvl}'><div class='notice-meta'><i class='fa-solid ${icon}'></i> ${ts}</div><div>${String(n.message||'')}</div></div>`;
+  }).join('');
+}
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
+renderNotifications(d.notifications||[]);
 const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
 document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
@@ -2794,9 +2902,30 @@ envChart.data.labels=labels; envChart.data.datasets[0].data=h.map(x=>x.garage_te
 histSocChart.data.labels=labels; histSocChart.data.datasets[0].data=h.map(x=>Number(x.early_start_soc||0)); histSocChart.data.datasets[1].data=h.map(x=>Number(x.min_stop_soc||0)); histSocChart.data.datasets[2].data=h.map(x=>Number(x.late_day_reserve_soc||0)); histSocChart.update();
 const mq=(m)=>m==='strong'?100:(m==='weak'?0:50);
 histFlagsChart.data.labels=labels; histFlagsChart.data.datasets[0].data=h.map(x=>x.should_preserve_battery?100:0); histFlagsChart.data.datasets[1].data=h.map(x=>x.headroom_good?100:0); histFlagsChart.data.datasets[2].data=h.map(x=>mq(String(x.month_quality||'neutral'))); histFlagsChart.update();}
-async function act(a){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});const d=await r.json();document.getElementById('actionResult').textContent=d.message + ' @ ' + d.ts;}
+async function act(a){
+  const buttons=['btnStart','btnStop','btnForce'].map(id=>document.getElementById(id));
+  buttons.forEach(b=>b.disabled=true);
+  showActionResult(t('actionInProgress'),'warn');
+  try{
+    const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});
+    const d=await r.json();
+    const msgKey=a==='start'?'actionStartOk':(a==='stop'?'actionStopOk':'actionForceOk');
+    const stamp=d.ts?new Date(d.ts).toLocaleString():'';
+    if(d.ok){
+      showActionResult(t(msgKey),'ok',`${d.message}${stamp?` · ${stamp}`:''}`);
+    }else{
+      showActionResult(`${t('actionError')}: ${d.message}`,'err',stamp);
+    }
+  }catch(err){
+    showActionResult(`${t('actionError')}: ${String(err)}`,'err');
+  }finally{
+    buttons.forEach(b=>b.disabled=false);
+  }
+}
 document.getElementById('applyRange').onclick=()=>{currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};pull();};
-document.getElementById('resetRange').onclick=()=>{setDefaultRange();pull();};
+document.getElementById('shortcutDay').onclick=()=>{setRangeDays(1);pull();};
+document.getElementById('shortcutWeek').onclick=()=>{setRangeDays(7);pull();};
+document.getElementById('shortcutMonth').onclick=()=>{setRangeDays(30);pull();};
 document.getElementById('downloadTelemetry').onclick=()=>{window.location.href='/api/telemetry/download';};
 init();applyI18n();pull();setInterval(pull,10000);document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};document.getElementById('lang').onclick=()=>{currentLang=currentLang==='en'?'hu':'en';applyI18n();pull();};
 </script></body></html>
@@ -2807,6 +2936,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
     with snapshot_lock:
         snap = dict(_shared_snapshot)
         hist = list(telemetry_history)
+    notices = list(web_notifications)[:5]
 
     now = datetime.now(tz=budapest_tz)
     start_ts = None
@@ -2851,6 +2981,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "history_count": len(filtered_hist),
         "history": filtered_hist,
         "historical_hints": snap.get("historical_hints", {}),
+        "notifications": notices,
     }
 
 
