@@ -1919,7 +1919,10 @@ def press_power_button(gpio_pin, press_time):
 
 def check_uptime(now, prev_state_val):
     global uptime
-    miner_ips = MINER_IPS or ["192.168.0.200"]
+    # OR semantics by design:
+    # - production: if ANY configured miner IP replies, miner is considered online
+    # - stop: if ANY configured miner IP replies, force shutdown is triggered
+    miner_ips = MINER_IPS or ["192.168.0.200", "192.168.0.201"]
     if uptime is None:
         uptime = now
     difference = now - uptime
@@ -1928,14 +1931,13 @@ def check_uptime(now, prev_state_val):
 
     print(f"Pinging miner IPs: {', '.join(miner_ips)} to check uptime...")
     try:
-        reachable_ip = None
+        reachable_ips = []
         for miner_ip in miner_ips:
             result = subprocess.run(["ping", "-c", "1", "-W", "2", miner_ip], stdout=subprocess.DEVNULL)
             if result.returncode == 0:
-                reachable_ip = miner_ip
-                break
+                reachable_ips.append(miner_ip)
 
-        if reachable_ip is None:
+        if not reachable_ips:
             print("No reply!")
             if prev_state_val == "production":
                 print(f"No reply from any configured IP ({', '.join(miner_ips)}). Attempting restart sequence...")
@@ -1950,11 +1952,12 @@ def check_uptime(now, prev_state_val):
                 uptime = now
                 save_prev_state(prev_state_val, uptime)
         else:
-            print(f"Reply from {reachable_ip}!")
+            reachable_text = ", ".join(reachable_ips)
+            print(f"Reply from: {reachable_text}!")
             if prev_state_val == "stop":
-                print(f"Reply from {reachable_ip}. Attempting force shutdown sequence...")
+                print(f"Reply from {reachable_text}. Attempting force shutdown sequence...")
                 send_telegram_message(
-                    f"⚠️ Miner válaszol ({reachable_ip}) STOP állapotban. Kényszerleállítás indul."
+                    f"⚠️ Miner válaszol ({reachable_text}) STOP állapotban. Kényszerleállítás indul."
                 )
                 press_power_button(16, 10)
                 time.sleep(5)
@@ -1964,7 +1967,7 @@ def check_uptime(now, prev_state_val):
                 save_prev_state(prev_state_val, uptime)
 
         total_hours = difference.days * 24 + hours
-        status_target = reachable_ip or f"any configured IP ({', '.join(miner_ips)})"
+        status_target = ", ".join(reachable_ips) if reachable_ips else f"any configured IP ({', '.join(miner_ips)})"
         if prev_state_val == "production":
             print(f"{status_target} is online for {total_hours} hours and {minutes} minutes")
         elif prev_state_val == "stop":
@@ -3303,6 +3306,12 @@ def main_loop():
                     prev_state = state
                     uptime = now
                     save_prev_state(prev_state, uptime)
+
+            # Safety ping supervision must also run during sleep/idle window.
+            # If any configured IP replies while stop is expected, force shutdown is executed.
+            if is_rpi and uptime and (now - uptime) > timedelta(minutes=3):
+                check_uptime(now, prev_state)
+
             if is_rpi:
                 write_to_display(
                     state_text="sleep",
