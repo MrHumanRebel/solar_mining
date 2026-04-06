@@ -68,6 +68,8 @@ MINER_IPS = [
     for ip in os.getenv("MY_MINER_IPS", "192.168.0.200,192.168.0.201").split(",")
     if ip.strip()
 ]
+MINER_PING_RETRIES_PER_IP = max(1, int(os.getenv("MY_MINER_PING_RETRIES_PER_IP", "2")))
+MINER_PING_FAIL_STREAK_FOR_RESTART = max(1, int(os.getenv("MY_MINER_PING_FAIL_STREAK_FOR_RESTART", "2")))
 
 print(platform.machine())
 print(platform.system())
@@ -238,6 +240,7 @@ telemetry_history: deque = deque()
 _pending_transition_state: Optional[str] = None
 _pending_transition_since: Optional[datetime] = None
 _pending_transition_hits: int = 0
+_miner_ping_full_failure_streak: int = 0
 web_notifications: deque = deque(maxlen=160)
 
 
@@ -1919,7 +1922,7 @@ def press_power_button(gpio_pin, press_time):
 
 
 def check_uptime(now, prev_state_val):
-    global uptime
+    global uptime, _miner_ping_full_failure_streak
     # OR semantics by design:
     # - production: if ANY configured miner IP replies, miner is considered online
     # - stop: if ANY configured miner IP replies, force shutdown is triggered
@@ -1930,29 +1933,46 @@ def check_uptime(now, prev_state_val):
     hours, remainder = divmod(difference.seconds, 3600)
     minutes, _ = divmod(remainder, 60)
 
-    print(f"Pinging miner IPs: {', '.join(miner_ips)} to check uptime...")
+    print(
+        f"Pinging miner IPs: {', '.join(miner_ips)} "
+        f"(retries per IP: {MINER_PING_RETRIES_PER_IP}) to check uptime..."
+    )
     try:
         reachable_ips = []
         for miner_ip in miner_ips:
-            result = subprocess.run(["ping", "-c", "1", "-W", "2", miner_ip], stdout=subprocess.DEVNULL)
-            if result.returncode == 0:
+            ip_reachable = False
+            for _ in range(MINER_PING_RETRIES_PER_IP):
+                result = subprocess.run(["ping", "-c", "1", "-W", "2", miner_ip], stdout=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    ip_reachable = True
+                    break
+            if ip_reachable:
                 reachable_ips.append(miner_ip)
 
         if not reachable_ips:
             print("No reply!")
             if prev_state_val == "production":
-                print(f"No reply from any configured IP ({', '.join(miner_ips)}). Attempting restart sequence...")
-                send_telegram_message(
-                    f"⚠️ Miner ping failed in production mode ({', '.join(miner_ips)}). Restart sequence started."
+                _miner_ping_full_failure_streak += 1
+                print(
+                    f"No reply from any configured IP ({', '.join(miner_ips)}). "
+                    f"Failure streak: {_miner_ping_full_failure_streak}/{MINER_PING_FAIL_STREAK_FOR_RESTART}."
                 )
-                press_power_button(16, 10)
-                time.sleep(15)
-                press_power_button(16, 0.55)
-                print("Restart sequence completed.")
-                send_telegram_message("✅ Miner restart sequence completed (after ping failure).")
-                uptime = now
-                save_prev_state(prev_state_val, uptime)
+                if _miner_ping_full_failure_streak >= MINER_PING_FAIL_STREAK_FOR_RESTART:
+                    print("Failure streak threshold reached. Attempting restart sequence...")
+                    send_telegram_message(
+                        f"⚠️ Miner ping failed in production mode ({', '.join(miner_ips)}) "
+                        f"for {_miner_ping_full_failure_streak} consecutive checks. Restart sequence started."
+                    )
+                    press_power_button(16, 10)
+                    time.sleep(15)
+                    press_power_button(16, 0.55)
+                    print("Restart sequence completed.")
+                    send_telegram_message("✅ Miner restart sequence completed (after consecutive ping failures).")
+                    uptime = now
+                    save_prev_state(prev_state_val, uptime)
+                    _miner_ping_full_failure_streak = 0
         else:
+            _miner_ping_full_failure_streak = 0
             reachable_text = ", ".join(reachable_ips)
             print(f"Reply from: {reachable_text}!")
             if prev_state_val == "stop":
