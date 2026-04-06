@@ -1679,7 +1679,8 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"• CPU temp: {temps.get('cpu-thermal') or temps.get('CPU') or 'N/A'}\n"
             f"• Quote usage: {used_quote} / {QUOTE_LIMIT} ({percentage:.2f}%)"
         )
-        send_telegram_message(message)
+        # /now is a high-frequency status query; keep Telegram reply but do not mirror it into GUI notifications.
+        send_telegram_message(message, mirror_web=False)
 
     if message_text == "/phase":
         try:
@@ -1942,13 +1943,13 @@ def check_uptime(now, prev_state_val):
             if prev_state_val == "production":
                 print(f"No reply from any configured IP ({', '.join(miner_ips)}). Attempting restart sequence...")
                 send_telegram_message(
-                    f"⚠️ Miner ping hiba production módban ({', '.join(miner_ips)}). Újraindítási szekvencia indul."
+                    f"⚠️ Miner ping failed in production mode ({', '.join(miner_ips)}). Restart sequence started."
                 )
                 press_power_button(16, 10)
                 time.sleep(15)
                 press_power_button(16, 0.55)
                 print("Restart sequence completed.")
-                send_telegram_message("✅ Miner restart szekvencia lefutott (ping hiba után).")
+                send_telegram_message("✅ Miner restart sequence completed (after ping failure).")
                 uptime = now
                 save_prev_state(prev_state_val, uptime)
         else:
@@ -1957,12 +1958,12 @@ def check_uptime(now, prev_state_val):
             if prev_state_val == "stop":
                 print(f"Reply from {reachable_text}. Attempting force shutdown sequence...")
                 send_telegram_message(
-                    f"⚠️ Miner válaszol ({reachable_text}) STOP állapotban. Kényszerleállítás indul."
+                    f"⚠️ Miner is responding ({reachable_text}) while state is STOP. Force shutdown started."
                 )
                 press_power_button(16, 10)
                 time.sleep(5)
                 print("Force shutdown completed.")
-                send_telegram_message("✅ STOP védelmi kényszerleállítás lefutott.")
+                send_telegram_message("✅ STOP safety force shutdown completed.")
                 uptime = now
                 save_prev_state(prev_state_val, uptime)
 
@@ -2203,15 +2204,28 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             and battery_charge >= 96
             and current_power >= max(350.0, MINER_POWER_W * 0.35)
         )
+        minutes_to_sunset = _safe_float((sunset - now).total_seconds() / 60.0, -1.0) if isinstance(sunset, datetime) else -1.0
+        eta_to_full_min = _safe_float(hist.get("predicted_minutes_to_full"), -1.0)
+        eta_exceeds_daylight_low_soc_while_running = (
+            prev_state == "production"
+            and eta_to_full_min >= 0.0
+            and minutes_to_sunset >= 0.0
+            and eta_to_full_min > minutes_to_sunset
+            and battery_charge < 90.0
+        )
         cannot_refill_before_sunset_while_running = (
             prev_state == "production"
-            and _safe_float(hist.get("predicted_minutes_to_full"), -1.0) >= 0.0
+            and eta_to_full_min >= 0.0
             and not bool(hist.get("can_refill_before_sunset", False))
             and _safe_float(hist.get("sunset_margin_minutes"), 0.0) < -5.0
             and not curtailment_prevent_window
         )
 
         stop_runtime_rules = [
+            (
+                "ETA to 100% exceeds remaining daylight while SOC<90% (force stop protection)",
+                eta_exceeds_daylight_low_soc_while_running,
+            ),
             (
                 f"Battery<{BATTERY_PROTECT_SOC:.0f}% and PV<{pv_stop_threshold:.0f}W (insufficient solar cover) while running",
                 prev_state == "production" and battery_charge < BATTERY_PROTECT_SOC and not pv_covers_miner and not curtailment_prevent_window,
