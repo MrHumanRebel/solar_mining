@@ -25,6 +25,7 @@ import signal
 import shutil
 import subprocess
 from urllib.parse import urlparse, parse_qs
+import ipaddress
 
 # NEW: threading / futures
 import threading
@@ -241,7 +242,23 @@ _pending_transition_state: Optional[str] = None
 _pending_transition_since: Optional[datetime] = None
 _pending_transition_hits: int = 0
 _miner_ping_full_failure_streak: int = 0
+_last_miner_ping_check_at: Optional[datetime] = None
 web_notifications: deque = deque(maxlen=160)
+
+
+def _should_run_miner_ping_check(now: datetime, min_interval_minutes: int = 3) -> bool:
+    """Throttle miner ping checks without coupling them to miner uptime timestamps."""
+    global _last_miner_ping_check_at
+    if not isinstance(now, datetime):
+        return False
+    if _last_miner_ping_check_at is None:
+        _last_miner_ping_check_at = now
+        return True
+    elapsed = now - _last_miner_ping_check_at
+    if elapsed >= timedelta(minutes=max(1, int(min_interval_minutes))):
+        _last_miner_ping_check_at = now
+        return True
+    return False
 
 
 def _last_state_change_ts() -> Optional[datetime]:
@@ -1926,7 +1943,16 @@ def check_uptime(now, prev_state_val):
     # OR semantics by design:
     # - production: if ANY configured miner IP replies, miner is considered online
     # - stop: if ANY configured miner IP replies, force shutdown is triggered
-    miner_ips = MINER_IPS or ["192.168.0.200", "192.168.0.201"]
+    miner_ips_raw = MINER_IPS or ["192.168.0.200", "192.168.0.201"]
+    miner_ips = []
+    for candidate in miner_ips_raw:
+        try:
+            miner_ips.append(str(ipaddress.ip_address(str(candidate).strip())))
+        except Exception:
+            print(f"[Warning] Invalid miner IP skipped: {candidate!r}")
+    if not miner_ips:
+        print("[Warning] No valid miner IP configured, skipping uptime check.")
+        return
     if uptime is None:
         uptime = now
     difference = now - uptime
@@ -1942,7 +1968,15 @@ def check_uptime(now, prev_state_val):
         for miner_ip in miner_ips:
             ip_reachable = False
             for _ in range(MINER_PING_RETRIES_PER_IP):
-                result = subprocess.run(["ping", "-c", "1", "-W", "2", miner_ip], stdout=subprocess.DEVNULL)
+                # Avoid stuck ping subprocesses in edge network states.
+                # NOTE: keep command list-form for safe argument handling.
+                result = subprocess.run(
+                    ["ping", "-c", "1", "-W", "2", miner_ip],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=4,
+                    check=False,
+                )
                 if result.returncode == 0:
                     ip_reachable = True
                     break
@@ -1992,7 +2026,10 @@ def check_uptime(now, prev_state_val):
         if prev_state_val == "production":
             print(f"{status_target} is online for {total_hours} hours and {minutes} minutes")
         elif prev_state_val == "stop":
-            print(f"{status_target} is offline for {total_hours} hours and {minutes} minutes")
+            if reachable_ips:
+                print(f"{status_target} is unexpectedly online while STOP was expected ({total_hours}h {minutes}m since last state change).")
+            else:
+                print(f"{status_target} is offline as expected for {total_hours} hours and {minutes} minutes")
     except Exception as e:
         print(f"Error during uptime check: {e}")
 
@@ -2271,7 +2308,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         decision_state = state or "unknown"
 
         # Optional ping supervision
-        if is_rpi and uptime and (now - uptime) > timedelta(minutes=3):
+        if is_rpi and _should_run_miner_ping_check(now, min_interval_minutes=3):
             check_uptime(now, prev_state)
 
         # HARD RULE: after configured afternoon hour, SOC under threshold must stop immediately.
@@ -3343,7 +3380,7 @@ def main_loop():
 
             # Safety ping supervision must also run during sleep/idle window.
             # If any configured IP replies while stop is expected, force shutdown is executed.
-            if is_rpi and uptime and (now - uptime) > timedelta(minutes=3):
+            if is_rpi and _should_run_miner_ping_check(now, min_interval_minutes=3):
                 check_uptime(now, prev_state)
 
             if is_rpi:
