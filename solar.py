@@ -299,36 +299,126 @@ def _hashrate_to_hs(value: float, unit: str) -> float:
     return max(0.0, value) * factor
 
 
+def _extract_hashrate_from_wallet_payload(payload: Dict[str, Any]) -> Optional[float]:
+    """
+    Parse RavenMiner wallet API payloads across multiple schema variants.
+    Returns H/s or None when no reliable value is found.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    candidates: List[float] = []
+    preferred: List[float] = []
+
+    def _append_numeric(value: Any) -> None:
+        try:
+            if isinstance(value, bool):
+                return
+            if isinstance(value, (int, float)):
+                candidates.append(max(0.0, float(value)))
+                return
+            if isinstance(value, str):
+                cleaned = value.strip().replace(",", "")
+                if cleaned:
+                    candidates.append(max(0.0, float(cleaned)))
+        except Exception:
+            return
+    def _append_preferred(value: Any) -> None:
+        try:
+            if isinstance(value, bool):
+                return
+            if isinstance(value, (int, float)):
+                preferred.append(max(0.0, float(value)))
+                return
+            if isinstance(value, str):
+                cleaned = value.strip().replace(",", "")
+                if cleaned:
+                    preferred.append(max(0.0, float(cleaned)))
+        except Exception:
+            return
+
+    # Common flat keys.
+    for key in ("hashrate", "currentHashrate", "current_hashrate", "hash", "hr5m", "5min"):
+        _append_numeric(payload.get(key))
+
+    # Nested "hashrate" object returned by RavenMiner wallet endpoint.
+    hashrate_obj = payload.get("hashrate")
+    if isinstance(hashrate_obj, dict):
+        _append_preferred(hashrate_obj.get("5min"))
+        for key in ("5min", "1h", "6h", "12h", "24h", "current", "avg"):
+            _append_numeric(hashrate_obj.get(key))
+
+    # Nested data envelope variants.
+    data_obj = payload.get("data")
+    if isinstance(data_obj, dict):
+        for key in ("hashrate", "currentHashrate", "current_hashrate", "hash", "hr5m"):
+            _append_numeric(data_obj.get(key))
+        nested_hashrate = data_obj.get("hashrate")
+        if isinstance(nested_hashrate, dict):
+            _append_preferred(nested_hashrate.get("5min"))
+            for key in ("5min", "1h", "6h", "12h", "24h", "current", "avg"):
+                _append_numeric(nested_hashrate.get(key))
+
+    # Worker list can also hold immediate 5-minute hashrate values.
+    workers = payload.get("workers")
+    worker_list = workers.get("list") if isinstance(workers, dict) else None
+    if isinstance(worker_list, list):
+        for w in worker_list:
+            if not isinstance(w, dict):
+                continue
+            _append_preferred(w.get("hr5m"))
+            for key in ("hr5m", "hashrate", "currentHashrate", "current_hashrate"):
+                _append_numeric(w.get(key))
+
+    if preferred:
+        return max(preferred)
+    return max(candidates) if candidates else None
+
+
 def _wallet_hashrate_hs(wallet: str) -> Optional[float]:
     wallet = _parse_wallet_address(wallet or "") or ""
     if not wallet:
         return None
     api_url = f"https://www.ravenminer.com/api/v1/wallet/{wallet}"
-    try:
-        r = requests.get(api_url, timeout=10)
-        if r.status_code == 200:
+    last_err: Optional[str] = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(
+                api_url,
+                timeout=(5, 12),
+                headers={"Accept": "application/json", "User-Agent": "solar-mining-bot/1.0"},
+            )
+            if r.status_code != 200:
+                last_err = f"http_{r.status_code}"
+                time.sleep(0.35 * attempt)
+                continue
+
             payload = r.json()
             if isinstance(payload, dict):
-                for key in ("hashrate", "currentHashrate", "current_hashrate", "hash"):
-                    if key in payload:
-                        try:
-                            return max(0.0, float(payload.get(key) or 0.0))
-                        except Exception:
-                            pass
-                data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
-                for key in ("hashrate", "currentHashrate", "current_hashrate", "hash"):
-                    if key in data:
-                        try:
-                            return max(0.0, float(data.get(key) or 0.0))
-                        except Exception:
-                            pass
-    except Exception:
-        pass
+                parsed_hs = _extract_hashrate_from_wallet_payload(payload)
+                if parsed_hs is not None:
+                    return parsed_hs
+                last_err = "json_schema_no_hashrate"
+            else:
+                last_err = "json_not_dict"
+        except requests.RequestException as err:
+            last_err = f"request_exception:{err.__class__.__name__}"
+        except ValueError:
+            last_err = "json_decode_error"
+        except Exception as err:
+            last_err = f"unexpected:{err.__class__.__name__}"
+        time.sleep(0.35 * attempt)
+    if last_err:
+        print(f"[Hashrate guard] RavenMiner API parse failed for {wallet}: {last_err}")
 
     # Fallback: parse wallet page text for any H/s values, keep highest.
     try:
         page_url = f"https://www.ravenminer.com/ravencoin/wallet/{wallet}"
-        resp = requests.get(page_url, timeout=12)
+        resp = requests.get(
+            page_url,
+            timeout=(5, 12),
+            headers={"User-Agent": "solar-mining-bot/1.0"},
+        )
         text = resp.text if resp.status_code == 200 else ""
         matches = re.findall(r"([0-9]+(?:[.,][0-9]+)?)\s*([kmgth]?h/s)", text, flags=re.IGNORECASE)
         if not matches:
@@ -1015,7 +1105,9 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
         weak_month = True
         strong_month = False
 
-    early_start_soc = 32 if strong_month else (58 if weak_month else 45)
+    # Lower baseline start SOCs so bridge capacity can be used earlier in the morning.
+    # Weak months still keep stricter discipline.
+    early_start_soc = 28 if strong_month else (52 if weak_month else 42)
     min_stop_soc = 26 if weak_month else 20
     late_day_reserve_soc = max(70, int(evening_soc_p40 + (8 if weak_month else 4)))
 
@@ -1067,13 +1159,13 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
         # Stronger relaxation when full recharge is predicted before late morning.
         if full_charge_dt is not None and full_charge_dt <= now.replace(hour=11, minute=30, second=0, microsecond=0):
             refill_confident_morning = True
-            early_start_soc = max(min_stop_soc + 4, early_start_soc - 14)
+            early_start_soc = max(min_stop_soc + 4, early_start_soc - 16)
         elif margin_min >= 120:
-            early_start_soc = max(min_stop_soc + 5, early_start_soc - 10)
+            early_start_soc = max(min_stop_soc + 5, early_start_soc - 12)
         elif margin_min >= 45:
-            early_start_soc = max(min_stop_soc + 6, early_start_soc - 8)
+            early_start_soc = max(min_stop_soc + 6, early_start_soc - 10)
         elif margin_min >= 15:
-            early_start_soc = max(min_stop_soc + 8, early_start_soc - 4)
+            early_start_soc = max(min_stop_soc + 8, early_start_soc - 6)
 
     return {
         "month_quality": "strong" if strong_month else ("weak" if weak_month else "neutral"),
@@ -2413,6 +2505,19 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             and battery_charge >= (hist["min_stop_soc"] + 6)
             and current_power >= max(120.0, MINER_POWER_W * 0.10)
         )
+        immediate_capacity_start = (
+            bool(start_guard.get("allow_start", False))
+            and now >= (sunrise - timedelta(minutes=30))
+            and now.hour < 15
+            and battery_charge >= (hist["min_stop_soc"] + 4)
+            and (
+                current_power >= max(100.0, MINER_POWER_W * 0.08)
+                or (
+                    bool(hist.get("can_refill_before_sunset", False))
+                    and _safe_float(hist.get("sunset_margin_minutes"), 0.0) >= 20.0
+                )
+            )
+        )
 
         start_rule_hits: List[str] = []
         stop_rule_hits: List[str] = []
@@ -2422,6 +2527,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
 
         start_rules = [
             ("Summer clear-day fast start: usable bridge energy covers needed bridge energy", summer_fast_start),
+            ("Immediate capacity start: bridge energy ready and daily refill still feasible", immediate_capacity_start),
             ("Confident sunny-day bridge start: PV can be 0W if bridge energy is enough (before 11h)", confident_sunny_bridge_start),
             ("Aggressive morning refill start: battery can still refill before sunset", aggressive_morning_refill_start),
             (
@@ -2480,6 +2586,29 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             and _safe_float(hist.get("sunset_margin_minutes"), 0.0) < -5.0
             and not curtailment_prevent_window
         )
+        required_rate_to_full_pct_per_h = 0.0
+        if minutes_to_sunset > 1.0 and battery_charge < 100.0:
+            required_rate_to_full_pct_per_h = max(0.0, (100.0 - battery_charge) / (minutes_to_sunset / 60.0))
+        predicted_rate_pct_per_h = _safe_float(hist.get("predicted_charge_rate_pct_per_hour"), 0.0)
+        likely_no_full_recharge_if_running = (
+            prev_state == "production"
+            and now.hour >= 12
+            and minutes_to_sunset > 0.0
+            and battery_charge < 99.0
+            and not curtailment_prevent_window
+            and (
+                (
+                    predicted_rate_pct_per_h > 0.0
+                    and predicted_rate_pct_per_h < (required_rate_to_full_pct_per_h * 0.9)
+                    and current_power < max(600.0, MINER_POWER_W * 0.80)
+                )
+                or (
+                    predicted_rate_pct_per_h <= 0.0
+                    and minutes_to_sunset <= 240.0
+                    and current_power < max(500.0, MINER_POWER_W * 0.65)
+                )
+            )
+        )
 
         stop_runtime_rules = [
             (
@@ -2493,6 +2622,10 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             (
                 "Predicted full charge is after sunset while running (sunset refill protection)",
                 cannot_refill_before_sunset_while_running,
+            ),
+            (
+                "Required charge rate to reach 100% by sunset is no longer achievable while running",
+                likely_no_full_recharge_if_running,
             ),
             ("Late-day reserve reached (after 14h, while running)", prev_state == "production" and now.hour >= 14 and battery_charge <= hist["late_day_reserve_soc"] and not curtailment_prevent_window),
             (
