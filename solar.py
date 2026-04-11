@@ -71,6 +71,11 @@ MINER_IPS = [
 ]
 MINER_PING_RETRIES_PER_IP = max(1, int(os.getenv("MY_MINER_PING_RETRIES_PER_IP", "2")))
 MINER_PING_FAIL_STREAK_FOR_RESTART = max(1, int(os.getenv("MY_MINER_PING_FAIL_STREAK_FOR_RESTART", "2")))
+MINER_STOP_FORCE_CONSECUTIVE = max(1, int(os.getenv("MY_MINER_STOP_FORCE_CONSECUTIVE", "2")))
+MINER_STOP_FORCE_COOLDOWN_MINUTES = max(1, int(os.getenv("MY_MINER_STOP_FORCE_COOLDOWN_MINUTES", "20")))
+HASHRATE_CHECK_DELAY_MINUTES = max(1, int(os.getenv("MY_HASHRATE_CHECK_DELAY_MINUTES", "10")))
+HASHRATE_MIN_HS = max(0.0, float(os.getenv("MY_HASHRATE_MIN_HS", "1")))
+HASHRATE_RESTART_COOLDOWN_MINUTES = max(5, int(os.getenv("MY_HASHRATE_RESTART_COOLDOWN_MINUTES", "30")))
 
 print(platform.machine())
 print(platform.system())
@@ -243,7 +248,100 @@ _pending_transition_since: Optional[datetime] = None
 _pending_transition_hits: int = 0
 _miner_ping_full_failure_streak: int = 0
 _last_miner_ping_check_at: Optional[datetime] = None
+_miner_stop_reply_streak: int = 0
+_last_force_shutdown_at: Optional[datetime] = None
+_last_production_start_at: Optional[datetime] = None
+_hashrate_low_streak: int = 0
+_last_hashrate_restart_at: Optional[datetime] = None
 web_notifications: deque = deque(maxlen=160)
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=budapest_tz)
+        return dt
+    except Exception:
+        return None
+
+
+def _parse_wallet_address(value: str) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("http://") or raw.startswith("https://"):
+        m = re.search(r"/wallet/([A-Za-z0-9]+)", raw)
+        if m:
+            raw = m.group(1)
+    raw = raw.strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{24,64}", raw):
+        return None
+    return raw
+
+
+def _effective_wallet_address() -> str:
+    global WALLET_ADDRESS
+    parsed = _parse_wallet_address(WALLET_ADDRESS)
+    return parsed or str(WALLET_ADDRESS).strip()
+
+
+def _hashrate_to_hs(value: float, unit: str) -> float:
+    factor = {
+        "h/s": 1.0,
+        "kh/s": 1e3,
+        "mh/s": 1e6,
+        "gh/s": 1e9,
+        "th/s": 1e12,
+    }.get(str(unit or "").strip().lower(), 1.0)
+    return max(0.0, value) * factor
+
+
+def _wallet_hashrate_hs(wallet: str) -> Optional[float]:
+    wallet = _parse_wallet_address(wallet or "") or ""
+    if not wallet:
+        return None
+    api_url = f"https://www.ravenminer.com/api/v1/wallet/{wallet}"
+    try:
+        r = requests.get(api_url, timeout=10)
+        if r.status_code == 200:
+            payload = r.json()
+            if isinstance(payload, dict):
+                for key in ("hashrate", "currentHashrate", "current_hashrate", "hash"):
+                    if key in payload:
+                        try:
+                            return max(0.0, float(payload.get(key) or 0.0))
+                        except Exception:
+                            pass
+                data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
+                for key in ("hashrate", "currentHashrate", "current_hashrate", "hash"):
+                    if key in data:
+                        try:
+                            return max(0.0, float(data.get(key) or 0.0))
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    # Fallback: parse wallet page text for any H/s values, keep highest.
+    try:
+        page_url = f"https://www.ravenminer.com/ravencoin/wallet/{wallet}"
+        resp = requests.get(page_url, timeout=12)
+        text = resp.text if resp.status_code == 200 else ""
+        matches = re.findall(r"([0-9]+(?:[.,][0-9]+)?)\s*([kmgth]?h/s)", text, flags=re.IGNORECASE)
+        if not matches:
+            return None
+        vals = []
+        for n, unit in matches:
+            try:
+                vals.append(_hashrate_to_hs(float(str(n).replace(",", ".")), unit))
+            except Exception:
+                continue
+        return max(vals) if vals else None
+    except Exception:
+        return None
 
 
 def _should_run_miner_ping_check(now: datetime, min_interval_minutes: int = 3) -> bool:
@@ -1551,7 +1649,8 @@ def handle_telegram_messages(battery, power, state, current_condition, sunrise, 
         print(f"Error while handling Telegram messages: {e}")
 
 def process_message(message_text, battery, power, state, current_condition, sunrise, sunset, clouds, garage_temp, garage_hum, historical_hints=None):
-    global used_quote
+    global used_quote, WALLET_ADDRESS
+    message_text = str(message_text or "").strip()
     if message_text == "/now":
         ip = get_ip_address()
         ram = get_ram_usage()
@@ -1752,6 +1851,19 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         else:
             send_telegram_message("Force stop requested, but GPIO is not available on this host.")
 
+    if message_text == "/wallet":
+        send_telegram_message(f"Current wallet: {_effective_wallet_address()}")
+
+    if message_text.startswith("/wallet "):
+        raw = message_text.split(" ", 1)[1].strip()
+        parsed = _parse_wallet_address(raw)
+        if not parsed:
+            send_telegram_message("Invalid wallet. Use Ravencoin wallet address or full RavenMiner wallet URL.")
+        else:
+            WALLET_ADDRESS = parsed
+            save_prev_state(prev_state, uptime)
+            send_telegram_message(f"✅ Wallet updated: {WALLET_ADDRESS}")
+
 
 def load_quote_usage():
     if os.path.exists(QUOTE_FILE):
@@ -1842,12 +1954,19 @@ def load_data(filename=SOLARMAN_FILE):
     return {}
 
 def load_prev_state():
+    global WALLET_ADDRESS, _last_production_start_at, _last_hashrate_restart_at, _last_force_shutdown_at
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
                 d = json.load(f)
         except Exception:
             return None, None
+        wallet = _parse_wallet_address(d.get("wallet_address", WALLET_ADDRESS))
+        if wallet:
+            WALLET_ADDRESS = wallet
+        _last_production_start_at = _parse_timestamp(d.get("last_production_start_at"))
+        _last_hashrate_restart_at = _parse_timestamp(d.get("last_hashrate_restart_at"))
+        _last_force_shutdown_at = _parse_timestamp(d.get("last_force_shutdown_at"))
         prev_state_val = d.get('prev_state', None)
         uptime_str = d.get('uptime', None)
         if uptime_str:
@@ -1859,14 +1978,32 @@ def load_prev_state():
                 up = None
         else:
             up = None
+        if prev_state_val == "production" and _last_production_start_at is None and isinstance(up, datetime):
+            _last_production_start_at = up
         return prev_state_val, up
     return None, None
 
 def save_prev_state(state_val, uptime_val):
+    global WALLET_ADDRESS, _last_production_start_at, _last_hashrate_restart_at, _last_force_shutdown_at
     try:
+        existing = {}
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, 'r') as f:
+                    existing = json.load(f) or {}
+            except Exception:
+                existing = {}
         uptime_str = uptime_val.isoformat() if isinstance(uptime_val, datetime) else uptime_val
+        existing.update({
+            'prev_state': state_val,
+            'uptime': uptime_str,
+            'wallet_address': _effective_wallet_address(),
+            'last_production_start_at': _last_production_start_at.isoformat() if isinstance(_last_production_start_at, datetime) else None,
+            'last_hashrate_restart_at': _last_hashrate_restart_at.isoformat() if isinstance(_last_hashrate_restart_at, datetime) else None,
+            'last_force_shutdown_at': _last_force_shutdown_at.isoformat() if isinstance(_last_force_shutdown_at, datetime) else None,
+        })
         with open(STATE_FILE, 'w') as f:
-            json.dump({'prev_state': state_val, 'uptime': uptime_str}, f, indent=4)
+            json.dump(existing, f, indent=4)
     except Exception as e:
         print(f"[Warning] Failed to save prev state: {e}")
 
@@ -1939,7 +2076,7 @@ def press_power_button(gpio_pin, press_time):
 
 
 def check_uptime(now, prev_state_val):
-    global uptime, _miner_ping_full_failure_streak
+    global uptime, _miner_ping_full_failure_streak, _miner_stop_reply_streak, _last_force_shutdown_at
     # OR semantics by design:
     # - production: if ANY configured miner IP replies, miner is considered online
     # - stop: if ANY configured miner IP replies, force shutdown is triggered
@@ -1984,6 +2121,7 @@ def check_uptime(now, prev_state_val):
                 reachable_ips.append(miner_ip)
 
         if not reachable_ips:
+            _miner_stop_reply_streak = 0
             print("No reply!")
             if prev_state_val == "production":
                 _miner_ping_full_failure_streak += 1
@@ -2010,16 +2148,35 @@ def check_uptime(now, prev_state_val):
             reachable_text = ", ".join(reachable_ips)
             print(f"Reply from: {reachable_text}!")
             if prev_state_val == "stop":
-                print(f"Reply from {reachable_text}. Attempting force shutdown sequence...")
-                send_telegram_message(
-                    f"⚠️ Miner is responding ({reachable_text}) while state is STOP. Force shutdown started."
+                _miner_stop_reply_streak += 1
+                cooldown_ok = (
+                    _last_force_shutdown_at is None
+                    or (now - _last_force_shutdown_at) >= timedelta(minutes=MINER_STOP_FORCE_COOLDOWN_MINUTES)
                 )
-                press_power_button(16, 10)
-                time.sleep(5)
-                print("Force shutdown completed.")
-                send_telegram_message("✅ STOP safety force shutdown completed.")
-                uptime = now
-                save_prev_state(prev_state_val, uptime)
+                if _miner_stop_reply_streak < MINER_STOP_FORCE_CONSECUTIVE:
+                    print(
+                        f"STOP response streak {_miner_stop_reply_streak}/{MINER_STOP_FORCE_CONSECUTIVE}. "
+                        "Waiting for confirmation before force shutdown."
+                    )
+                elif not cooldown_ok:
+                    wait_left = max(
+                        0.0,
+                        MINER_STOP_FORCE_COOLDOWN_MINUTES - (now - _last_force_shutdown_at).total_seconds() / 60.0
+                    )
+                    print(f"Force shutdown cooldown active ({wait_left:.1f} min remaining).")
+                else:
+                    print(f"Reply from {reachable_text}. Attempting force shutdown sequence...")
+                    send_telegram_message(
+                        f"⚠️ Miner is responding ({reachable_text}) while state is STOP. Force shutdown started."
+                    )
+                    press_power_button(16, 10)
+                    time.sleep(5)
+                    print("Force shutdown completed.")
+                    send_telegram_message("✅ STOP safety force shutdown completed.")
+                    _last_force_shutdown_at = now
+                    _miner_stop_reply_streak = 0
+                    uptime = now
+                    save_prev_state(prev_state_val, uptime)
 
         total_hours = difference.days * 24 + hours
         status_target = ", ".join(reachable_ips) if reachable_ips else f"any configured IP ({', '.join(miner_ips)})"
@@ -2033,8 +2190,54 @@ def check_uptime(now, prev_state_val):
     except Exception as e:
         print(f"Error during uptime check: {e}")
 
+
+def check_hashrate_guard(now: datetime, effective_state: str) -> None:
+    global _hashrate_low_streak, _last_hashrate_restart_at
+    if str(effective_state).lower() != "production":
+        _hashrate_low_streak = 0
+        return
+    if _last_production_start_at is None:
+        return
+    if (now - _last_production_start_at) < timedelta(minutes=HASHRATE_CHECK_DELAY_MINUTES):
+        return
+
+    wallet = _effective_wallet_address()
+    hashrate_hs = _wallet_hashrate_hs(wallet)
+    if hashrate_hs is None:
+        _hashrate_low_streak += 1
+        print(f"[Hashrate guard] Unable to fetch hashrate for wallet {wallet}. streak={_hashrate_low_streak}")
+        return
+
+    if hashrate_hs >= HASHRATE_MIN_HS:
+        _hashrate_low_streak = 0
+        return
+
+    _hashrate_low_streak += 1
+    cooldown_ok = (
+        _last_hashrate_restart_at is None
+        or (now - _last_hashrate_restart_at) >= timedelta(minutes=HASHRATE_RESTART_COOLDOWN_MINUTES)
+    )
+    if not cooldown_ok:
+        print("[Hashrate guard] Low hashrate detected but restart cooldown is still active.")
+        return
+
+    msg = (
+        f"⚠️ Hashrate is too low after startup window ({HASHRATE_CHECK_DELAY_MINUTES} min). "
+        f"Wallet={wallet}, measured={hashrate_hs:.1f} H/s. Restarting miner."
+    )
+    print(msg)
+    send_telegram_message(msg)
+    if is_rpi and GPIO_AVAILABLE:
+        press_power_button(16, 10)
+        time.sleep(15)
+        press_power_button(16, 0.55)
+        _last_hashrate_restart_at = now
+        _hashrate_low_streak = 0
+        save_prev_state(prev_state, now)
+        send_telegram_message("✅ Hashrate guard restart sequence completed.")
+
 def check_crypto_production_conditions(data, weather_api_key, location_lat, location_lon):
-    global prev_state, state, used_quote, sunrise, sunset, uptime
+    global prev_state, state, used_quote, sunrise, sunset, uptime, _last_production_start_at
     global _pending_transition_state, _pending_transition_since, _pending_transition_hits
     prev_state, uptime = load_prev_state()
 
@@ -2490,6 +2693,7 @@ ________________________________
         })
 
         if state == "production" and prev_state != "production":
+            _last_production_start_at = now
             send_telegram_message(
                 f""" Production started!
 ________________________________
@@ -2502,6 +2706,7 @@ ________________________________
  Humidity: {humidity}%"""
             )
         elif state == "stop" and prev_state != "stop":
+            _last_production_start_at = None
             send_telegram_message(
                 f""" Production stopped.
 ________________________________
@@ -3311,6 +3516,7 @@ def main_loop():
                 f1_cond, f1_clouds, f1_ts, f3_cond, f3_clouds, f3_ts, hist_hints) = check_crypto_production_conditions(
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
+                check_hashrate_guard(now, state or "unknown")
 
                 has_usable_solarman_data = _has_solarman_payload(data)
                 if not has_usable_solarman_data:
