@@ -1356,8 +1356,16 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
         if deficit_w <= 0:
             eta_minutes = 0.0
 
+    # Real-time override: if PV already (or almost) covers miner demand, we're in full-supply mode.
+    # Historical interpolation can still yield a small positive ETA near hour boundaries (e.g. 1-3 min),
+    # and meter jitter can report tiny deficits; both should display as 0 and require no bridge energy.
+    realtime_full_supply_margin_w = max(50.0, MINER_POWER_W * 0.015)
+    if deficit_w <= realtime_full_supply_margin_w:
+        eta_minutes = 0.0
+        remaining_bridge_wh = 0.0
+
     # Avoid zero ETA when real-time PV is still below miner demand.
-    if deficit_w > 0.0 and eta_minutes <= 0.0:
+    if deficit_w > realtime_full_supply_margin_w and eta_minutes <= 0.0:
         eta_minutes = 5.0
         remaining_bridge_wh = max(remaining_bridge_wh, deficit_w * (eta_minutes / 60.0))
 
