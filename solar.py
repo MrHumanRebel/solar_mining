@@ -76,6 +76,8 @@ MINER_STOP_FORCE_COOLDOWN_MINUTES = max(1, int(os.getenv("MY_MINER_STOP_FORCE_CO
 HASHRATE_CHECK_DELAY_MINUTES = max(1, int(os.getenv("MY_HASHRATE_CHECK_DELAY_MINUTES", "10")))
 HASHRATE_MIN_HS = max(0.0, float(os.getenv("MY_HASHRATE_MIN_HS", "1")))
 HASHRATE_RESTART_COOLDOWN_MINUTES = max(5, int(os.getenv("MY_HASHRATE_RESTART_COOLDOWN_MINUTES", "30")))
+POWER_BUTTON_SHORT_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_SHORT_PRESS_SECONDS", "0.55"))
+POWER_BUTTON_LONG_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_LONG_PRESS_SECONDS", "10"))
 
 print(platform.machine())
 print(platform.system())
@@ -1934,20 +1936,20 @@ def process_message(message_text, battery, power, state, current_condition, sunr
 
     if message_text == "/start":
         if is_rpi and GPIO_AVAILABLE:
-            press_power_button(16, 0.55)
+            press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
             send_telegram_message("Crypto production started! Pressed power button.")
         else:
             send_telegram_message("Crypto production start requested, but GPIO is not available on this host.")
     if message_text == "/stop":
         if is_rpi and GPIO_AVAILABLE:
-            press_power_button(16, 0.55)
-            send_telegram_message("Crypto production stopped! Pressed power button.")
+            press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
+            send_telegram_message("Crypto production stopped! Pressed power button with long press.")
         else:
             send_telegram_message("Crypto production stop requested, but GPIO is not available on this host.")
     if message_text == "/force_stop":
         if is_rpi and GPIO_AVAILABLE:
-            press_power_button(16, 10)
-            send_telegram_message("Crypto production force stopped! Pressed power button for 10 seconds.")
+            press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
+            send_telegram_message(f"Crypto production force stopped! Pressed power button for {POWER_BUTTON_LONG_PRESS_SECONDS:.0f} seconds.")
         else:
             send_telegram_message("Force stop requested, but GPIO is not available on this host.")
 
@@ -2235,9 +2237,9 @@ def check_uptime(now, prev_state_val):
                         f"⚠️ Miner ping failed in production mode ({', '.join(miner_ips)}) "
                         f"for {_miner_ping_full_failure_streak} consecutive checks. Restart sequence started."
                     )
-                    press_power_button(16, 10)
+                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
                     time.sleep(15)
-                    press_power_button(16, 0.55)
+                    press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
                     print("Restart sequence completed.")
                     send_telegram_message("✅ Miner restart sequence completed (after consecutive ping failures).")
                     uptime = now
@@ -2269,7 +2271,7 @@ def check_uptime(now, prev_state_val):
                     send_telegram_message(
                         f"⚠️ Miner is responding ({reachable_text}) while state is STOP. Force shutdown started."
                     )
-                    press_power_button(16, 10)
+                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
                     time.sleep(5)
                     print("Force shutdown completed.")
                     send_telegram_message("✅ STOP safety force shutdown completed.")
@@ -2328,9 +2330,9 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
     print(msg)
     send_telegram_message(msg)
     if is_rpi and GPIO_AVAILABLE:
-        press_power_button(16, 10)
+        press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
         time.sleep(15)
-        press_power_button(16, 0.55)
+        press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
         _last_hashrate_restart_at = now
         _hashrate_low_streak = 0
         save_prev_state(prev_state, now)
@@ -2667,7 +2669,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
                 print("Trying to press power button.")
                 uptime = now
                 if is_rpi:
-                    press_power_button(16, 0.55)
+                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
             hist.update({
                 "decision_state": decision_state,
                 "decision_start_rules": start_rule_hits,
@@ -2705,7 +2707,7 @@ ________________________________
                 print("Trying to press power button.")
                 uptime = now
                 if is_rpi:
-                    press_power_button(16, 0.55)
+                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
             hist.update({
                 "decision_state": decision_state,
                 "decision_start_rules": start_rule_hits,
@@ -2747,7 +2749,7 @@ ________________________________
                     uptime = now
                     save_prev_state(prev_state, uptime)
                 if is_rpi:
-                    press_power_button(16, 0.55)
+                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
         elif matched_runtime_stops:
             stop_rule_hits = matched_runtime_stops
             decision_summary = "STOP: runtime stop rules satisfied"
@@ -2758,7 +2760,7 @@ ________________________________
                 print("Trying to press power button.")
                 uptime = now
                 if is_rpi:
-                    press_power_button(16, 0.55)
+                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
         elif start_guard["allow_start"] and start_rule_hits:
             print("Crypto production ready!")
             decision_summary = "START: start rules satisfied"
@@ -2768,7 +2770,7 @@ ________________________________
                 print("Trying to press power button.")
                 uptime = now
                 if is_rpi:
-                    press_power_button(16, 0.55)
+                    press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
         elif (not start_guard["allow_start"]) and prev_state != "production":
             print("Start trigger blocked by battery bridge guard.")
             decision_summary = "STOP: bridge guard blocked start"
@@ -3719,7 +3721,7 @@ def main_loop():
                 send_telegram_message("Miner did not shut down correctly, shutting down...")
                 print("Trying to press power button.")
                 if is_rpi:
-                    press_power_button(16, 0.55)
+                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
                 if state != prev_state:
                     prev_state = state
                     uptime = now
