@@ -66,15 +66,15 @@ MIN_RUN_MINUTES = int(os.getenv("MY_MIN_RUN_MINUTES", "18"))
 MIN_RESTART_DELAY_MINUTES = int(os.getenv("MY_MIN_RESTART_DELAY_MINUTES", "10"))
 MINER_IPS = [
     ip.strip()
-    for ip in os.getenv("MY_MINER_IPS", "192.168.0.200,192.168.0.201").split(",")
+    for ip in os.getenv("MY_MINER_IPS", "192.168.0.200").split(",")
     if ip.strip()
 ]
 MINER_PING_RETRIES_PER_IP = max(1, int(os.getenv("MY_MINER_PING_RETRIES_PER_IP", "2")))
-MINER_PING_FAIL_STREAK_FOR_RESTART = max(1, int(os.getenv("MY_MINER_PING_FAIL_STREAK_FOR_RESTART", "2")))
+MINER_PING_FAIL_STREAK_FOR_RESTART = max(1, int(os.getenv("MY_MINER_PING_FAIL_STREAK_FOR_RESTART", "1")))
 MINER_STOP_FORCE_CONSECUTIVE = max(1, int(os.getenv("MY_MINER_STOP_FORCE_CONSECUTIVE", "2")))
 MINER_STOP_FORCE_COOLDOWN_MINUTES = max(1, int(os.getenv("MY_MINER_STOP_FORCE_COOLDOWN_MINUTES", "20")))
 HASHRATE_CHECK_DELAY_MINUTES = max(1, int(os.getenv("MY_HASHRATE_CHECK_DELAY_MINUTES", "10")))
-HASHRATE_MIN_HS = max(0.0, float(os.getenv("MY_HASHRATE_MIN_HS", "1")))
+HASHRATE_MIN_HS = max(0.0, float(os.getenv("MY_HASHRATE_MIN_HS", "75000000")))
 HASHRATE_RESTART_COOLDOWN_MINUTES = max(5, int(os.getenv("MY_HASHRATE_RESTART_COOLDOWN_MINUTES", "30")))
 POWER_BUTTON_SHORT_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_SHORT_PRESS_SECONDS", "0.55"))
 POWER_BUTTON_LONG_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_LONG_PRESS_SECONDS", "10"))
@@ -114,6 +114,7 @@ _shared_snapshot = {
     "battery": 0, "power": 0, "state": "init", "current_condition": "unknown",
     "sunrise": datetime.now(tz=budapest_tz), "sunset": datetime.now(tz=budapest_tz),
     "clouds": 0, "garage_temp": 0, "garage_hum": 0,
+    "hashrate_hs": None, "hashrate_mhs": None,
     "inv_l1": 0, "inv_l2": 0, "inv_l3": 0, "inv_lt": 0,
     "historical_hints": {
         "month_quality": "neutral",
@@ -255,6 +256,8 @@ _last_force_shutdown_at: Optional[datetime] = None
 _last_production_start_at: Optional[datetime] = None
 _hashrate_low_streak: int = 0
 _last_hashrate_restart_at: Optional[datetime] = None
+_last_wallet_hashrate_hs: Optional[float] = None
+_last_wallet_hashrate_at: Optional[datetime] = None
 web_notifications: deque = deque(maxlen=160)
 
 
@@ -434,6 +437,23 @@ def _wallet_hashrate_hs(wallet: str) -> Optional[float]:
         return max(vals) if vals else None
     except Exception:
         return None
+
+
+def _wallet_hashrate_hs_cached(wallet: str, now: Optional[datetime] = None, max_age_seconds: int = 120) -> Optional[float]:
+    global _last_wallet_hashrate_hs, _last_wallet_hashrate_at
+    if now is None:
+        now = datetime.now(tz=budapest_tz)
+    if (
+        _last_wallet_hashrate_at is not None
+        and _last_wallet_hashrate_hs is not None
+        and (now - _last_wallet_hashrate_at).total_seconds() <= max(1, int(max_age_seconds))
+    ):
+        return _last_wallet_hashrate_hs
+    hs = _wallet_hashrate_hs(wallet)
+    if hs is not None:
+        _last_wallet_hashrate_hs = hs
+        _last_wallet_hashrate_at = now
+    return hs
 
 
 def _should_run_miner_ping_check(now: datetime, min_interval_minutes: int = 3) -> bool:
@@ -1789,6 +1809,9 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         lt_str = f"{lt} {unit}" if isinstance(lt, (int, float)) else "N/A"
 
         now_dt = datetime.now(tz=budapest_tz)
+        wallet = _effective_wallet_address()
+        now_hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now_dt, max_age_seconds=120)
+        hashrate_text = f"{(now_hashrate_hs / 1e6):.2f} MH/s" if isinstance(now_hashrate_hs, (int, float)) else "N/A"
         hints = historical_hints if isinstance(historical_hints, dict) and historical_hints else _history_recommendation(
             now_dt,
             _safe_float(battery, 0.0),
@@ -1851,6 +1874,7 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"• Battery: {battery}%\n"
             f"• Power: {power}W\n"
             f"• State: {state}\n"
+            f"• Hashrate: {hashrate_text}\n"
             f"• Weather: {current_condition}\n"
             f"• Clouds: {clouds}%\n"
             f"• Sunrise: {sunrise.strftime('%H:%M')}\n"
@@ -2182,7 +2206,7 @@ def check_uptime(now, prev_state_val):
     # OR semantics by design:
     # - production: if ANY configured miner IP replies, miner is considered online
     # - stop: if ANY configured miner IP replies, force shutdown is triggered
-    miner_ips_raw = MINER_IPS or ["192.168.0.200", "192.168.0.201"]
+    miner_ips_raw = MINER_IPS or ["192.168.0.200"]
     miner_ips = []
     for candidate in miner_ips_raw:
         try:
@@ -2233,15 +2257,26 @@ def check_uptime(now, prev_state_val):
                 )
                 if _miner_ping_full_failure_streak >= MINER_PING_FAIL_STREAK_FOR_RESTART:
                     print("Failure streak threshold reached. Attempting restart sequence...")
+                    wallet = _effective_wallet_address()
+                    hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
+                    hashrate_text = (
+                        f"{(hashrate_hs / 1e6):.2f} MH/s"
+                        if isinstance(hashrate_hs, (int, float))
+                        else "N/A"
+                    )
                     send_telegram_message(
                         f"⚠️ Miner ping failed in production mode ({', '.join(miner_ips)}) "
-                        f"for {_miner_ping_full_failure_streak} consecutive checks. Restart sequence started."
+                        f"for {_miner_ping_full_failure_streak} consecutive checks. "
+                        f"Current hashrate: {hashrate_text}. Restart sequence started."
                     )
                     press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
                     time.sleep(15)
                     press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
                     print("Restart sequence completed.")
-                    send_telegram_message("✅ Miner restart sequence completed (after consecutive ping failures).")
+                    send_telegram_message(
+                        f"✅ Miner restart sequence completed (after consecutive ping failures). "
+                        f"Latest hashrate: {hashrate_text}."
+                    )
                     uptime = now
                     save_prev_state(prev_state_val, uptime)
                     _miner_ping_full_failure_streak = 0
@@ -2302,9 +2337,8 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
         return
     if (now - _last_production_start_at) < timedelta(minutes=HASHRATE_CHECK_DELAY_MINUTES):
         return
-
     wallet = _effective_wallet_address()
-    hashrate_hs = _wallet_hashrate_hs(wallet)
+    hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
     if hashrate_hs is None:
         _hashrate_low_streak += 1
         print(f"[Hashrate guard] Unable to fetch hashrate for wallet {wallet}. streak={_hashrate_low_streak}")
@@ -2325,7 +2359,8 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
 
     msg = (
         f"⚠️ Hashrate is too low after startup window ({HASHRATE_CHECK_DELAY_MINUTES} min). "
-        f"Wallet={wallet}, measured={hashrate_hs:.1f} H/s. Restarting miner."
+        f"Wallet={wallet}, measured={(hashrate_hs / 1e6):.2f} MH/s "
+        f"(threshold {(HASHRATE_MIN_HS / 1e6):.2f} MH/s). Restarting miner."
     )
     print(msg)
     send_telegram_message(msg)
@@ -2336,7 +2371,7 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
         _last_hashrate_restart_at = now
         _hashrate_low_streak = 0
         save_prev_state(prev_state, now)
-        send_telegram_message("✅ Hashrate guard restart sequence completed.")
+        send_telegram_message(f"✅ Hashrate guard restart sequence completed. Latest hashrate: {(hashrate_hs / 1e6):.2f} MH/s.")
 
 def check_crypto_production_conditions(data, weather_api_key, location_lat, location_lon):
     global prev_state, state, used_quote, sunrise, sunset, uptime, _last_production_start_at
@@ -3185,10 +3220,10 @@ let currentRange={from:null,to:null};
 let currentLang='en';
 const I18N={
   en:{title:'Solar Mining Dashboard',theme:'Theme',downloadTelemetry:'Telemetry JSON',from:'From',to:'To',lastDay:'Last Day',lastWeek:'Last Week',lastMonth:'Last Month',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',actionInProgress:'Sending command…',actionStartOk:'Miner start command sent successfully.',actionStopOk:'Miner stop command sent successfully.',actionForceOk:'Force stop command sent successfully.',actionError:'Command failed',notifTitle:'Notifications',notifEmpty:'No notifications yet.',
-      state:'State',battery:'Battery',pv:'PV Power',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
+      state:'State',battery:'Battery',pv:'PV Power',hashrate:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
       chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardFullEta:'ETA to 100% battery charge',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',reasonCannotRefillBeforeSunset:'Likely cannot refill battery before sunset',reasonRefillRelaxation:'Confident refill relaxation',reasonRefillMorningRelaxation:'Confident morning refill relaxation',reasonBridgeEnergySunnyRelaxation:'Bridge-energy confident sunny-day relaxation',reasonAggressiveMorningRefillStart:'Aggressive morning refill start',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
   hu:{title:'Solar Bányászat Dashboard',theme:'Téma',downloadTelemetry:'Telemetry JSON letöltése',from:'Ettől',to:'Eddig',lastDay:'Elmúlt nap',lastWeek:'Elmúlt hét',lastMonth:'Elmúlt hónap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',actionInProgress:'Parancs küldése…',actionStartOk:'Indítási parancs elküldve.',actionStopOk:'Leállítási parancs elküldve.',actionForceOk:'Kényszerleállítási parancs elküldve.',actionError:'Parancs hiba',notifTitle:'Értesítések',notifEmpty:'Még nincs értesítés.',
-      state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
+      state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hashrate:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
       chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardFullEta:'Várható idő 100% akku töltésig',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',reasonCannotRefillBeforeSunset:'Várhatóan nem tölt vissza napnyugtáig',reasonRefillRelaxation:'Magabiztos visszatöltési lazítás',reasonRefillMorningRelaxation:'Magabiztos reggeli visszatöltési lazítás',reasonBridgeEnergySunnyRelaxation:'Bridge energia + napsütés miatti lazítás',reasonAggressiveMorningRefillStart:'Agresszív reggeli indítás (visszatöltés biztos)',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
 const t=(k)=>I18N[currentLang][k]||k;
@@ -3287,7 +3322,7 @@ function renderNotifications(items){
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
 renderNotifications(d.notifications||[]);
 const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-gauge-high'></i> ${t('hashrate')}</div><div class='v'>${Number.isFinite(Number(d.hashrate_mhs))?Number(d.hashrate_mhs).toFixed(2)+' MH/s':'N/A'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
 const hints=d.historical_hints||{};
 const monthQ=String(hints.month_quality||'neutral');
@@ -3398,6 +3433,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "current_condition": snap.get("current_condition", "unknown"),
         "weather_icon": _weather_icon(snap.get("current_condition", "")),
         "clouds": snap.get("clouds", 0),
+        "hashrate_hs": snap.get("hashrate_hs"),
+        "hashrate_mhs": snap.get("hashrate_mhs"),
         "sunrise": snap.get("sunrise").isoformat() if snap.get("sunrise") else "",
         "sunset": snap.get("sunset").isoformat() if snap.get("sunset") else "",
         "history_count": len(filtered_hist),
@@ -3660,6 +3697,9 @@ def main_loop():
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
                 check_hashrate_guard(now, state or "unknown")
+                wallet = _effective_wallet_address()
+                current_hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
+                current_hashrate_mhs = (current_hashrate_hs / 1e6) if isinstance(current_hashrate_hs, (int, float)) else None
 
                 has_usable_solarman_data = _has_solarman_payload(data)
                 if not has_usable_solarman_data:
@@ -3677,6 +3717,8 @@ def main_loop():
                         "state": state or "unknown",
                         "current_condition": current_condition or "unknown",
                         "sunrise": sunrise, "sunset": sunset, "clouds": clouds or 0,
+                        "hashrate_hs": current_hashrate_hs,
+                        "hashrate_mhs": current_hashrate_mhs,
                         "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0,
                         "inv_l1": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L1", 0.0)),
                         "inv_l2": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L2", 0.0)),
