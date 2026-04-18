@@ -258,6 +258,7 @@ _hashrate_low_streak: int = 0
 _last_hashrate_restart_at: Optional[datetime] = None
 _last_wallet_hashrate_hs: Optional[float] = None
 _last_wallet_hashrate_at: Optional[datetime] = None
+_restart_triggered_this_cycle: bool = False
 web_notifications: deque = deque(maxlen=160)
 
 
@@ -2203,6 +2204,7 @@ def press_power_button(gpio_pin, press_time):
 
 def check_uptime(now, prev_state_val):
     global uptime, _miner_ping_full_failure_streak, _miner_stop_reply_streak, _last_force_shutdown_at
+    global _restart_triggered_this_cycle
     # OR semantics by design:
     # - production: if ANY configured miner IP replies, miner is considered online
     # - stop: if ANY configured miner IP replies, force shutdown is triggered
@@ -2256,6 +2258,10 @@ def check_uptime(now, prev_state_val):
                     f"Failure streak: {_miner_ping_full_failure_streak}/{MINER_PING_FAIL_STREAK_FOR_RESTART}."
                 )
                 if _miner_ping_full_failure_streak >= MINER_PING_FAIL_STREAK_FOR_RESTART:
+                    if _restart_triggered_this_cycle:
+                        print("[Ping guard] Restart already triggered in this cycle. Skipping duplicate restart.")
+                        _miner_ping_full_failure_streak = 0
+                        return
                     print("Failure streak threshold reached. Attempting restart sequence...")
                     wallet = _effective_wallet_address()
                     hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
@@ -2280,6 +2286,7 @@ def check_uptime(now, prev_state_val):
                     uptime = now
                     save_prev_state(prev_state_val, uptime)
                     _miner_ping_full_failure_streak = 0
+                    _restart_triggered_this_cycle = True
         else:
             _miner_ping_full_failure_streak = 0
             reachable_text = ", ".join(reachable_ips)
@@ -2329,7 +2336,10 @@ def check_uptime(now, prev_state_val):
 
 
 def check_hashrate_guard(now: datetime, effective_state: str) -> None:
-    global _hashrate_low_streak, _last_hashrate_restart_at
+    global _hashrate_low_streak, _last_hashrate_restart_at, _restart_triggered_this_cycle
+    if _restart_triggered_this_cycle:
+        print("[Hashrate guard] Restart already triggered in this cycle. Skipping hashrate restart check.")
+        return
     if str(effective_state).lower() != "production":
         _hashrate_low_streak = 0
         return
@@ -2370,6 +2380,7 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
         press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
         _last_hashrate_restart_at = now
         _hashrate_low_streak = 0
+        _restart_triggered_this_cycle = True
         save_prev_state(prev_state, now)
         send_telegram_message(f"✅ Hashrate guard restart sequence completed. Latest hashrate: {(hashrate_hs / 1e6):.2f} MH/s.")
 
@@ -3577,6 +3588,7 @@ def _telegram_loop():
 
 def main_loop():
     global prev_state, state, used_quote, sunrise, sunset, uptime, last_quote_reset_date, historical_profile
+    global _restart_triggered_this_cycle
 
     if historical_profile is None:
         historical_profile = build_historical_profile(HISTORY_DIR)
@@ -3608,6 +3620,7 @@ def main_loop():
 
     while True:
         now = datetime.now(tz=budapest_tz)
+        _restart_triggered_this_cycle = False
 
         # Concurrently read DHT and prefetch next weather + token
         fut_dht = executor.submit(read_dht11, prev_garage_temp, prev_garage_hum)
