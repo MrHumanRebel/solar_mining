@@ -12,7 +12,6 @@ import platform
 import sys
 import re
 import math
-import subprocess
 from zoneinfo import ZoneInfo
 from collections import deque
 from collections import defaultdict
@@ -23,9 +22,7 @@ from typing import Any, Dict, Tuple, Optional, List
 import traceback
 import signal
 import shutil
-import subprocess
 from urllib.parse import urlparse, parse_qs
-import ipaddress
 
 # NEW: threading / futures
 import threading
@@ -64,17 +61,11 @@ PV_COVERAGE_RATIO_STOP = float(os.getenv("MY_PV_COVERAGE_RATIO_STOP", "0.9"))
 PV_COVERAGE_RATIO_START = float(os.getenv("MY_PV_COVERAGE_RATIO_START", "0.75"))
 MIN_RUN_MINUTES = int(os.getenv("MY_MIN_RUN_MINUTES", "18"))
 MIN_RESTART_DELAY_MINUTES = int(os.getenv("MY_MIN_RESTART_DELAY_MINUTES", "10"))
-MINER_IPS = [
-    ip.strip()
-    for ip in os.getenv("MY_MINER_IPS", "192.168.0.200").split(",")
-    if ip.strip()
-]
-MINER_PING_RETRIES_PER_IP = max(1, int(os.getenv("MY_MINER_PING_RETRIES_PER_IP", "2")))
-MINER_PING_FAIL_STREAK_FOR_RESTART = max(1, int(os.getenv("MY_MINER_PING_FAIL_STREAK_FOR_RESTART", "1")))
 MINER_STOP_FORCE_CONSECUTIVE = max(1, int(os.getenv("MY_MINER_STOP_FORCE_CONSECUTIVE", "2")))
 MINER_STOP_FORCE_COOLDOWN_MINUTES = max(1, int(os.getenv("MY_MINER_STOP_FORCE_COOLDOWN_MINUTES", "20")))
-HASHRATE_CHECK_DELAY_MINUTES = max(1, int(os.getenv("MY_HASHRATE_CHECK_DELAY_MINUTES", "10")))
-HASHRATE_MIN_HS = max(0.0, float(os.getenv("MY_HASHRATE_MIN_HS", "75000000")))
+HASHRATE_CHECK_DELAY_MINUTES = max(1, int(os.getenv("MY_HASHRATE_CHECK_DELAY_MINUTES", "15")))
+HASHRATE_MIN_HS = max(0.0, float(os.getenv("MY_HASHRATE_MIN_HS", "0")))
+HASHRATE_LOW_STREAK_LIMIT = max(1, int(os.getenv("MY_HASHRATE_LOW_STREAK_LIMIT", "3")))
 HASHRATE_RESTART_COOLDOWN_MINUTES = max(5, int(os.getenv("MY_HASHRATE_RESTART_COOLDOWN_MINUTES", "30")))
 POWER_BUTTON_SHORT_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_SHORT_PRESS_SECONDS", "0.55"))
 POWER_BUTTON_LONG_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_LONG_PRESS_SECONDS", "10"))
@@ -249,8 +240,6 @@ telemetry_history: deque = deque()
 _pending_transition_state: Optional[str] = None
 _pending_transition_since: Optional[datetime] = None
 _pending_transition_hits: int = 0
-_miner_ping_full_failure_streak: int = 0
-_last_miner_ping_check_at: Optional[datetime] = None
 _miner_stop_reply_streak: int = 0
 _last_force_shutdown_at: Optional[datetime] = None
 _last_production_start_at: Optional[datetime] = None
@@ -455,21 +444,6 @@ def _wallet_hashrate_hs_cached(wallet: str, now: Optional[datetime] = None, max_
         _last_wallet_hashrate_hs = hs
         _last_wallet_hashrate_at = now
     return hs
-
-
-def _should_run_miner_ping_check(now: datetime, min_interval_minutes: int = 3) -> bool:
-    """Throttle miner ping checks without coupling them to miner uptime timestamps."""
-    global _last_miner_ping_check_at
-    if not isinstance(now, datetime):
-        return False
-    if _last_miner_ping_check_at is None:
-        _last_miner_ping_check_at = now
-        return True
-    elapsed = now - _last_miner_ping_check_at
-    if elapsed >= timedelta(minutes=max(1, int(min_interval_minutes))):
-        _last_miner_ping_check_at = now
-        return True
-    return False
 
 
 def _last_state_change_ts() -> Optional[datetime]:
@@ -2202,137 +2176,52 @@ def press_power_button(gpio_pin, press_time):
         print(f"[Warning] GPIO press failed: {e}")
 
 
-def check_uptime(now, prev_state_val):
-    global uptime, _miner_ping_full_failure_streak, _miner_stop_reply_streak, _last_force_shutdown_at
-    global _restart_triggered_this_cycle
-    # OR semantics by design:
-    # - production: if ANY configured miner IP replies, miner is considered online
-    # - stop: if ANY configured miner IP replies, force shutdown is triggered
-    miner_ips_raw = MINER_IPS or ["192.168.0.200"]
-    miner_ips = []
-    for candidate in miner_ips_raw:
-        try:
-            miner_ips.append(str(ipaddress.ip_address(str(candidate).strip())))
-        except Exception:
-            print(f"[Warning] Invalid miner IP skipped: {candidate!r}")
-    if not miner_ips:
-        print("[Warning] No valid miner IP configured, skipping uptime check.")
+def supervise_runtime_by_hashrate(now: datetime, expected_state: str) -> None:
+    global _miner_stop_reply_streak, _last_force_shutdown_at
+    wallet = _effective_wallet_address()
+    hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
+    is_running = isinstance(hashrate_hs, (int, float)) and hashrate_hs > 0
+    hashrate_text = f"{(hashrate_hs / 1e6):.2f} MH/s" if isinstance(hashrate_hs, (int, float)) else "N/A"
+
+    if str(expected_state).lower() != "stop":
+        _miner_stop_reply_streak = 0
         return
-    if uptime is None:
-        uptime = now
-    difference = now - uptime
-    hours, remainder = divmod(difference.seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
 
-    print(
-        f"Pinging miner IPs: {', '.join(miner_ips)} "
-        f"(retries per IP: {MINER_PING_RETRIES_PER_IP}) to check uptime..."
+    if not is_running:
+        _miner_stop_reply_streak = 0
+        print(f"[Runtime guard] STOP state confirmed by hashrate={hashrate_text}.")
+        return
+
+    _miner_stop_reply_streak += 1
+    cooldown_ok = (
+        _last_force_shutdown_at is None
+        or (now - _last_force_shutdown_at) >= timedelta(minutes=MINER_STOP_FORCE_COOLDOWN_MINUTES)
     )
-    try:
-        reachable_ips = []
-        for miner_ip in miner_ips:
-            ip_reachable = False
-            for _ in range(MINER_PING_RETRIES_PER_IP):
-                # Avoid stuck ping subprocesses in edge network states.
-                # NOTE: keep command list-form for safe argument handling.
-                result = subprocess.run(
-                    ["ping", "-c", "1", "-W", "2", miner_ip],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=4,
-                    check=False,
-                )
-                if result.returncode == 0:
-                    ip_reachable = True
-                    break
-            if ip_reachable:
-                reachable_ips.append(miner_ip)
+    if _miner_stop_reply_streak < MINER_STOP_FORCE_CONSECUTIVE:
+        print(
+            f"[Runtime guard] STOP expected but hashrate still >0 ({hashrate_text}). "
+            f"streak={_miner_stop_reply_streak}/{MINER_STOP_FORCE_CONSECUTIVE}. Waiting."
+        )
+        return
+    if not cooldown_ok:
+        wait_left = max(
+            0.0,
+            MINER_STOP_FORCE_COOLDOWN_MINUTES - (now - _last_force_shutdown_at).total_seconds() / 60.0
+        )
+        print(f"[Runtime guard] Force shutdown cooldown active ({wait_left:.1f} min remaining).")
+        return
 
-        if not reachable_ips:
-            _miner_stop_reply_streak = 0
-            print("No reply!")
-            if prev_state_val == "production":
-                _miner_ping_full_failure_streak += 1
-                print(
-                    f"No reply from any configured IP ({', '.join(miner_ips)}). "
-                    f"Failure streak: {_miner_ping_full_failure_streak}/{MINER_PING_FAIL_STREAK_FOR_RESTART}."
-                )
-                if _miner_ping_full_failure_streak >= MINER_PING_FAIL_STREAK_FOR_RESTART:
-                    if _restart_triggered_this_cycle:
-                        print("[Ping guard] Restart already triggered in this cycle. Skipping duplicate restart.")
-                        _miner_ping_full_failure_streak = 0
-                        return
-                    print("Failure streak threshold reached. Attempting restart sequence...")
-                    wallet = _effective_wallet_address()
-                    hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
-                    hashrate_text = (
-                        f"{(hashrate_hs / 1e6):.2f} MH/s"
-                        if isinstance(hashrate_hs, (int, float))
-                        else "N/A"
-                    )
-                    send_telegram_message(
-                        f"⚠️ Miner ping failed in production mode ({', '.join(miner_ips)}) "
-                        f"for {_miner_ping_full_failure_streak} consecutive checks. "
-                        f"Current hashrate: {hashrate_text}. Restart sequence started."
-                    )
-                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-                    time.sleep(15)
-                    press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
-                    print("Restart sequence completed.")
-                    send_telegram_message(
-                        f"✅ Miner restart sequence completed (after consecutive ping failures). "
-                        f"Latest hashrate: {hashrate_text}."
-                    )
-                    uptime = now
-                    save_prev_state(prev_state_val, uptime)
-                    _miner_ping_full_failure_streak = 0
-                    _restart_triggered_this_cycle = True
-        else:
-            _miner_ping_full_failure_streak = 0
-            reachable_text = ", ".join(reachable_ips)
-            print(f"Reply from: {reachable_text}!")
-            if prev_state_val == "stop":
-                _miner_stop_reply_streak += 1
-                cooldown_ok = (
-                    _last_force_shutdown_at is None
-                    or (now - _last_force_shutdown_at) >= timedelta(minutes=MINER_STOP_FORCE_COOLDOWN_MINUTES)
-                )
-                if _miner_stop_reply_streak < MINER_STOP_FORCE_CONSECUTIVE:
-                    print(
-                        f"STOP response streak {_miner_stop_reply_streak}/{MINER_STOP_FORCE_CONSECUTIVE}. "
-                        "Waiting for confirmation before force shutdown."
-                    )
-                elif not cooldown_ok:
-                    wait_left = max(
-                        0.0,
-                        MINER_STOP_FORCE_COOLDOWN_MINUTES - (now - _last_force_shutdown_at).total_seconds() / 60.0
-                    )
-                    print(f"Force shutdown cooldown active ({wait_left:.1f} min remaining).")
-                else:
-                    print(f"Reply from {reachable_text}. Attempting force shutdown sequence...")
-                    send_telegram_message(
-                        f"⚠️ Miner is responding ({reachable_text}) while state is STOP. Force shutdown started."
-                    )
-                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-                    time.sleep(5)
-                    print("Force shutdown completed.")
-                    send_telegram_message("✅ STOP safety force shutdown completed.")
-                    _last_force_shutdown_at = now
-                    _miner_stop_reply_streak = 0
-                    uptime = now
-                    save_prev_state(prev_state_val, uptime)
-
-        total_hours = difference.days * 24 + hours
-        status_target = ", ".join(reachable_ips) if reachable_ips else f"any configured IP ({', '.join(miner_ips)})"
-        if prev_state_val == "production":
-            print(f"{status_target} is online for {total_hours} hours and {minutes} minutes")
-        elif prev_state_val == "stop":
-            if reachable_ips:
-                print(f"{status_target} is unexpectedly online while STOP was expected ({total_hours}h {minutes}m since last state change).")
-            else:
-                print(f"{status_target} is offline as expected for {total_hours} hours and {minutes} minutes")
-    except Exception as e:
-        print(f"Error during uptime check: {e}")
+    print("[Runtime guard] STOP expected but hashrate >0. Force shutdown sequence started.")
+    send_telegram_message(
+        f"⚠️ STOP expected but hashrate still {hashrate_text}. Force shutdown started."
+    )
+    if is_rpi and GPIO_AVAILABLE:
+        press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
+        time.sleep(5)
+    send_telegram_message("✅ STOP safety force shutdown completed.")
+    _last_force_shutdown_at = now
+    _miner_stop_reply_streak = 0
+    save_prev_state(prev_state, now)
 
 
 def check_hashrate_guard(now: datetime, effective_state: str) -> None:
@@ -2351,14 +2240,19 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
     hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
     if hashrate_hs is None:
         _hashrate_low_streak += 1
-        print(f"[Hashrate guard] Unable to fetch hashrate for wallet {wallet}. streak={_hashrate_low_streak}")
-        return
-
-    if hashrate_hs >= HASHRATE_MIN_HS:
+        print(f"[Hashrate guard] Unable to fetch hashrate for wallet {wallet}. streak={_hashrate_low_streak}/{HASHRATE_LOW_STREAK_LIMIT}")
+    elif hashrate_hs > HASHRATE_MIN_HS:
         _hashrate_low_streak = 0
         return
+    else:
+        _hashrate_low_streak += 1
 
-    _hashrate_low_streak += 1
+    if _hashrate_low_streak < HASHRATE_LOW_STREAK_LIMIT:
+        print(
+            f"[Hashrate guard] Hashrate not above 0 H/s yet for wallet {wallet}. "
+            f"streak={_hashrate_low_streak}/{HASHRATE_LOW_STREAK_LIMIT}. Waiting before restart."
+        )
+        return
     cooldown_ok = (
         _last_hashrate_restart_at is None
         or (now - _last_hashrate_restart_at) >= timedelta(minutes=HASHRATE_RESTART_COOLDOWN_MINUTES)
@@ -2367,10 +2261,11 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
         print("[Hashrate guard] Low hashrate detected but restart cooldown is still active.")
         return
 
+    measured_mhs = (hashrate_hs / 1e6) if isinstance(hashrate_hs, (int, float)) else 0.0
     msg = (
-        f"⚠️ Hashrate is too low after startup window ({HASHRATE_CHECK_DELAY_MINUTES} min). "
-        f"Wallet={wallet}, measured={(hashrate_hs / 1e6):.2f} MH/s "
-        f"(threshold {(HASHRATE_MIN_HS / 1e6):.2f} MH/s). Restarting miner."
+        f"⚠️ Hashrate is 0 after startup window ({HASHRATE_CHECK_DELAY_MINUTES} min) "
+        f"for {HASHRATE_LOW_STREAK_LIMIT} consecutive checks. "
+        f"Wallet={wallet}, measured={measured_mhs:.2f} MH/s. Restarting miner."
     )
     print(msg)
     send_telegram_message(msg)
@@ -2382,7 +2277,7 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
         _hashrate_low_streak = 0
         _restart_triggered_this_cycle = True
         save_prev_state(prev_state, now)
-        send_telegram_message(f"✅ Hashrate guard restart sequence completed. Latest hashrate: {(hashrate_hs / 1e6):.2f} MH/s.")
+        send_telegram_message(f"✅ Hashrate guard restart sequence completed. Latest hashrate: {measured_mhs:.2f} MH/s.")
 
 def check_crypto_production_conditions(data, weather_api_key, location_lat, location_lon):
     global prev_state, state, used_quote, sunrise, sunset, uptime, _last_production_start_at
@@ -2698,10 +2593,6 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
 
         decision_summary = "No state change"
         decision_state = state or "unknown"
-
-        # Optional ping supervision
-        if is_rpi and _should_run_miner_ping_check(now, min_interval_minutes=3):
-            check_uptime(now, prev_state)
 
         # HARD RULE: after configured afternoon hour, SOC under threshold must stop immediately.
         # This is intentionally unconditional and bypasses forecast/curtailment relaxations.
@@ -3083,11 +2974,9 @@ def _write_full_telemetry_history(history: deque) -> None:
 
 def _miner_action(action: str) -> Dict[str, Any]:
     now = datetime.now(tz=budapest_tz).isoformat()
-    duration = 0.55
-    if action == "force_stop":
-        duration = 10
     if action not in {"start", "stop", "force_stop"}:
         return {"ok": False, "message": "invalid action", "ts": now}
+    duration = POWER_BUTTON_SHORT_PRESS_SECONDS if action == "start" else POWER_BUTTON_LONG_PRESS_SECONDS
 
     if not is_rpi:
         msg = "GPIO unavailable (not Raspberry Pi runtime)"
@@ -3713,6 +3602,7 @@ def main_loop():
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
                 check_hashrate_guard(now, state or "unknown")
+                supervise_runtime_by_hashrate(now, state or "unknown")
                 wallet = _effective_wallet_address()
                 current_hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
                 current_hashrate_mhs = (current_hashrate_hs / 1e6) if isinstance(current_hashrate_hs, (int, float)) else None
@@ -3785,10 +3675,7 @@ def main_loop():
                     uptime = now
                     save_prev_state(prev_state, uptime)
 
-            # Safety ping supervision must also run during sleep/idle window.
-            # If any configured IP replies while stop is expected, force shutdown is executed.
-            if is_rpi and _should_run_miner_ping_check(now, min_interval_minutes=3):
-                check_uptime(now, prev_state)
+            supervise_runtime_by_hashrate(now, state)
 
             if is_rpi:
                 write_to_display(
