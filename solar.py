@@ -1687,6 +1687,7 @@ def _make_miner_decision(
     phase_safe = _is_phase_power_safe(inv_l1, inv_l2, inv_l3, inv_lt)
     force_cooldown_active = isinstance(_last_force_shutdown_at, datetime) and (now - _last_force_shutdown_at).total_seconds() < MINER_STOP_FORCE_COOLDOWN_MINUTES * 60
     hard_stop = False
+    afternoon_reserve_stop = False
     soft_stop = False
     start_hits: List[str] = []
     stop_hits: List[str] = []
@@ -1697,6 +1698,18 @@ def _make_miner_decision(
     if not phase_safe:
         hard_stop = True
         stop_hits.append("Phase/total inverter safety threshold exceeded")
+
+    # Night-house reserve: after the configured afternoon cutoff, mining must not
+    # spend the battery below the protected reserve target. This is intentionally
+    # immediate (no debounce), because that SOC is reserved for overnight house load.
+    afternoon_reserve_stop = (
+        now.hour >= HARD_AFTERNOON_STOP_HOUR
+        and battery_charge < HARD_AFTERNOON_STOP_SOC
+    )
+    if afternoon_reserve_stop:
+        hard_stop = True
+        stop_hits.append(f"Afternoon night reserve: SOC below {HARD_AFTERNOON_STOP_SOC:.0f}% after {HARD_AFTERNOON_STOP_HOUR}:00")
+
     if not control.get("active", False):
         stop_hits.append("Outside active control window")
 
@@ -1740,9 +1753,9 @@ def _make_miner_decision(
         if hist.get("should_preserve_battery", False) and current_power < MINER_POWER_W * 0.75 and battery_charge < _safe_float(hist.get("late_day_reserve_soc"), 80.0):
             soft_stop = True
             stop_hits.append("Late-day reserve protection")
-        if now.hour >= HARD_AFTERNOON_STOP_HOUR and battery_charge >= HARD_AFTERNOON_STOP_SOC and current_power <= HIGH_SOC_STOP_MAX_PV_W:
+        if now.hour >= HARD_AFTERNOON_STOP_HOUR and battery_charge >= HIGH_SOC_STOP_SOC and current_power <= HIGH_SOC_STOP_MAX_PV_W:
             soft_stop = True
-            stop_hits.append("High-SOC afternoon curtailment stop")
+            stop_hits.append("High-SOC low-PV afternoon curtailment stop")
 
     start_score = 0.0
     if battery_charge > min_stop_soc:
@@ -1776,7 +1789,9 @@ def _make_miner_decision(
         desired = "stop"
 
     summary = "HOLD: no decision"
-    if hard_stop:
+    if hard_stop and afternoon_reserve_stop:
+        summary = "STOP: afternoon night reserve protection"
+    elif hard_stop:
         summary = "STOP: hard safety rule"
     elif desired == "production" and dawn_zero_pv_start:
         summary = "START: dawn zero-PV bridge energy and refill model allow mining"
@@ -1799,6 +1814,8 @@ def _make_miner_decision(
         "control_window_reason": str(control.get("reason", "unknown")),
         "min_stop_soc": round(min_stop_soc, 2),
         "dawn_soc_buffer": round(buffer_soc, 2),
+        "afternoon_reserve_soc": round(HARD_AFTERNOON_STOP_SOC, 2),
+        "afternoon_reserve_hour": int(HARD_AFTERNOON_STOP_HOUR),
         "refill_model": refill,
     }
     return {
@@ -1812,6 +1829,7 @@ def _make_miner_decision(
         "stop_rule_hits": stop_hits,
         "hard_stop": bool(hard_stop),
         "soft_stop": bool(soft_stop),
+        "afternoon_reserve_stop": bool(afternoon_reserve_stop),
         "zero_pv_bridge_start": bool(dawn_zero_pv_start),
         "dawn_start_allowed": bool(dawn_zero_pv_start or (dawn_bridge_window and bridge_ok and refill_ok and not hard_stop)),
         "metrics": metrics,
