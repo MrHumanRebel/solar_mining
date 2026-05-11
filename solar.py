@@ -70,6 +70,18 @@ HASHRATE_RESTART_COOLDOWN_MINUTES = max(5, int(os.getenv("MY_HASHRATE_RESTART_CO
 POWER_BUTTON_SHORT_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_SHORT_PRESS_SECONDS", "0.55"))
 POWER_BUTTON_LONG_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_LONG_PRESS_SECONDS", "10"))
 
+PRE_SUNRISE_CONTROL_MINUTES = int(os.getenv("MY_PRE_SUNRISE_CONTROL_MINUTES", "120"))
+DAWN_ZERO_PV_MAX_W = float(os.getenv("MY_DAWN_ZERO_PV_MAX_W", "80"))
+BRIDGE_START_SAFETY_FACTOR = float(os.getenv("MY_BRIDGE_START_SAFETY_FACTOR", "1.25"))
+STARTUP_ENERGY_PENALTY_WH = float(os.getenv("MY_STARTUP_ENERGY_PENALTY_WH", "120"))
+MIN_DAWN_BRIDGE_SOC_BUFFER = float(os.getenv("MY_MIN_DAWN_BRIDGE_SOC_BUFFER", "6"))
+WEAK_WEATHER_BRIDGE_SOC_BUFFER = float(os.getenv("MY_WEAK_WEATHER_BRIDGE_SOC_BUFFER", "12"))
+ZERO_PV_REFILL_DEADLINE_HOUR = int(os.getenv("MY_ZERO_PV_REFILL_DEADLINE_HOUR", "13"))
+MIN_DECISION_CONFIDENCE_START = float(os.getenv("MY_MIN_DECISION_CONFIDENCE_START", "0.62"))
+MIN_DECISION_CONFIDENCE_STOP = float(os.getenv("MY_MIN_DECISION_CONFIDENCE_STOP", "0.68"))
+DAWN_RAIN_FORECAST_BLOCK_BAD_RATIO = float(os.getenv("MY_DAWN_RAIN_FORECAST_BLOCK_BAD_RATIO", "0.45"))
+DAWN_OVERCAST_BLOCK_CLOUDS = float(os.getenv("MY_DAWN_OVERCAST_BLOCK_CLOUDS", "98"))
+
 print(platform.machine())
 print(platform.system())
 
@@ -162,7 +174,48 @@ def _idle_historical_hints() -> Dict[str, Any]:
         "weather_risk_5d": "unknown",
         "weather_sunny_ratio_5d": 0.0,
         "weather_bad_ratio_5d": 0.0,
+        "dawn_start_allowed": False,
+        "zero_pv_bridge_start": False,
+        "decision_confidence": 0.0,
+        "start_score": 0.0,
+        "stop_score": 0.0,
+        "available_bridge_wh": 0.0,
+        "required_bridge_wh": 0.0,
+        "bridge_safety_factor": BRIDGE_START_SAFETY_FACTOR,
+        "startup_energy_penalty_wh": STARTUP_ENERGY_PENALTY_WH,
+        "predicted_first_miner_cover_time": None,
+        "predicted_full_charge_time": None,
+        "predicted_refill_confidence": 0.0,
+        "active_control_window": False,
+        "control_window_reason": "idle",
     }
+
+
+def _is_adverse_dawn_weather(condition: str) -> bool:
+    c = str(condition or "").lower()
+    return any(k in c for k in [
+        "rain", "drizzle", "storm", "thunder", "shower",
+        "snow", "sleet", "blizzard", "freezing", "hail",
+    ])
+
+
+def _dawn_weather_block_reason(current_condition, f1_cond, f1_clouds, f3_cond, f3_clouds, weather_outlook) -> str:
+    """Return non-empty reason when dawn battery bridge start should be blocked by near-term weather."""
+    bad_hits = []
+    for label, cond in (("now", current_condition), ("1h", f1_cond), ("3h", f3_cond)):
+        if _is_adverse_dawn_weather(cond):
+            bad_hits.append(f"{label}:{cond}")
+    if bad_hits:
+        return "rain/storm forecast in dawn window (" + "; ".join(str(x) for x in bad_hits) + ")"
+
+    wx = weather_outlook or {}
+    bad_ratio = _safe_float(wx.get("bad_ratio_5d"), 0.0)
+    summary = str(wx.get("summary_5d", "unknown")).lower()
+    f1c = _safe_float(f1_clouds, 0.0)
+    f3c = _safe_float(f3_clouds, 0.0)
+    if summary == "solar_weak" and bad_ratio >= DAWN_RAIN_FORECAST_BLOCK_BAD_RATIO and min(f1c, f3c) >= DAWN_OVERCAST_BLOCK_CLOUDS:
+        return f"very weak overcast dawn forecast (bad_ratio={bad_ratio:.2f}, clouds={f1c:.0f}/{f3c:.0f}%)"
+    return ""
 
 
 def _classify_weather_condition(condition: str) -> str:
@@ -648,21 +701,31 @@ def _history_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _percentile(values: List[float], pct: float, default: float = 0.0) -> float:
+    vals = sorted(float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v)))
+    if not vals:
+        return default
+    if len(vals) == 1:
+        return vals[0]
+    pos = (len(vals) - 1) * max(0.0, min(1.0, pct))
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return vals[lo]
+    frac = pos - lo
+    return vals[lo] * (1.0 - frac) + vals[hi] * frac
+
+
 def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, Any]:
     """
-    Build month-level and hour-level production profile from downloaded Solarman JSON exports.
-    Robust behaviors:
-    - tolerates malformed files/rows,
-    - deduplicates overlaps on exact timestamp (same minute),
-    - avoids overweighting duplicate download windows,
-    - clamps obviously broken values.
+    Build month/hour Solarman PV profile.
+    Keeps timestamp dedupe, exposes mean/p50/p75/p90 counts plus monthly refill metrics.
     """
     files = sorted(glob.glob(os.path.join(history_dir, "*.json")))
     if not files:
         print(f"[History] No history files found in {history_dir}. Using static defaults.")
         return {}
 
-    # timestamp -> list of observed values coming from possibly overlapping files
     sample_by_ts: Dict[datetime, Dict[str, List[float]]] = defaultdict(lambda: {"prod": [], "soc": []})
     invalid_rows = 0
     parsed_rows = 0
@@ -674,24 +737,19 @@ def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, An
         except Exception as err:
             print(f"[History] Failed loading {fp}: {err}")
             continue
-
         if not isinstance(payload, list):
             print(f"[History] Ignoring non-list JSON payload in {fp}")
             continue
-
         for row in payload:
             if not isinstance(row, dict):
                 invalid_rows += 1
                 continue
-
             ts = _parse_history_ts(str(row.get("Updated Time", "")).strip())
             if ts is None:
                 invalid_rows += 1
                 continue
-
             prod = max(0.0, min(_history_float(row.get("Production Power(W)"), 0.0), 25000.0))
             soc = max(0.0, min(_history_float(row.get("SoC(%)"), 0.0), 100.0))
-
             sample_by_ts[ts]["prod"].append(prod)
             sample_by_ts[ts]["soc"].append(soc)
             parsed_rows += 1
@@ -700,7 +758,6 @@ def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, An
         print("[History] All rows were invalid or empty. Using static defaults.")
         return {}
 
-    # Canonicalize each timestamp to a single robust sample to prevent overlap bias.
     canonical: List[Dict[str, Any]] = []
     duplicate_timestamps = 0
     for ts in sorted(sample_by_ts.keys()):
@@ -708,30 +765,24 @@ def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, An
         soc_values = sample_by_ts[ts]["soc"]
         if len(prod_values) > 1:
             duplicate_timestamps += 1
-
-        # median is robust to occasional outliers in duplicate windows
-        prod = statistics.median(prod_values) if prod_values else 0.0
-        soc = statistics.median(soc_values) if soc_values else 0.0
-
-        canonical.append({"ts": ts, "prod": prod, "soc": soc})
+        canonical.append({
+            "ts": ts,
+            "prod": statistics.median(prod_values) if prod_values else 0.0,
+            "soc": statistics.median(soc_values) if soc_values else 0.0,
+        })
 
     month_hour_prod: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
     month_hour_soc: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
-    month_daily_peaks: Dict[int, Dict[str, float]] = defaultdict(dict)
+    month_day_rows: Dict[int, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
 
     for item in canonical:
         ts = item["ts"]
         month = ts.month
         hour = ts.hour
         day_key = ts.strftime("%Y-%m-%d")
-        prod = item["prod"]
-        soc = item["soc"]
-
-        month_hour_prod[month][hour].append(prod)
-        month_hour_soc[month][hour].append(soc)
-
-        if day_key not in month_daily_peaks[month] or prod > month_daily_peaks[month][day_key]:
-            month_daily_peaks[month][day_key] = prod
+        month_hour_prod[month][hour].append(float(item["prod"]))
+        month_hour_soc[month][hour].append(float(item["soc"]))
+        month_day_rows[month][day_key].append(item)
 
     profile: Dict[str, Any] = {
         "months": {},
@@ -747,42 +798,98 @@ def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, An
         if not hourly_prod:
             continue
 
-        daily_peaks = list(month_daily_peaks.get(month, {}).values())
-        monthly_peak_p75 = (
-            statistics.quantiles(daily_peaks, n=4)[2]
-            if len(daily_peaks) >= 4
-            else (max(daily_peaks) if daily_peaks else 0.0)
-        )
+        hourly_stats: Dict[str, Any] = {}
+        for h, vals in hourly_prod.items():
+            clean = [float(v) for v in vals if math.isfinite(float(v))]
+            if not clean:
+                continue
+            hourly_stats[str(h)] = {
+                "mean": float(statistics.mean(clean)),
+                "p50": float(_percentile(clean, 0.50)),
+                "median": float(_percentile(clean, 0.50)),
+                "p75": float(_percentile(clean, 0.75)),
+                "p90": float(_percentile(clean, 0.90)),
+                "count": len(clean),
+            }
 
-        daylight_hours = [h for h, vals in hourly_prod.items() if vals and statistics.mean(vals) >= 350]
-        solar_start_hour = min(daylight_hours) if daylight_hours else 8
+        hourly_mean = {h: st["mean"] for h, st in hourly_stats.items()}
+        hourly_p50 = {h: st["p50"] for h, st in hourly_stats.items()}
+        hourly_p75 = {h: st["p75"] for h, st in hourly_stats.items()}
+        hourly_p90 = {h: st["p90"] for h, st in hourly_stats.items()}
+
+        daily_peaks: List[float] = []
+        daily_energy_wh: List[float] = []
+        charge_rates: List[float] = []
+        first_100: List[float] = []
+        first_500: List[float] = []
+        first_cover: List[float] = []
+        refill_days = 0
+        total_days = 0
+
+        for _day, rows in month_day_rows.get(month, {}).items():
+            if not rows:
+                continue
+            rows = sorted(rows, key=lambda x: x["ts"])
+            total_days += 1
+            prods = [float(r["prod"]) for r in rows]
+            socs = [float(r["soc"]) for r in rows]
+            daily_peaks.append(max(prods) if prods else 0.0)
+            energy = 0.0
+            for i, r in enumerate(rows):
+                if i + 1 < len(rows):
+                    dt_h = max(0.0, min(1.0, (rows[i + 1]["ts"] - r["ts"]).total_seconds() / 3600.0))
+                else:
+                    dt_h = 5.0 / 60.0
+                energy += max(0.0, float(r["prod"])) * dt_h
+            daily_energy_wh.append(energy)
+            if max(socs or [0.0]) >= 99.0:
+                refill_days += 1
+            for threshold, target in ((100.0, first_100), (500.0, first_500), (MINER_POWER_W, first_cover)):
+                hit = next((r["ts"].hour + r["ts"].minute / 60.0 for r in rows if float(r["prod"]) >= threshold), None)
+                if hit is not None:
+                    target.append(float(hit))
+            for i in range(1, len(rows)):
+                dt_h = (rows[i]["ts"] - rows[i - 1]["ts"]).total_seconds() / 3600.0
+                if dt_h <= 0 or dt_h > 0.6:
+                    continue
+                if max(float(rows[i]["prod"]), float(rows[i - 1]["prod"])) < 500:
+                    continue
+                rate = (float(rows[i]["soc"]) - float(rows[i - 1]["soc"])) / dt_h
+                if 0.05 <= rate <= 18.0:
+                    charge_rates.append(rate)
+
+        daylight_hours = [h for h, vals in hourly_prod.items() if vals and _percentile(vals, 0.50) >= 100]
+        solar_start_hour = min(daylight_hours) if daylight_hours else int(_percentile(first_100, 0.50, 8))
         solar_end_hour = max(daylight_hours) if daylight_hours else 15
-
-        midday_hours = [h for h in range(10, 15) if h in hourly_prod and hourly_prod[h]]
-        if midday_hours:
-            midday_avg = statistics.mean([statistics.mean(hourly_prod[h]) for h in midday_hours])
-        else:
-            midday_avg = statistics.mean([statistics.mean(v) for v in hourly_prod.values() if v])
-
-        evening_hours = [h for h in range(16, 24) if h in month_hour_soc.get(month, {})]
+        midday_hours = [h for h in range(10, 15) if str(h) in hourly_stats]
+        midday_avg = statistics.mean([hourly_stats[str(h)]["p50"] for h in midday_hours]) if midday_hours else statistics.mean(hourly_mean.values())
         evening_soc_values: List[float] = []
-        for h in evening_hours:
-            evening_soc_values.extend(month_hour_soc[month][h])
-
-        evening_soc_p40 = (
-            statistics.quantiles(evening_soc_values, n=5)[1]
-            if len(evening_soc_values) >= 5
-            else (statistics.mean(evening_soc_values) if evening_soc_values else 45.0)
-        )
+        for h in range(16, 24):
+            evening_soc_values.extend(month_hour_soc.get(month, {}).get(h, []))
+        evening_soc_p40 = _percentile(evening_soc_values, 0.40, 45.0)
+        refill_confidence = refill_days / total_days if total_days else 0.0
+        if _percentile(daily_peaks, 0.75, 0.0) >= MINER_POWER_W * 2.0 and _percentile(daily_energy_wh, 0.50, 0.0) >= MINER_POWER_W * 3.5:
+            refill_confidence = max(refill_confidence, 0.65)
 
         profile["months"][month] = {
             "solar_start_hour": int(solar_start_hour),
             "solar_end_hour": int(solar_end_hour),
             "daylight_span": int(max(0, solar_end_hour - solar_start_hour + 1)),
             "midday_avg": float(midday_avg),
-            "daily_peak_p75": float(monthly_peak_p75),
+            "daily_peak_p75": float(_percentile(daily_peaks, 0.75)),
+            "daily_energy_wh_p50": float(_percentile(daily_energy_wh, 0.50)),
+            "daily_energy_wh_p75": float(_percentile(daily_energy_wh, 0.75)),
+            "charge_rate_pct_per_hour_p50": float(_percentile(charge_rates, 0.50)),
+            "refill_confidence": float(max(0.0, min(1.0, refill_confidence))),
+            "first_100w_hour": float(_percentile(first_100, 0.50, solar_start_hour)),
+            "first_500w_hour": float(_percentile(first_500, 0.50, solar_start_hour + 1)),
+            "first_miner_cover_hour": float(_percentile(first_cover, 0.50, solar_start_hour + 2)),
             "evening_soc_p40": float(evening_soc_p40),
-            "hourly_prod_mean": {str(h): float(statistics.mean(vals)) for h, vals in hourly_prod.items() if vals},
+            "hourly_prod": hourly_stats,
+            "hourly_prod_mean": hourly_mean,
+            "hourly_prod_p50": hourly_p50,
+            "hourly_prod_p75": hourly_p75,
+            "hourly_prod_p90": hourly_p90,
         }
 
     print(
@@ -791,7 +898,6 @@ def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, An
         f"dup_ts={profile['duplicate_timestamps']} months={sorted(profile['months'].keys())}"
     )
     return profile
-
 
 def _interpolate_month_config(target_month: int, months_cfg: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
     """Interpolate missing month values from nearest available months (circular calendar distance)."""
@@ -852,6 +958,15 @@ def _interpolate_hourly_profile_for_month(target_month: int, months_cfg: Dict[in
             weights[h] += w
 
     return {str(h): (blended[h] / weights[h]) for h in sorted(weights.keys()) if weights[h] > 0}
+
+
+def _hourly_profile_from_hist(hist: Dict[str, Any], quantile: str = "p50") -> Dict[str, float]:
+    quantile = str(quantile or "p50").lower()
+    key = "hourly_prod_mean" if quantile in {"mean", "avg"} else f"hourly_prod_{quantile}"
+    profile = hist.get(key, {}) if isinstance(hist, dict) else {}
+    if not isinstance(profile, dict) or not profile:
+        profile = hist.get("hourly_prod_mean", {}) if isinstance(hist, dict) else {}
+    return {str(int(k)): max(0.0, _safe_float(v, 0.0)) for k, v in (profile or {}).items()}
 
 
 def _pv_estimate_at(dt: datetime, hourly_profile: Dict[str, Any]) -> float:
@@ -1172,6 +1287,14 @@ def _history_recommendation(now: datetime, battery_charge: float, current_power:
         "should_preserve_battery": should_preserve_battery,
         "headroom_good": headroom_good,
         "hourly_prod_mean": month_cfg.get("hourly_prod_mean", {}) or interpolated_hourly,
+        "hourly_prod_p50": month_cfg.get("hourly_prod_p50", {}) or interpolated_hourly,
+        "hourly_prod_p75": month_cfg.get("hourly_prod_p75", {}) or interpolated_hourly,
+        "hourly_prod_p90": month_cfg.get("hourly_prod_p90", {}) or interpolated_hourly,
+        "first_miner_cover_hour": float(month_cfg.get("first_miner_cover_hour", 0.0)),
+        "daily_energy_wh_p50": float(month_cfg.get("daily_energy_wh_p50", 0.0)),
+        "daily_energy_wh_p75": float(month_cfg.get("daily_energy_wh_p75", 0.0)),
+        "charge_rate_pct_per_hour_p50": float(month_cfg.get("charge_rate_pct_per_hour_p50", 0.0)),
+        "refill_confidence": float(month_cfg.get("refill_confidence", 0.0)),
         "predicted_minutes_to_full": full_charge_pred.get("minutes_to_full"),
         "predicted_full_charge_time": full_charge_pred.get("full_charge_time"),
         "can_refill_before_sunset": bool(full_charge_pred.get("can_refill_before_sunset", False)),
@@ -1290,7 +1413,7 @@ def _with_daytime_data_fallback(data: Dict[str, Any], now: datetime,
     if _has_solarman_payload(data):
         return data, False
 
-    if not _is_active_window(now, sunrise_dt, sunset_dt):
+    if not _is_control_window(now, sunrise_dt, sunset_dt):
         return data, False
 
     previous = load_data()
@@ -1439,6 +1562,315 @@ def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_po
         "min_stop_soc": round(min_stop_soc, 2),
         "bms_floor_soc": round(bms_floor_soc, 2),
         "bms_window_wh": round(bms_window_wh, 2),
+    }
+
+
+def _available_bridge_wh(battery_soc, min_stop_soc, battery_voltage, battery_ah) -> float:
+    capacity_wh = _effective_battery_capacity_wh(_safe_float(battery_voltage, BATTERY_NOMINAL_V), _safe_float(battery_ah, BATTERY_CAPACITY_AH))
+    usable_pct = max(0.0, _safe_float(battery_soc, 0.0) - _safe_float(min_stop_soc, BATTERY_FLOOR_SOC))
+    return max(0.0, capacity_wh * usable_pct / 100.0)
+
+
+def _required_bridge_wh_until_cover(now, cover_dt, hourly_profile, miner_power_w) -> float:
+    if not isinstance(now, datetime) or not isinstance(cover_dt, datetime) or cover_dt <= now:
+        return 0.0
+    profile = hourly_profile if isinstance(hourly_profile, dict) else {}
+    t = now.replace(second=0, microsecond=0)
+    end = cover_dt.replace(second=0, microsecond=0)
+    step_min = 5
+    total_wh = 0.0
+    while t < end:
+        nxt = min(t + timedelta(minutes=step_min), end)
+        pv = _pv_estimate_at(t, profile)
+        total_wh += max(0.0, float(miner_power_w) - pv) * ((nxt - t).total_seconds() / 3600.0)
+        t = nxt
+    return max(0.0, total_wh)
+
+
+def _predict_first_miner_cover_time(now, sunrise_dt, hourly_profile, miner_power_w, quantile="p50") -> Optional[datetime]:
+    if not isinstance(now, datetime):
+        return None
+    profile = hourly_profile if isinstance(hourly_profile, dict) else {}
+    if not profile:
+        return None
+    start = max(now, sunrise_dt if isinstance(sunrise_dt, datetime) else now).replace(second=0, microsecond=0)
+    end = start.replace(hour=23, minute=59, second=0, microsecond=0)
+    t = start
+    while t <= end:
+        if _pv_estimate_at(t, profile) >= float(miner_power_w):
+            return t
+        t += timedelta(minutes=5)
+    return None
+
+
+def _predict_full_recharge_feasibility(now, battery_soc, sunset_dt, hourly_profile, telemetry_context, weather_outlook) -> Dict[str, Any]:
+    missing_pct = max(0.0, 100.0 - _safe_float(battery_soc, 0.0))
+    if missing_pct <= 0.5:
+        return {
+            "can_refill_before_sunset": True,
+            "predicted_full_charge_time": now.isoformat() if isinstance(now, datetime) else None,
+            "confidence": 1.0,
+            "required_charge_rate": 0.0,
+            "predicted_charge_rate": 0.0,
+        }
+    remaining_h = max(0.0, ((sunset_dt - now).total_seconds() / 3600.0) if isinstance(sunset_dt, datetime) and isinstance(now, datetime) else 0.0)
+    required_rate = missing_pct / remaining_h if remaining_h > 0 else 999.0
+    telem_rate = _safe_float((telemetry_context or {}).get("fresh_charge_rate_pct_per_hour"), 0.0)
+    hist_rate = _safe_float((telemetry_context or {}).get("charge_rate_pct_per_hour_p50"), 0.0)
+    predicted_rate = max(telem_rate, hist_rate)
+    if predicted_rate <= 0:
+        # PV-energy fallback: 1 SOC pct = capacity/100 Wh, use conservative 55% charge usefulness.
+        capacity_wh = _effective_battery_capacity_wh(BATTERY_NOMINAL_V, BATTERY_CAPACITY_AH)
+        future_wh = 0.0
+        t = now.replace(second=0, microsecond=0)
+        while isinstance(sunset_dt, datetime) and t < sunset_dt:
+            future_wh += _pv_estimate_at(t, hourly_profile or {}) * (5.0 / 60.0) * 0.55
+            t += timedelta(minutes=5)
+        predicted_rate = (future_wh / max(1.0, capacity_wh) * 100.0) / max(0.25, remaining_h)
+    wx = str((weather_outlook or {}).get("summary_5d", "unknown")).lower()
+    confidence = 0.52
+    if predicted_rate >= required_rate:
+        confidence += min(0.35, (predicted_rate - required_rate) / max(1.0, required_rate) * 0.25)
+    if wx == "solar_friendly":
+        confidence += 0.08
+    elif wx == "solar_weak":
+        confidence -= 0.08
+    confidence += min(0.12, _safe_float((telemetry_context or {}).get("confidence"), 0.0) * 0.12)
+    full_dt = now + timedelta(hours=(missing_pct / predicted_rate)) if predicted_rate > 0 and isinstance(now, datetime) else None
+    can = bool(full_dt and isinstance(sunset_dt, datetime) and full_dt <= sunset_dt and confidence >= 0.50)
+    return {
+        "can_refill_before_sunset": can,
+        "predicted_full_charge_time": full_dt.isoformat() if full_dt else None,
+        "confidence": round(max(0.0, min(1.0, confidence)), 3),
+        "required_charge_rate": round(required_rate, 3),
+        "predicted_charge_rate": round(predicted_rate, 3),
+    }
+
+
+def _control_window_details(now, sunrise_dt, sunset_dt, hist=None) -> Dict[str, Any]:
+    if not isinstance(now, datetime) or not isinstance(sunrise_dt, datetime) or not isinstance(sunset_dt, datetime):
+        return {"active": False, "reason": "missing_time"}
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=budapest_tz)
+    if sunrise_dt.tzinfo is None:
+        sunrise_dt = sunrise_dt.replace(tzinfo=budapest_tz)
+    if sunset_dt.tzinfo is None:
+        sunset_dt = sunset_dt.replace(tzinfo=budapest_tz)
+    if sunrise_dt <= now <= sunset_dt:
+        return {"active": True, "reason": "daylight"}
+    dawn_start = sunrise_dt - timedelta(minutes=max(0, PRE_SUNRISE_CONTROL_MINUTES))
+    has_context = bool((historical_profile or {}).get("months")) or bool(telemetry_history) or bool(hist)
+    if has_context and dawn_start <= now < sunrise_dt:
+        return {"active": True, "reason": "dawn_pre_sunrise"}
+    return {"active": False, "reason": "outside_control_window"}
+
+
+def _is_control_window(now, sunrise_dt, sunset_dt, hist=None) -> bool:
+    return bool(_control_window_details(now, sunrise_dt, sunset_dt, hist).get("active", False))
+
+
+def _is_phase_power_safe(inv_l1, inv_l2, inv_l3, inv_lt) -> bool:
+    return not (_safe_float(inv_l2, 0.0) > 2500 or _safe_float(inv_l3, 0.0) > 2500 or _safe_float(inv_lt, 0.0) > 5000)
+
+
+def _make_miner_decision(
+    now,
+    prev_state,
+    battery_charge,
+    current_power,
+    inv_l1,
+    inv_l2,
+    inv_l3,
+    inv_lt,
+    current_condition,
+    clouds,
+    f1_cond,
+    f1_clouds,
+    f3_cond,
+    f3_clouds,
+    sunrise,
+    sunset,
+    hist,
+    start_guard,
+    battery_voltage,
+    battery_ah,
+    weather_outlook,
+) -> Dict[str, Any]:
+    hist = hist if isinstance(hist, dict) else {}
+    start_guard = start_guard if isinstance(start_guard, dict) else {}
+    wx5 = str(hist.get("weather_risk_5d") or (weather_outlook or {}).get("summary_5d", "unknown")).lower()
+    min_stop_soc = _safe_float(hist.get("min_stop_soc"), BATTERY_FLOOR_SOC)
+    hourly_quantile = "p75" if wx5 == "solar_weak" else "p50"
+    hourly_profile = _hourly_profile_from_hist(hist, hourly_quantile)
+    control = _control_window_details(now, sunrise, sunset, hist)
+    dawn_bridge_window = isinstance(sunrise, datetime) and (sunrise - timedelta(minutes=PRE_SUNRISE_CONTROL_MINUTES)) <= now <= (sunrise + timedelta(minutes=60))
+    available_wh = _available_bridge_wh(battery_charge, min_stop_soc, battery_voltage, battery_ah)
+    cover_dt = _predict_first_miner_cover_time(now, sunrise, hourly_profile, MINER_POWER_W, hourly_quantile)
+    required_wh = _required_bridge_wh_until_cover(now, cover_dt, hourly_profile, MINER_POWER_W) if cover_dt else 999999.0
+    buffer_soc = WEAK_WEATHER_BRIDGE_SOC_BUFFER if wx5 == "solar_weak" else MIN_DAWN_BRIDGE_SOC_BUFFER
+    safety_factor = BRIDGE_START_SAFETY_FACTOR + (0.10 if wx5 == "solar_weak" else 0.0)
+    dawn_weather_block_reason = _dawn_weather_block_reason(
+        current_condition, f1_cond, f1_clouds, f3_cond, f3_clouds, weather_outlook or {}
+    )
+    dawn_weather_block = bool(dawn_weather_block_reason)
+    telem_ctx = _telemetry_context_for_history(now)
+    telem_ctx["charge_rate_pct_per_hour_p50"] = _safe_float(hist.get("charge_rate_pct_per_hour_p50"), 0.0)
+    refill = _predict_full_recharge_feasibility(now, battery_charge, sunset, hourly_profile, telem_ctx, weather_outlook or {})
+    refill_conf = max(_safe_float(hist.get("refill_confidence"), 0.0), _safe_float(refill.get("confidence"), 0.0))
+    phase_safe = _is_phase_power_safe(inv_l1, inv_l2, inv_l3, inv_lt)
+    force_cooldown_active = isinstance(_last_force_shutdown_at, datetime) and (now - _last_force_shutdown_at).total_seconds() < MINER_STOP_FORCE_COOLDOWN_MINUTES * 60
+    hard_stop = False
+    afternoon_reserve_stop = False
+    soft_stop = False
+    start_hits: List[str] = []
+    stop_hits: List[str] = []
+
+    if battery_charge <= min_stop_soc:
+        hard_stop = True
+        stop_hits.append("Battery at/below protected min_stop_soc")
+    if not phase_safe:
+        hard_stop = True
+        stop_hits.append("Phase/total inverter safety threshold exceeded")
+
+    # Night-house reserve: after the configured afternoon cutoff, mining must not
+    # spend the battery below the protected reserve target. This is intentionally
+    # immediate (no debounce), because that SOC is reserved for overnight house load.
+    afternoon_reserve_stop = (
+        now.hour >= HARD_AFTERNOON_STOP_HOUR
+        and battery_charge < HARD_AFTERNOON_STOP_SOC
+    )
+    if afternoon_reserve_stop:
+        hard_stop = True
+        stop_hits.append(f"Afternoon night reserve: SOC below {HARD_AFTERNOON_STOP_SOC:.0f}% after {HARD_AFTERNOON_STOP_HOUR}:00")
+
+    if not control.get("active", False):
+        stop_hits.append("Outside active control window")
+
+    cover_before_deadline = bool(cover_dt and cover_dt.hour < ZERO_PV_REFILL_DEADLINE_HOUR)
+    bridge_ok = available_wh >= (required_wh * safety_factor + STARTUP_ENERGY_PENALTY_WH)
+    refill_ok = bool(hist.get("can_refill_before_sunset", False)) or bool(refill.get("can_refill_before_sunset", False)) or refill_conf >= 0.62
+    dawn_zero_pv_start = (
+        control.get("active", False)
+        and dawn_bridge_window
+        and current_power <= DAWN_ZERO_PV_MAX_W
+        and battery_charge >= min_stop_soc + buffer_soc
+        and bridge_ok
+        and cover_before_deadline
+        and refill_ok
+        and not dawn_weather_block
+        and not hard_stop
+        and not force_cooldown_active
+        and phase_safe
+    )
+    if dawn_bridge_window and current_power <= DAWN_ZERO_PV_MAX_W and dawn_weather_block:
+        stop_hits.append(f"Dawn zero-PV bridge start blocked by weather: {dawn_weather_block_reason}")
+    if dawn_zero_pv_start:
+        start_hits.append("Dawn zero-PV bridge start: battery bridge energy can cover until predicted PV support and same-day refill is feasible")
+
+    pv_covers = current_power >= max(150.0, MINER_POWER_W * PV_COVERAGE_RATIO_START)
+    normal_start = (
+        control.get("active", False)
+        and not hard_stop
+        and not force_cooldown_active
+        and bool(start_guard.get("allow_start", False))
+        and battery_charge >= min_stop_soc + 4
+        and (pv_covers or (current_power >= max(120.0, MINER_POWER_W * 0.10) and refill_ok))
+    )
+    if normal_start:
+        start_hits.append("Bridge guard start: PV/forecast and refill model allow mining")
+
+    if prev_state == "production" and not hard_stop:
+        low_pv = current_power <= 150.0
+        bridge_budget_insufficient = available_wh < (required_wh * 0.85 + STARTUP_ENERGY_PENALTY_WH) if required_wh < 999999 else True
+        dawn_allow_active = dawn_bridge_window and bridge_ok and refill_ok
+        if low_pv and (not dawn_allow_active) and (bridge_budget_insufficient or battery_charge <= min_stop_soc + 4):
+            soft_stop = True
+            stop_hits.append("PV deficit confirmed and bridge budget insufficient")
+        if hist.get("should_preserve_battery", False) and current_power < MINER_POWER_W * 0.75 and battery_charge < _safe_float(hist.get("late_day_reserve_soc"), 80.0):
+            soft_stop = True
+            stop_hits.append("Late-day reserve protection")
+        if now.hour >= HARD_AFTERNOON_STOP_HOUR and battery_charge >= HIGH_SOC_STOP_SOC and current_power <= HIGH_SOC_STOP_MAX_PV_W:
+            soft_stop = True
+            stop_hits.append("High-SOC low-PV afternoon curtailment stop")
+
+    start_score = 0.0
+    if battery_charge > min_stop_soc:
+        start_score += min(0.25, (battery_charge - min_stop_soc) / 100.0)
+    if bridge_ok:
+        start_score += 0.30
+    if refill_ok:
+        start_score += 0.25
+    if cover_before_deadline:
+        start_score += 0.10
+    if phase_safe:
+        start_score += 0.10
+    if wx5 == "solar_weak":
+        start_score -= 0.05
+    start_score = max(0.0, min(1.0, start_score))
+    stop_score = 0.95 if hard_stop else (0.72 if soft_stop else 0.15)
+    confidence = max(start_score if start_hits else 0.0, stop_score if (hard_stop or soft_stop) else 0.0, refill_conf)
+
+    desired = "hold"
+    if hard_stop:
+        desired = "stop"
+    elif start_hits and start_score >= MIN_DECISION_CONFIDENCE_START:
+        desired = "production"
+    elif prev_state == "production" and soft_stop and stop_score >= MIN_DECISION_CONFIDENCE_STOP:
+        desired = "stop"
+    elif prev_state == "production":
+        desired = "production"
+    elif not control.get("active", False):
+        desired = "stop"
+    else:
+        desired = "stop"
+
+    summary = "HOLD: no decision"
+    if hard_stop and afternoon_reserve_stop:
+        summary = "STOP: afternoon night reserve protection"
+    elif hard_stop:
+        summary = "STOP: hard safety rule"
+    elif desired == "production" and dawn_zero_pv_start:
+        summary = "START: dawn zero-PV bridge energy and refill model allow mining"
+    elif desired == "production":
+        summary = "START: bridge/refill start rules satisfied"
+    elif desired == "stop" and soft_stop:
+        summary = "STOP: soft economic rules confirmed"
+    elif desired == "stop":
+        summary = "STOP: no valid start rule"
+
+    metrics = {
+        "available_bridge_wh": round(available_wh, 2),
+        "required_bridge_wh": round(required_wh if required_wh < 999999 else 0.0, 2),
+        "bridge_safety_factor": round(safety_factor, 3),
+        "startup_energy_penalty_wh": round(STARTUP_ENERGY_PENALTY_WH, 2),
+        "predicted_first_miner_cover_time": cover_dt.isoformat() if cover_dt else None,
+        "predicted_full_charge_time": refill.get("predicted_full_charge_time"),
+        "predicted_refill_confidence": round(refill_conf, 3),
+        "active_control_window": bool(control.get("active", False)),
+        "control_window_reason": str(control.get("reason", "unknown")),
+        "min_stop_soc": round(min_stop_soc, 2),
+        "dawn_soc_buffer": round(buffer_soc, 2),
+        "dawn_weather_block": bool(dawn_weather_block),
+        "dawn_weather_block_reason": dawn_weather_block_reason,
+        "afternoon_reserve_soc": round(HARD_AFTERNOON_STOP_SOC, 2),
+        "afternoon_reserve_hour": int(HARD_AFTERNOON_STOP_HOUR),
+        "refill_model": refill,
+    }
+    return {
+        "desired_state": desired,
+        "decision_summary": summary,
+        "decision_state": desired,
+        "start_score": round(start_score, 3),
+        "stop_score": round(stop_score, 3),
+        "confidence": round(max(0.0, min(1.0, confidence)), 3),
+        "start_rule_hits": start_hits,
+        "stop_rule_hits": stop_hits,
+        "hard_stop": bool(hard_stop),
+        "soft_stop": bool(soft_stop),
+        "afternoon_reserve_stop": bool(afternoon_reserve_stop),
+        "zero_pv_bridge_start": bool(dawn_zero_pv_start),
+        "dawn_start_allowed": bool(dawn_zero_pv_start or (dawn_bridge_window and bridge_ok and refill_ok and not dawn_weather_block and not hard_stop)),
+        "metrics": metrics,
     }
 
 def _runtime_info() -> str:
@@ -1841,6 +2273,20 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         weather_sunny_ratio_5d = 100.0 * _safe_float(hints.get("weather_sunny_ratio_5d", 0.0), 0.0)
         weather_bad_ratio_5d = 100.0 * _safe_float(hints.get("weather_bad_ratio_5d", 0.0), 0.0)
         battery_pct = _safe_float(battery, 0.0)
+        dawn_start_allowed = "Yes" if hints.get("dawn_start_allowed", False) else "No"
+        zero_pv_bridge_start = "Yes" if hints.get("zero_pv_bridge_start", False) else "No"
+        decision_confidence = _safe_float(hints.get("decision_confidence", 0.0), 0.0)
+        start_score = _safe_float(hints.get("start_score", 0.0), 0.0)
+        stop_score = _safe_float(hints.get("stop_score", 0.0), 0.0)
+        available_bridge_wh = _safe_float(hints.get("available_bridge_wh", 0.0), 0.0)
+        required_bridge_wh = _safe_float(hints.get("required_bridge_wh", 0.0), 0.0)
+        bridge_safety_factor = _safe_float(hints.get("bridge_safety_factor", BRIDGE_START_SAFETY_FACTOR), BRIDGE_START_SAFETY_FACTOR)
+        startup_energy_penalty_wh = _safe_float(hints.get("startup_energy_penalty_wh", STARTUP_ENERGY_PENALTY_WH), STARTUP_ENERGY_PENALTY_WH)
+        first_cover_time = str(hints.get("predicted_first_miner_cover_time") or "N/A")
+        full_charge_time = str(hints.get("predicted_full_charge_time") or "N/A")
+        refill_conf = _safe_float(hints.get("predicted_refill_confidence", 0.0), 0.0)
+        active_control_window = "Yes" if hints.get("active_control_window", False) else "No"
+        control_window_reason = str(hints.get("control_window_reason", "unknown"))
 
         message = (
             f"⚡️ Solar Mining — NOW\n"
@@ -1885,7 +2331,13 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"• Decision state: {decision_state}\n"
             f"• Decision summary: {decision_summary}\n"
             f"• Matched start rules: {decision_start_text}\n"
-            f"• Matched stop rules: {decision_stop_text}\n\n"
+            f"• Matched stop rules: {decision_stop_text}\n"
+            f"• Confidence: {decision_confidence:.2f} (start {start_score:.2f} / stop {stop_score:.2f})\n"
+            f"• Dawn start allowed: {dawn_start_allowed} | zero-PV bridge start: {zero_pv_bridge_start}\n"
+            f"• Control window: {active_control_window} ({control_window_reason})\n"
+            f"• Bridge energy: {available_bridge_wh:.0f}Wh available / {required_bridge_wh:.0f}Wh required × {bridge_safety_factor:.2f} + {startup_energy_penalty_wh:.0f}Wh startup\n"
+            f"• First miner-cover time: {first_cover_time}\n"
+            f"• Predicted full charge: {full_charge_time} (confidence {refill_conf:.2f})\n\n"
             f"📈 Telemetry blend\n"
             f"• Samples: {telem_samples}\n"
             f"• Confidence: {telem_confidence:.2f}\n"
@@ -2279,6 +2731,42 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
         save_prev_state(prev_state, now)
         send_telegram_message(f"✅ Hashrate guard restart sequence completed. Latest hashrate: {measured_mhs:.2f} MH/s.")
 
+def _merge_decision_into_hints(hist: Dict[str, Any], decision: Dict[str, Any], start_guard: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = decision.get("metrics", {}) if isinstance(decision, dict) else {}
+    hist.update({
+        "start_guard_allow": bool(start_guard.get("allow_start", False)),
+        "start_guard_reason": str(start_guard.get("reason", "unknown")),
+        "start_guard_bridge_minutes": float(start_guard.get("bridge_minutes", 0.0)),
+        "start_guard_eta_minutes": float(start_guard.get("eta_minutes", 0.0)),
+        "start_guard_capacity_wh": float(start_guard.get("capacity_wh", 0.0)),
+        "start_guard_battery_ah": float(start_guard.get("battery_ah", 0.0)),
+        "start_guard_battery_voltage": float(start_guard.get("battery_voltage", 0.0)),
+        "start_guard_usable_wh": float(start_guard.get("usable_wh", 0.0)),
+        "start_guard_soc_window_pct": float(start_guard.get("soc_window_pct", 0.0)),
+        "start_guard_min_stop_soc": float(start_guard.get("min_stop_soc", 0.0)),
+        "start_guard_bms_floor_soc": float(start_guard.get("bms_floor_soc", 20.0)),
+        "start_guard_bms_window_wh": float(start_guard.get("bms_window_wh", 0.0)),
+        "start_guard_needed_bridge_minutes": float(start_guard.get("needed_bridge_minutes", 0.0)),
+        "start_guard_needed_bridge_wh": float(start_guard.get("needed_bridge_wh", 0.0)),
+        "decision_state": str(decision.get("decision_state", "unknown")),
+        "decision_start_rules": list(decision.get("start_rule_hits", [])),
+        "decision_stop_rules": list(decision.get("stop_rule_hits", [])),
+        "decision_summary": str(decision.get("decision_summary", "unknown")),
+        "dawn_start_allowed": bool(decision.get("dawn_start_allowed", False)),
+        "zero_pv_bridge_start": bool(decision.get("zero_pv_bridge_start", False)),
+        "decision_confidence": float(decision.get("confidence", 0.0)),
+        "start_score": float(decision.get("start_score", 0.0)),
+        "stop_score": float(decision.get("stop_score", 0.0)),
+    })
+    for key in (
+        "available_bridge_wh", "required_bridge_wh", "bridge_safety_factor", "startup_energy_penalty_wh",
+        "predicted_first_miner_cover_time", "predicted_full_charge_time", "predicted_refill_confidence",
+        "active_control_window", "control_window_reason", "dawn_weather_block", "dawn_weather_block_reason",
+    ):
+        hist[key] = metrics.get(key)
+    return hist
+
+
 def check_crypto_production_conditions(data, weather_api_key, location_lat, location_lon):
     global prev_state, state, used_quote, sunrise, sunset, uptime, _last_production_start_at
     global _pending_transition_state, _pending_transition_since, _pending_transition_hits
@@ -2289,444 +2777,39 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
          f1_cond, f1_clouds, f1_ts,
          f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(weather_api_key, location_lat, location_lon)
 
-        print(f"\nCurrent weather: {current_condition}, | Clouds: {clouds}%")
-        print(f"1H forecast: {f1_cond}, | Clouds: {f1_clouds}% | Time:{f1_ts}")
-        print(f"3H forecast: {f3_cond}, | Clouds: {f3_clouds}% | Time:{f3_ts}")
-
         garage_data = read_dht11(0, 0)
         temperature = garage_data['temperature']
         humidity = garage_data['humidity']
-
-        dl = data.get("dataList", [])
-
-        # core values
+        dl = data.get("dataList", []) if isinstance(data, dict) else []
         battery_charge = _find_value(dl, "BMS_SOC", 0)
         current_power = _find_value(dl, "S_P_T", 0)
         internal_power = _find_value(dl, "GS_T", 0)
-        battery_voltage = _find_first_value(
-            dl,
-            ["BMS_B_V1", "B_V1", "BMS_V", "BMS_U", "BAT_V", "BAT_U", "BMS Voltage", "Battery Voltage"],
-            BATTERY_NOMINAL_V,
-        )
-        battery_ah = _find_first_value(
-            dl,
-            ["BRC", "Battery Rated Capacity", "BMS_B_AH", "B_AH"],
-            BATTERY_CAPACITY_AH,
-        )
-
-        # per-phase inverter outputs (W)
+        battery_voltage = _find_first_value(dl, ["BMS_B_V1", "B_V1", "BMS_V", "BMS_U", "BAT_V", "BAT_U", "BMS Voltage", "Battery Voltage"], BATTERY_NOMINAL_V)
+        battery_ah = _find_first_value(dl, ["BRC", "Battery Rated Capacity", "BMS_B_AH", "B_AH"], BATTERY_CAPACITY_AH)
         inv_l1 = _find_value(dl, "INV_O_P_L1", 0.0)
         inv_l2 = _find_value(dl, "INV_O_P_L2", 0.0)
         inv_l3 = _find_value(dl, "INV_O_P_L3", 0.0)
         inv_lt = _find_value(dl, "INV_O_P_T", 0.0)
-
-        print(f"Battery charge: {battery_charge}%")
-        print(f"Current production (PV total): {current_power}W")
-        print(f"Inverter output per phase: L1={int(inv_l1)}W, L2={int(inv_l2)}W, L3={int(inv_l3)}W, Total={int(inv_lt)}W")
-        print(f"Internal Power: {internal_power}W")
-        print(f"Battery voltage: {battery_voltage:.2f}V")
-        print(f"Battery capacity: {battery_ah:.2f}Ah")
-
         now = datetime.now(tz=budapest_tz)
+
         hist = _history_recommendation(now, battery_charge, current_power, sunrise, sunset, weather_outlook)
-        print(
-            "[History tuning] "
-            f"month={hist['month_quality']} early_start_soc={hist['early_start_soc']}% "
-            f"min_stop_soc={hist['min_stop_soc']}% late_reserve={hist['late_day_reserve_soc']}% "
-            f"headroom_good={hist['headroom_good']} preserve={hist['should_preserve_battery']} "
-            f"telem_q={hist.get('telemetry_month_quality', 'neutral')} samples={hist.get('telemetry_samples', 0)} "
-            f"conf={float(hist.get('telemetry_confidence', 0.0)):.2f} blended_midday={float(hist.get('blended_midday_pv', 0.0)):.0f}W "
-            f"full_eta_min={hist.get('predicted_minutes_to_full')} "
-            f"wx5={hist.get('weather_risk_5d', 'unknown')} "
-            f"wx_conf={float(hist.get('weather_confidence', 0.0)):.2f}"
-        )
         start_guard = _compute_start_bridge_guard(now, battery_charge, current_power, sunrise, sunset, hist, battery_voltage, battery_ah)
-        print(
-            "[Start guard] "
-            f"allow={start_guard['allow_start']} reason={start_guard['reason']} "
-            f"capacity={start_guard['capacity_wh']}Wh ({start_guard['battery_ah']}Ah @ {start_guard['battery_voltage']}V) "
-            f"usable_wh={start_guard['usable_wh']}Wh deficit={start_guard['deficit_w']}W bridge={start_guard['bridge_minutes']}min eta={start_guard['eta_minutes']}min"
+        decision = _make_miner_decision(
+            now, prev_state or "stop", battery_charge, current_power, inv_l1, inv_l2, inv_l3, inv_lt,
+            current_condition, clouds, f1_cond, f1_clouds, f3_cond, f3_clouds, sunrise, sunset,
+            hist, start_guard, battery_voltage, battery_ah, weather_outlook,
         )
-        hist.update({
-            "start_guard_allow": bool(start_guard.get("allow_start", False)),
-            "start_guard_reason": str(start_guard.get("reason", "unknown")),
-            "start_guard_bridge_minutes": float(start_guard.get("bridge_minutes", 0.0)),
-            "start_guard_eta_minutes": float(start_guard.get("eta_minutes", 0.0)),
-            "start_guard_capacity_wh": float(start_guard.get("capacity_wh", 0.0)),
-            "start_guard_battery_ah": float(start_guard.get("battery_ah", 0.0)),
-            "start_guard_battery_voltage": float(start_guard.get("battery_voltage", 0.0)),
-            "start_guard_usable_wh": float(start_guard.get("usable_wh", 0.0)),
-            "start_guard_soc_window_pct": float(start_guard.get("soc_window_pct", 0.0)),
-            "start_guard_min_stop_soc": float(start_guard.get("min_stop_soc", 0.0)),
-            "start_guard_bms_floor_soc": float(start_guard.get("bms_floor_soc", 20.0)),
-            "start_guard_bms_window_wh": float(start_guard.get("bms_window_wh", 0.0)),
-            "start_guard_needed_bridge_minutes": float(start_guard.get("needed_bridge_minutes", 0.0)),
-            "start_guard_needed_bridge_wh": float(start_guard.get("needed_bridge_wh", 0.0)),
-        })
+        hist = _merge_decision_into_hints(hist, decision, start_guard)
 
-        solar_keywords = [
-            'sunny', 'clear', 'clear sky', 'scattered clouds', 'few clouds', 'broken clouds',
-            'partly cloudy', 'mostly sunny', 'sunshine', 'sunrise', 'sunset'
-        ]
-        non_solar_keywords = [
-            'rain', 'storm', 'thunder', 'snow', 'fog', 'haze',
-            'sleet', 'blizzard', 'dust', 'sand', 'ash', 'drizzle', 'shower', 'mist', 'smoke',
-            'tornado', 'hurricane', 'squall', 'lightning', 'moderate rain', 'heavy intensity rain', 'overcast'
-        ]
-
-        cond_now = str(current_condition).lower()
-        cond_f1 = str(f1_cond).lower()
-        cond_f3 = str(f3_cond).lower()
-        solar_now = any(k in cond_now for k in solar_keywords)
-        solar_f1 = any(k in cond_f1 for k in solar_keywords)
-        solar_f3 = any(k in cond_f3 for k in solar_keywords)
-        non_solar_now = any(k in cond_now for k in non_solar_keywords)
-        non_solar_f1 = any(k in cond_f1 for k in non_solar_keywords)
-        non_solar_f3 = any(k in cond_f3 for k in non_solar_keywords)
-
-        confident_sunny_bridge_start = (
-            bool(hist.get("refill_confident_morning", False))
-            and bool(hist.get("can_refill_before_sunset", False))
-            and bool(start_guard.get("energy_cover_ok", False))
-            and battery_charge >= (hist["min_stop_soc"] + 4)
-            and solar_now and solar_f1 and solar_f3
-            and not non_solar_now and not non_solar_f1 and not non_solar_f3
-            and now.hour < 11
-        )
-        if confident_sunny_bridge_start and not start_guard.get("allow_start", False):
-            start_guard["allow_start"] = True
-            start_guard["reason"] = "bridge_energy_confident_sunny_day_relaxation"
-
-        summer_clear_day = (
-            now.month in (5, 6, 7, 8)
-            and solar_now and solar_f1 and solar_f3
-            and not non_solar_now and not non_solar_f1 and not non_solar_f3
-        )
-        summer_fast_start = (
-            summer_clear_day
-            and battery_charge > hist["min_stop_soc"]
-            and bool(start_guard.get("energy_cover_ok", False))
-        )
-
-        aggressive_morning_refill_start = (
-            now.hour < 10
-            and battery_charge >= max(hist["min_stop_soc"] + 10, 42)
-            and bool(hist.get("can_refill_before_sunset", False))
-            and _safe_float(hist.get("predicted_minutes_to_full"), 9999) <= 240
-            and solar_now and solar_f1 and solar_f3
-            and not non_solar_now and not non_solar_f1 and not non_solar_f3
-            and str(hist.get("weather_risk_5d", "unknown")).lower() != "solar_weak"
-            and current_power >= max(150.0, MINER_POWER_W * 0.15)
-        )
-        if aggressive_morning_refill_start and not start_guard.get("allow_start", False):
-            start_guard["allow_start"] = True
-            start_guard["reason"] = "aggressive_morning_refill_start"
-
-        # Intelligent real-time start: require meaningful PV headroom and seasonal SOC discipline.
-        # This prevents autumn/winter starts from eating into battery recharge.
-        month_quality = str(hist.get("month_quality", "neutral")).lower()
-        weather_risk_5d = str(hist.get("weather_risk_5d", "unknown")).lower()
-        season_margin_w = 50 if month_quality == "strong" else (180 if month_quality == "neutral" else 350)
-        if weather_risk_5d == "solar_weak":
-            season_margin_w += 140
-        elif weather_risk_5d == "solar_friendly":
-            season_margin_w = max(30, season_margin_w - 40)
-        season_soc_floor = (
-            max(hist["min_stop_soc"] + 4, hist["early_start_soc"] - 6)
-            if month_quality == "strong"
-            else (max(hist["early_start_soc"] - 2, 52) if month_quality == "neutral" else max(hist["early_start_soc"], 68))
-        )
-        if weather_risk_5d == "solar_weak":
-            season_soc_floor = max(season_soc_floor, hist["min_stop_soc"] + 12)
-        season_time_ok = now.hour < (15 if month_quality == "strong" else (14 if month_quality == "neutral" else 12))
-        if weather_risk_5d == "solar_weak":
-            season_time_ok = season_time_ok and now.hour < 12
-        smart_bridge_pv_start = (
-            bool(start_guard.get("allow_start", False))
-            and current_power >= (MINER_POWER_W + season_margin_w)
-            and battery_charge >= season_soc_floor
-            and season_time_ok
-            and not hist.get("should_preserve_battery", False)
-        )
-        predictive_early_start = (
-            bool(start_guard.get("allow_start", False))
-            and bool(hist.get("can_refill_before_sunset", False))
-            and weather_risk_5d in {"solar_friendly", "mixed"}
-            and now.hour < 12
-            and battery_charge >= (hist["min_stop_soc"] + 6)
-            and current_power >= max(120.0, MINER_POWER_W * 0.10)
-        )
-        immediate_capacity_start = (
-            bool(start_guard.get("allow_start", False))
-            and now >= (sunrise - timedelta(minutes=30))
-            and now.hour < 15
-            and battery_charge >= (hist["min_stop_soc"] + 4)
-            and (
-                current_power >= max(100.0, MINER_POWER_W * 0.08)
-                or (
-                    bool(hist.get("can_refill_before_sunset", False))
-                    and _safe_float(hist.get("sunset_margin_minutes"), 0.0) >= 20.0
-                )
-            )
-        )
-
-        start_rule_hits: List[str] = []
-        stop_rule_hits: List[str] = []
-        pv_start_threshold = max(150.0, MINER_POWER_W * PV_COVERAGE_RATIO_START)
-        pv_stop_threshold = max(150.0, MINER_POWER_W * PV_COVERAGE_RATIO_STOP)
-        pv_covers_miner = current_power >= pv_stop_threshold
-
-        start_rules = [
-            ("Summer clear-day fast start: usable bridge energy covers needed bridge energy", summer_fast_start),
-            ("Immediate capacity start: bridge energy ready and daily refill still feasible", immediate_capacity_start),
-            ("Confident sunny-day bridge start: PV can be 0W if bridge energy is enough (before 11h)", confident_sunny_bridge_start),
-            ("Aggressive morning refill start: battery can still refill before sunset", aggressive_morning_refill_start),
-            (
-                "Bridge guard OK + PV headroom + seasonal SOC/time gate",
-                smart_bridge_pv_start,
-            ),
-            ("Predictive early start: refill before sunset is likely", predictive_early_start),
-            ("Sunny+1H forecast, PV>0, SOC>=early_start, before 13h", solar_now and solar_f1 and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13),
-            (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=65, before 13h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 65 and now.hour < 13),
-            (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=55, before 12h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 55 and now.hour < 12),
-            (f"Sunny+1H forecast, PV>={pv_start_threshold:.0f}W, SOC>=35, before 11h", solar_now and solar_f1 and current_power >= pv_start_threshold and battery_charge >= 35 and now.hour < 11),
-            ("Bridge-friendly morning start: SOC>=min_stop+12 and PV>=450W before 11h", battery_charge >= (hist["min_stop_soc"] + 12) and current_power >= 450 and now.hour < 11),
-            ("Sunny+3H forecast, PV>0, SOC>=early_start, before 13h", solar_now and solar_f3 and current_power > 0 and battery_charge >= hist["early_start_soc"] and now.hour < 13),
-            (f"Sunny+3H forecast, PV>={pv_start_threshold:.0f}W, SOC>=65, before 13h", solar_now and solar_f3 and current_power >= pv_start_threshold and battery_charge >= 65 and now.hour < 13),
-            (f"Sunny+3H forecast, PV>={pv_start_threshold:.0f}W, SOC>=55, before 12h", solar_now and solar_f3 and current_power >= pv_start_threshold and battery_charge >= 55 and now.hour < 12),
-            (f"Sunny+3H forecast, PV>={pv_start_threshold:.0f}W, SOC>=35, before 11h", solar_now and solar_f3 and current_power >= pv_start_threshold and battery_charge >= 35 and now.hour < 11),
-            ("Historical headroom good + SOC>=early_start, before 14h", hist["headroom_good"] and battery_charge >= hist["early_start_soc"] and now.hour < 14),
-            ("SOC>=60 and PV>=2500W, before 11h", battery_charge >= 60 and current_power >= 2500 and now.hour < 11),
-            ("SOC>=70 and PV>=2250W, before 12h", battery_charge >= 70 and current_power >= 2250 and now.hour < 12),
-            ("SOC>=80 and PV>=2000W, before 13h", battery_charge >= 80 and current_power >= 2000 and now.hour < 13),
-            ("SOC>=40 and PV>=3000W, before 14h", battery_charge >= 40 and current_power >= 3000 and now.hour < 14),
-            (f"SOC>{BATTERY_PROTECT_SOC:.0f}% and PV>={pv_start_threshold:.0f}W", battery_charge > BATTERY_PROTECT_SOC and current_power >= pv_start_threshold),
-        ]
-        for label, ok in start_rules:
-            if ok:
-                start_rule_hits.append(label)
-
-        stop_battery_rules = [
-            ("Battery below minimum stop SOC while running", prev_state == "production" and battery_charge < hist["min_stop_soc"]),
-            ("Late-day reserve protection (after 14h)", prev_state == "production" and now.hour > 14 and battery_charge < hist["late_day_reserve_soc"]),
-            ("Historical preserve-battery flag while running", prev_state == "production" and hist["should_preserve_battery"]),
-        ]
-        for label, ok in stop_battery_rules:
-            if ok:
-                stop_rule_hits.append(label)
-
-        curtailment_prevent_window = (
-            prev_state == "production"
-            and now.hour < 17
-            and battery_charge >= 96
-            and current_power >= max(350.0, MINER_POWER_W * 0.35)
-        )
-        minutes_to_sunset = _safe_float((sunset - now).total_seconds() / 60.0, -1.0) if isinstance(sunset, datetime) else -1.0
-        eta_to_full_min = _safe_float(hist.get("predicted_minutes_to_full"), -1.0)
-        eta_exceeds_daylight_low_soc_while_running = (
-            prev_state == "production"
-            and eta_to_full_min >= 0.0
-            and minutes_to_sunset >= 0.0
-            and eta_to_full_min > minutes_to_sunset
-            and battery_charge < 90.0
-        )
-        cannot_refill_before_sunset_while_running = (
-            prev_state == "production"
-            and eta_to_full_min >= 0.0
-            and not bool(hist.get("can_refill_before_sunset", False))
-            and _safe_float(hist.get("sunset_margin_minutes"), 0.0) < -5.0
-            and not curtailment_prevent_window
-        )
-        required_rate_to_full_pct_per_h = 0.0
-        if minutes_to_sunset > 1.0 and battery_charge < 100.0:
-            required_rate_to_full_pct_per_h = max(0.0, (100.0 - battery_charge) / (minutes_to_sunset / 60.0))
-        predicted_rate_pct_per_h = _safe_float(hist.get("predicted_charge_rate_pct_per_hour"), 0.0)
-        likely_no_full_recharge_if_running = (
-            prev_state == "production"
-            and now.hour >= 12
-            and minutes_to_sunset > 0.0
-            and battery_charge < 99.0
-            and not curtailment_prevent_window
-            and (
-                (
-                    predicted_rate_pct_per_h > 0.0
-                    and predicted_rate_pct_per_h < (required_rate_to_full_pct_per_h * 0.9)
-                    and current_power < max(600.0, MINER_POWER_W * 0.80)
-                )
-                or (
-                    predicted_rate_pct_per_h <= 0.0
-                    and minutes_to_sunset <= 240.0
-                    and current_power < max(500.0, MINER_POWER_W * 0.65)
-                )
-            )
-        )
-
-        stop_runtime_rules = [
-            (
-                "ETA to 100% exceeds remaining daylight while SOC<90% (force stop protection)",
-                eta_exceeds_daylight_low_soc_while_running,
-            ),
-            (
-                f"Battery<{BATTERY_PROTECT_SOC:.0f}% and PV<{pv_stop_threshold:.0f}W (insufficient solar cover) while running",
-                prev_state == "production" and battery_charge < BATTERY_PROTECT_SOC and not pv_covers_miner and not curtailment_prevent_window,
-            ),
-            (
-                "Predicted full charge is after sunset while running (sunset refill protection)",
-                cannot_refill_before_sunset_while_running,
-            ),
-            (
-                "Required charge rate to reach 100% by sunset is no longer achievable while running",
-                likely_no_full_recharge_if_running,
-            ),
-            ("Late-day reserve reached (after 14h, while running)", prev_state == "production" and now.hour >= 14 and battery_charge <= hist["late_day_reserve_soc"] and not curtailment_prevent_window),
-            (
-                f"High-SOC bridge drained (SOC<{HIGH_SOC_STOP_SOC:.0f}% and PV<={HIGH_SOC_STOP_MAX_PV_W:.0f}W while running)",
-                prev_state == "production" and battery_charge < HIGH_SOC_STOP_SOC and current_power <= HIGH_SOC_STOP_MAX_PV_W and not curtailment_prevent_window,
-            ),
-            ("PV <= 150W", current_power <= 150 and not curtailment_prevent_window),
-            ("Current weather non-solar + battery<=95 + PV<=1000W", non_solar_now and battery_charge <= 95 and current_power <= 1000 and not curtailment_prevent_window),
-            ("1H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f1 and battery_charge <= 95 and current_power <= 1000 and not curtailment_prevent_window),
-            ("3H forecast non-solar + battery<=95 + PV<=1000W", non_solar_f3 and battery_charge <= 95 and current_power <= 1000 and not curtailment_prevent_window),
-            ("Historical preserve-battery after 14h", hist["should_preserve_battery"] and now.hour >= 14 and not curtailment_prevent_window),
-            ("5-day weather risk is solar_weak + PV<70% miner", weather_risk_5d == "solar_weak" and current_power < (MINER_POWER_W * 0.7) and not curtailment_prevent_window),
-        ]
-
-        decision_summary = "No state change"
-        decision_state = state or "unknown"
-
-        # HARD RULE: after configured afternoon hour, SOC under threshold must stop immediately.
-        # This is intentionally unconditional and bypasses forecast/curtailment relaxations.
-        if now.hour >= HARD_AFTERNOON_STOP_HOUR and battery_charge < HARD_AFTERNOON_STOP_SOC:
-            stop_rule_hits = [f"Hard afternoon cutoff: SOC<{HARD_AFTERNOON_STOP_SOC:.0f}% after {HARD_AFTERNOON_STOP_HOUR}:00"]
-            decision_summary = "STOP: hard afternoon SOC cutoff"
-            print("Hard afternoon SOC cutoff triggered → forcing STOP.")
-            state = "stop"
-            decision_state = state
-            if prev_state == "production":
-                print("Trying to press power button.")
-                uptime = now
-                if is_rpi:
-                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-            hist.update({
-                "decision_state": decision_state,
-                "decision_start_rules": start_rule_hits,
-                "decision_stop_rules": stop_rule_hits,
-                "decision_summary": decision_summary,
-            })
-            if state != prev_state:
-                prev_state = state
-                save_prev_state(prev_state, now)
-                send_telegram_message(
-                    f""" Production stopped (hard afternoon SOC cutoff).
-________________________________
-________________________________
- Battery: {battery_charge}%
- Current power: {current_power}W
- Rule: SOC<{HARD_AFTERNOON_STOP_SOC:.0f}% after {HARD_AFTERNOON_STOP_HOUR}:00
-________________________________
- Weather: {current_condition}
- Temperature: {temperature}
- Humidity: {humidity}%
-"""
-                )
-            return (battery_charge, current_power, state, current_condition, sunrise, sunset, clouds,
-                    f1_cond, f1_clouds, f1_ts,
-                    f3_cond, f3_clouds, f3_ts, hist)
-
-        # IMMEDIATE POWER-BASED STOP RULE MINER IS ON L2 and L3
-        if (inv_l2 > 2500) or (inv_l3 > 2500) or (inv_lt > 5000):
-            stop_rule_hits = ["Power safety threshold exceeded (L2/L3/Total inverter output)"]
-            decision_summary = "STOP: power safety"
-            print("Power safety threshold exceeded → Crypto production over (STOP).")
-            state = "stop"
-            decision_state = state
-            if prev_state == "production":
-                print("Trying to press power button.")
-                uptime = now
-                if is_rpi:
-                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-            hist.update({
-                "decision_state": decision_state,
-                "decision_start_rules": start_rule_hits,
-                "decision_stop_rules": stop_rule_hits,
-                "decision_summary": decision_summary,
-            })
-            if state != prev_state:
-                prev_state = state
-                save_prev_state(prev_state, now)
-                send_telegram_message(
-                    f""" Production stopped (power threshold).
-________________________________
-________________________________
- Battery: {battery_charge}%
- Current power: {current_power}W
- L1: {int(inv_l1)}W | L2: {int(inv_l2)}W | L3: {int(inv_l3)}W | Total: {int(inv_lt)}W
-________________________________
- Weather: {current_condition}
- Temperature: {temperature}
- Humidity: {humidity}%
-"""
-                )
-            return (battery_charge, current_power, state, current_condition, sunrise, sunset, clouds,
-                    f1_cond, f1_clouds, f1_ts,
-                    f3_cond, f3_clouds, f3_ts, hist)
-
-        # ===== existing logic continues below =====
-        matched_runtime_stops = [label for label, ok in stop_runtime_rules if ok]
-
-        if stop_rule_hits:
-            print("Battery emergency shutdown.")
-            decision_summary = "STOP: battery protection"
-            state = "stop"
-            decision_state = state
-            if prev_state == "production":
-                print("Trying to press power button.")
-                if state != prev_state:
-                    prev_state = state
-                    uptime = now
-                    save_prev_state(prev_state, uptime)
-                if is_rpi:
-                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-        elif matched_runtime_stops:
-            stop_rule_hits = matched_runtime_stops
-            decision_summary = "STOP: runtime stop rules satisfied"
-            print("Crypto production over.")
-            state = "stop"
-            decision_state = state
-            if prev_state == "production":
-                print("Trying to press power button.")
-                uptime = now
-                if is_rpi:
-                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-        elif start_guard["allow_start"] and start_rule_hits:
-            print("Crypto production ready!")
-            decision_summary = "START: start rules satisfied"
-            state = "production"
-            decision_state = state
-            if prev_state == "stop":
-                print("Trying to press power button.")
-                uptime = now
-                if is_rpi:
-                    press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
-        elif (not start_guard["allow_start"]) and prev_state != "production":
-            print("Start trigger blocked by battery bridge guard.")
-            decision_summary = "STOP: bridge guard blocked start"
-            stop_rule_hits = [f"Start guard blocked start ({start_guard.get('reason', 'unknown')})"]
-            state = "stop"
-            decision_state = state
-        else:
-            print("No change!")
-
-        # Debounce non-emergency transitions to avoid flip-flop on short weather/PV noise.
-        # IMPORTANT: production starts are intentionally immediate once start rules are met,
-        # so we do not lose mining hours during strong morning bridge-energy windows.
-        emergency_stop = decision_summary in {"STOP: battery protection", "STOP: power safety"}
-        desired_state = state or prev_state or "stop"
+        desired_state = str(decision.get("desired_state", "hold"))
+        if desired_state == "hold":
+            desired_state = prev_state or "stop"
         stable_prev_state = prev_state or "stop"
-        if not emergency_stop:
-            confirmation_needed = 1 if desired_state == "production" else 3
+        hard_stop = bool(decision.get("hard_stop", False))
+        high_conf_dawn_start = bool(decision.get("zero_pv_bridge_start", False)) and float(decision.get("confidence", 0.0)) >= MIN_DECISION_CONFIDENCE_START
+        if not hard_stop:
+            confirmation_needed = 1 if (desired_state == "production" and high_conf_dawn_start) else (1 if desired_state == "production" else 3)
             min_hold_minutes = 0 if desired_state == "production" else 12
-
             if desired_state == stable_prev_state:
                 _pending_transition_state = None
                 _pending_transition_since = None
@@ -2739,43 +2822,31 @@ ________________________________
                     _pending_transition_hits = 1
                 else:
                     _pending_transition_hits += 1
-                pending_age_min = (
-                    (now - _pending_transition_since).total_seconds() / 60.0
-                    if isinstance(_pending_transition_since, datetime) else 0.0
-                )
-                transition_confirmed = (
-                    _pending_transition_hits >= confirmation_needed
-                    and pending_age_min >= min_hold_minutes
-                )
+                pending_age_min = ((now - _pending_transition_since).total_seconds() / 60.0) if isinstance(_pending_transition_since, datetime) else 0.0
+                transition_confirmed = _pending_transition_hits >= confirmation_needed and pending_age_min >= min_hold_minutes
+            effective_state, blocked, gate_reason = _apply_transition_guard(stable_prev_state, desired_state, now, confirmed=transition_confirmed)
+            if high_conf_dawn_start and desired_state == "production":
+                effective_state, blocked, gate_reason = "production", False, "high_confidence_dawn_start"
+            if blocked:
+                hist["decision_summary"] = f"HOLD: transition guard blocked ({gate_reason})"
+                hist["decision_state"] = effective_state
+            state = effective_state
+        else:
+            state = "stop"
 
-            effective_state, blocked, gate_reason = _apply_transition_guard(
-                stable_prev_state, desired_state, now, confirmed=transition_confirmed
-            )
-            if blocked and effective_state != desired_state:
-                state = effective_state
-                decision_state = state
-                decision_summary = f"HOLD: transition guard blocked ({gate_reason})"
-                if desired_state == "production":
-                    stop_rule_hits = stop_rule_hits or [f"Start delayed by transition guard ({gate_reason})"]
-                else:
-                    start_rule_hits = start_rule_hits or [f"Stop delayed by transition guard ({gate_reason})"]
-            else:
-                state = effective_state
-                decision_state = state
-                if state == desired_state:
-                    _pending_transition_state = None
-                    _pending_transition_since = None
-                    _pending_transition_hits = 0
-
-        hist.update({
-            "decision_state": decision_state,
-            "decision_start_rules": start_rule_hits,
-            "decision_stop_rules": stop_rule_hits,
-            "decision_summary": decision_summary,
-        })
+        print(
+            f"[Decision] desired={desired_state} effective={state} summary={hist.get('decision_summary')} "
+            f"confidence={hist.get('decision_confidence')} start={hist.get('start_score')} stop={hist.get('stop_score')} "
+            f"bridge={hist.get('available_bridge_wh')}/{hist.get('required_bridge_wh')}Wh cover={hist.get('predicted_first_miner_cover_time')}"
+        )
+        print(f"Battery charge: {battery_charge}% | PV: {current_power}W | Internal: {internal_power}W")
+        print(f"Inverter output per phase: L1={int(inv_l1)}W, L2={int(inv_l2)}W, L3={int(inv_l3)}W, Total={int(inv_lt)}W")
 
         if state == "production" and prev_state != "production":
             _last_production_start_at = now
+            print("Crypto production ready!")
+            if is_rpi:
+                press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
             send_telegram_message(
                 f""" Production started!
 ________________________________
@@ -2783,12 +2854,16 @@ ________________________________
  Current power: {current_power}W
  L1: {int(inv_l1)}W | L2: {int(inv_l2)}W | L3: {int(inv_l3)}W | Total: {int(inv_lt)}W
 ________________________________
+ Decision: {hist.get('decision_summary')}
  Weather: {current_condition}
  Temperature: {temperature}
  Humidity: {humidity}%"""
             )
         elif state == "stop" and prev_state != "stop":
             _last_production_start_at = None
+            print("Crypto production over.")
+            if is_rpi:
+                press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
             send_telegram_message(
                 f""" Production stopped.
 ________________________________
@@ -2796,6 +2871,7 @@ ________________________________
  Current power: {current_power}W
  L1: {int(inv_l1)}W | L2: {int(inv_l2)}W | L3: {int(inv_l3)}W | Total: {int(inv_lt)}W
 ________________________________
+ Decision: {hist.get('decision_summary')}
  Weather: {current_condition}
  Temperature: {temperature}
  Humidity: {humidity}%"""
@@ -2811,7 +2887,7 @@ ________________________________
 
     except Exception as e:
         print(f"Error while checking production conditions: {e}")
-        # Keep tuple arity stable for caller unpacking.
+        traceback.print_exc()
         now_fallback = datetime.now(tz=budapest_tz)
         safe_sunrise = sunrise if isinstance(sunrise, datetime) else now_fallback
         safe_sunset = sunset if isinstance(sunset, datetime) else now_fallback
@@ -2880,8 +2956,8 @@ def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power
                       garage_temp: Optional[float], garage_hum: Optional[float],
                       historical_hints: Optional[Dict[str, Any]] = None,
                       sunrise_dt: Optional[datetime] = None, sunset_dt: Optional[datetime] = None):
-    if not _is_active_window(now, sunrise_dt, sunset_dt):
-        print("[Telemetry] Skipping idle-period telemetry persist (outside active sunrise/sunset window).")
+    if not _is_control_window(now, sunrise_dt, sunset_dt, historical_hints):
+        print("[Telemetry] Skipping idle-period telemetry persist (outside control window).")
         return
 
     dl = data.get("dataList", []) if isinstance(data, dict) else []
@@ -2908,6 +2984,22 @@ def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power
         "weather_risk_5d": str((historical_hints or {}).get("weather_risk_5d", "unknown")),
         "weather_sunny_ratio_5d": float((historical_hints or {}).get("weather_sunny_ratio_5d", 0.0)),
         "weather_bad_ratio_5d": float((historical_hints or {}).get("weather_bad_ratio_5d", 0.0)),
+        "dawn_start_allowed": bool((historical_hints or {}).get("dawn_start_allowed", False)),
+        "zero_pv_bridge_start": bool((historical_hints or {}).get("zero_pv_bridge_start", False)),
+        "decision_confidence": float((historical_hints or {}).get("decision_confidence", 0.0)),
+        "start_score": float((historical_hints or {}).get("start_score", 0.0)),
+        "stop_score": float((historical_hints or {}).get("stop_score", 0.0)),
+        "available_bridge_wh": float((historical_hints or {}).get("available_bridge_wh") or 0.0),
+        "required_bridge_wh": float((historical_hints or {}).get("required_bridge_wh") or 0.0),
+        "bridge_safety_factor": float((historical_hints or {}).get("bridge_safety_factor") or 0.0),
+        "startup_energy_penalty_wh": float((historical_hints or {}).get("startup_energy_penalty_wh") or 0.0),
+        "predicted_first_miner_cover_time": str((historical_hints or {}).get("predicted_first_miner_cover_time") or ""),
+        "predicted_full_charge_time": str((historical_hints or {}).get("predicted_full_charge_time") or ""),
+        "predicted_refill_confidence": float((historical_hints or {}).get("predicted_refill_confidence") or 0.0),
+        "active_control_window": bool((historical_hints or {}).get("active_control_window", False)),
+        "control_window_reason": str((historical_hints or {}).get("control_window_reason", "unknown")),
+        "dawn_weather_block": bool((historical_hints or {}).get("dawn_weather_block", False)),
+        "dawn_weather_block_reason": str((historical_hints or {}).get("dawn_weather_block_reason", "")),
     }
     telemetry_history.append(record)
     _append_telemetry_to_file(record)
@@ -3124,10 +3216,10 @@ let currentLang='en';
 const I18N={
   en:{title:'Solar Mining Dashboard',theme:'Theme',downloadTelemetry:'Telemetry JSON',from:'From',to:'To',lastDay:'Last Day',lastWeek:'Last Week',lastMonth:'Last Month',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',actionInProgress:'Sending command…',actionStartOk:'Miner start command sent successfully.',actionStopOk:'Miner stop command sent successfully.',actionForceOk:'Force stop command sent successfully.',actionError:'Command failed',notifTitle:'Notifications',notifEmpty:'No notifications yet.',
       state:'State',battery:'Battery',pv:'PV Power',hashrate:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
-      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardFullEta:'ETA to 100% battery charge',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',reasonCannotRefillBeforeSunset:'Likely cannot refill battery before sunset',reasonRefillRelaxation:'Confident refill relaxation',reasonRefillMorningRelaxation:'Confident morning refill relaxation',reasonBridgeEnergySunnyRelaxation:'Bridge-energy confident sunny-day relaxation',reasonAggressiveMorningRefillStart:'Aggressive morning refill start',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
+      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardFullEta:'ETA to 100% battery charge',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',reasonCannotRefillBeforeSunset:'Likely cannot refill battery before sunset',reasonRefillRelaxation:'Confident refill relaxation',reasonRefillMorningRelaxation:'Confident morning refill relaxation',reasonBridgeEnergySunnyRelaxation:'Bridge-energy confident sunny-day relaxation',reasonAggressiveMorningRefillStart:'Aggressive morning refill start',dawnStartAllowed:'Dawn start allowed',zeroPvBridgeStart:'Zero-PV bridge start',decisionConfidence:'Decision confidence',bridgeEnergyModel:'Bridge energy model',activeControlWindow:'Active control window',firstCoverTime:'First miner-cover time',fullChargeTime:'Predicted full charge',refillConfidence:'Refill confidence',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
   hu:{title:'Solar Bányászat Dashboard',theme:'Téma',downloadTelemetry:'Telemetry JSON letöltése',from:'Ettől',to:'Eddig',lastDay:'Elmúlt nap',lastWeek:'Elmúlt hét',lastMonth:'Elmúlt hónap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',actionInProgress:'Parancs küldése…',actionStartOk:'Indítási parancs elküldve.',actionStopOk:'Leállítási parancs elküldve.',actionForceOk:'Kényszerleállítási parancs elküldve.',actionError:'Parancs hiba',notifTitle:'Értesítések',notifEmpty:'Még nincs értesítés.',
       state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hashrate:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
-      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardFullEta:'Várható idő 100% akku töltésig',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',reasonCannotRefillBeforeSunset:'Várhatóan nem tölt vissza napnyugtáig',reasonRefillRelaxation:'Magabiztos visszatöltési lazítás',reasonRefillMorningRelaxation:'Magabiztos reggeli visszatöltési lazítás',reasonBridgeEnergySunnyRelaxation:'Bridge energia + napsütés miatti lazítás',reasonAggressiveMorningRefillStart:'Agresszív reggeli indítás (visszatöltés biztos)',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
+      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardFullEta:'Várható idő 100% akku töltésig',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',reasonCannotRefillBeforeSunset:'Várhatóan nem tölt vissza napnyugtáig',reasonRefillRelaxation:'Magabiztos visszatöltési lazítás',reasonRefillMorningRelaxation:'Magabiztos reggeli visszatöltési lazítás',reasonBridgeEnergySunnyRelaxation:'Bridge energia + napsütés miatti lazítás',reasonAggressiveMorningRefillStart:'Agresszív reggeli indítás (visszatöltés biztos)',dawnStartAllowed:'Hajnali indítás engedélyezve',zeroPvBridgeStart:'Nulla-PV áthidaló indítás',decisionConfidence:'Döntési bizalom',bridgeEnergyModel:'Áthidaló energia modell',activeControlWindow:'Aktív vezérlési ablak',firstCoverTime:'Első PV fedezési idő',fullChargeTime:'Várt teljes töltés',refillConfidence:'Feltöltési bizalom',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
 };
 const t=(k)=>I18N[currentLang][k]||k;
 function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
@@ -3252,9 +3344,17 @@ const decisionSummary=String(hints.decision_summary||'').trim()||t('decisionNone
 const startRules=Array.isArray(hints.decision_start_rules)?hints.decision_start_rules:[];
 const stopRules=Array.isArray(hints.decision_stop_rules)?hints.decision_stop_rules:[];
 const renderRuleList=(arr)=>arr.length?`<ul class='hint-list'>${arr.map(x=>`<li>${String(x)}</li>`).join('')}</ul>`:`<div class='hint-sub'>${t('decisionNone')}</div>`;
+const decisionConfidence=Number(hints.decision_confidence||0);
+const startScore=Number(hints.start_score||0);
+const stopScore=Number(hints.stop_score||0);
+const bridgeModel=`${Number(hints.available_bridge_wh||0).toFixed(0)} / ${Number(hints.required_bridge_wh||0).toFixed(0)} ${t('unitWh')} × ${Number(hints.bridge_safety_factor||0).toFixed(2)} + ${Number(hints.startup_energy_penalty_wh||0).toFixed(0)} ${t('unitWh')}`;
+const controlWindow=`${boolTxt(!!hints.active_control_window)} (${String(hints.control_window_reason||'unknown')})`;
+const firstCover=String(hints.predicted_first_miner_cover_time||'N/A');
+const fullCharge=String(hints.predicted_full_charge_time||'N/A');
+const refillConf=Number(hints.predicted_refill_confidence||0);
 const startGuardBridgeView=startGuardBridge;
 const startGuardEtaView=startGuardEta;
-document.getElementById('historyHints').innerHTML=`<div class='hint-section'><div class='hint-section-title'>${t('hintHistoryTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-calendar-days'></i> ${t('monthQuality')}</div><div class='hint-value'>${qText}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt'></i> ${t('earlyStart')}</div><div class='hint-value'>${Number(hints.early_start_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-stop'></i> ${t('minStop')}</div><div class='hint-value'>${Number(hints.min_stop_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-end'></i> ${t('lateReserve')}</div><div class='hint-value'>${Number(hints.late_day_reserve_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-shield-heart'></i> ${t('preserveBattery')}</div><div class='hint-value'>${boolTxt(!!hints.should_preserve_battery)}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-gauge-high'></i> ${t('headroomGood')}</div><div class='hint-value'>${boolTxt(!!hints.headroom_good)}</div></div></div><div class='hint-card decision-card'><div class='hint-title'><i class='fa-solid fa-list-check'></i> ${t('hintDecisionTitle')}</div><div class='hint-sub'><strong>${t('decisionState')}:</strong> ${decisionState}</div><div class='hint-sub'><strong>${t('decisionSummary')}:</strong> ${decisionSummary}</div><div class='hint-sub'><strong>${t('decisionStartRules')}:</strong></div>${renderRuleList(startRules)}<div class='hint-sub'><strong>${t('decisionStopRules')}:</strong></div>${renderRuleList(stopRules)}</div></div><div class='hint-section'><div class='hint-section-title'>${t('hintStartGuardTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-play-circle'></i> ${t('startGuardAllow')}</div><div class='hint-value'>${startGuardAllow}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-info'></i> ${t('startGuardReason')}</div><div class='hint-value'>${reasonTxt}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-start'></i> ${t('startGuardBridge')}</div><div class='hint-value'>${startGuardBridgeView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-half'></i> ${t('startGuardEta')}</div><div class='hint-value'>${startGuardEtaView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-full'></i> ${t('startGuardFullEta')}</div><div class='hint-value'>${startGuardFullEta}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-car-battery'></i> ${t('startGuardCapacity')}</div><div class='hint-value'>${startGuardCapacity}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-three-quarters'></i> ${t('startGuardUsable')}</div><div class='hint-value'>${startGuardUsable}</div><div class='hint-sub'><strong>${t('usableFormula')}:</strong> ${startGuardUsableFormula}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-business-time'></i> ${t('neededBridgeTime')}</div><div class='hint-value'>${neededBridgeTime}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt-lightning'></i> ${t('neededBridgeEnergy')}</div><div class='hint-value'>${neededBridgeEnergy}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div></div></div>`;
+document.getElementById('historyHints').innerHTML=`<div class='hint-section'><div class='hint-section-title'>${t('hintHistoryTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-calendar-days'></i> ${t('monthQuality')}</div><div class='hint-value'>${qText}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt'></i> ${t('earlyStart')}</div><div class='hint-value'>${Number(hints.early_start_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-stop'></i> ${t('minStop')}</div><div class='hint-value'>${Number(hints.min_stop_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-end'></i> ${t('lateReserve')}</div><div class='hint-value'>${Number(hints.late_day_reserve_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-shield-heart'></i> ${t('preserveBattery')}</div><div class='hint-value'>${boolTxt(!!hints.should_preserve_battery)}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-gauge-high'></i> ${t('headroomGood')}</div><div class='hint-value'>${boolTxt(!!hints.headroom_good)}</div></div></div><div class='hint-card decision-card'><div class='hint-title'><i class='fa-solid fa-list-check'></i> ${t('hintDecisionTitle')}</div><div class='hint-sub'><strong>${t('decisionState')}:</strong> ${decisionState}</div><div class='hint-sub'><strong>${t('decisionSummary')}:</strong> ${decisionSummary}</div><div class='hint-sub'><strong>${t('decisionConfidence')}:</strong> ${decisionConfidence.toFixed(2)} (${startScore.toFixed(2)} / ${stopScore.toFixed(2)})</div><div class='hint-sub'><strong>${t('dawnStartAllowed')}:</strong> ${boolTxt(!!hints.dawn_start_allowed)} | <strong>${t('zeroPvBridgeStart')}:</strong> ${boolTxt(!!hints.zero_pv_bridge_start)}</div><div class='hint-sub'><strong>${t('activeControlWindow')}:</strong> ${controlWindow}</div><div class='hint-sub'><strong>${t('bridgeEnergyModel')}:</strong> ${bridgeModel}</div><div class='hint-sub'><strong>${t('firstCoverTime')}:</strong> ${firstCover}</div><div class='hint-sub'><strong>${t('fullChargeTime')}:</strong> ${fullCharge} (${t('refillConfidence')} ${refillConf.toFixed(2)})</div><div class='hint-sub'><strong>${t('decisionStartRules')}:</strong></div>${renderRuleList(startRules)}<div class='hint-sub'><strong>${t('decisionStopRules')}:</strong></div>${renderRuleList(stopRules)}</div></div><div class='hint-section'><div class='hint-section-title'>${t('hintStartGuardTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-play-circle'></i> ${t('startGuardAllow')}</div><div class='hint-value'>${startGuardAllow}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-info'></i> ${t('startGuardReason')}</div><div class='hint-value'>${reasonTxt}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-start'></i> ${t('startGuardBridge')}</div><div class='hint-value'>${startGuardBridgeView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-half'></i> ${t('startGuardEta')}</div><div class='hint-value'>${startGuardEtaView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-full'></i> ${t('startGuardFullEta')}</div><div class='hint-value'>${startGuardFullEta}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-car-battery'></i> ${t('startGuardCapacity')}</div><div class='hint-value'>${startGuardCapacity}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-three-quarters'></i> ${t('startGuardUsable')}</div><div class='hint-value'>${startGuardUsable}</div><div class='hint-sub'><strong>${t('usableFormula')}:</strong> ${startGuardUsableFormula}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-business-time'></i> ${t('neededBridgeTime')}</div><div class='hint-value'>${neededBridgeTime}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt-lightning'></i> ${t('neededBridgeEnergy')}</div><div class='hint-value'>${neededBridgeEnergy}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div></div></div>`;
 powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
 phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
 batteryChart.data.labels=labels; batteryChart.data.datasets[0].data=h.map(x=>x.battery); batteryChart.data.datasets[1].data=h.map(x=>x.state==='production'?100:0); batteryChart.update();
@@ -3568,7 +3668,9 @@ def main_loop():
             last_quote_reset_date = today
 
         print(f"Sunrise start: {sunrise}:00 | Sunset stop: {sunset}:00")
-        within_active = (sunrise.hour, sunrise.minute) <= (now.hour, now.minute) <= (sunset.hour, sunset.minute)
+        control_details = _control_window_details(now, sunrise, sunset, historical_profile)
+        within_active = bool(control_details.get("active", False))
+        print(f"Control window: {within_active} ({control_details.get('reason')})")
 
         if within_active:
             try:
@@ -3656,7 +3758,7 @@ def main_loop():
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
-            print(f"Outside of active hours. Sleeping... (Sunrise: {sunrise.strftime('%H:%M')} | Sunset: {sunset.strftime('%H:%M')})")
+            print(f"Outside of control window. Sleeping... (Sunrise: {sunrise.strftime('%H:%M')} | Sunset: {sunset.strftime('%H:%M')})")
             print(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
             (current_condition, sunrise, sunset, clouds,
