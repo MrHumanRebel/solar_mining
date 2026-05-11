@@ -79,6 +79,8 @@ WEAK_WEATHER_BRIDGE_SOC_BUFFER = float(os.getenv("MY_WEAK_WEATHER_BRIDGE_SOC_BUF
 ZERO_PV_REFILL_DEADLINE_HOUR = int(os.getenv("MY_ZERO_PV_REFILL_DEADLINE_HOUR", "13"))
 MIN_DECISION_CONFIDENCE_START = float(os.getenv("MY_MIN_DECISION_CONFIDENCE_START", "0.62"))
 MIN_DECISION_CONFIDENCE_STOP = float(os.getenv("MY_MIN_DECISION_CONFIDENCE_STOP", "0.68"))
+DAWN_RAIN_FORECAST_BLOCK_BAD_RATIO = float(os.getenv("MY_DAWN_RAIN_FORECAST_BLOCK_BAD_RATIO", "0.45"))
+DAWN_OVERCAST_BLOCK_CLOUDS = float(os.getenv("MY_DAWN_OVERCAST_BLOCK_CLOUDS", "98"))
 
 print(platform.machine())
 print(platform.system())
@@ -187,6 +189,33 @@ def _idle_historical_hints() -> Dict[str, Any]:
         "active_control_window": False,
         "control_window_reason": "idle",
     }
+
+
+def _is_adverse_dawn_weather(condition: str) -> bool:
+    c = str(condition or "").lower()
+    return any(k in c for k in [
+        "rain", "drizzle", "storm", "thunder", "shower",
+        "snow", "sleet", "blizzard", "freezing", "hail",
+    ])
+
+
+def _dawn_weather_block_reason(current_condition, f1_cond, f1_clouds, f3_cond, f3_clouds, weather_outlook) -> str:
+    """Return non-empty reason when dawn battery bridge start should be blocked by near-term weather."""
+    bad_hits = []
+    for label, cond in (("now", current_condition), ("1h", f1_cond), ("3h", f3_cond)):
+        if _is_adverse_dawn_weather(cond):
+            bad_hits.append(f"{label}:{cond}")
+    if bad_hits:
+        return "rain/storm forecast in dawn window (" + "; ".join(str(x) for x in bad_hits) + ")"
+
+    wx = weather_outlook or {}
+    bad_ratio = _safe_float(wx.get("bad_ratio_5d"), 0.0)
+    summary = str(wx.get("summary_5d", "unknown")).lower()
+    f1c = _safe_float(f1_clouds, 0.0)
+    f3c = _safe_float(f3_clouds, 0.0)
+    if summary == "solar_weak" and bad_ratio >= DAWN_RAIN_FORECAST_BLOCK_BAD_RATIO and min(f1c, f3c) >= DAWN_OVERCAST_BLOCK_CLOUDS:
+        return f"very weak overcast dawn forecast (bad_ratio={bad_ratio:.2f}, clouds={f1c:.0f}/{f3c:.0f}%)"
+    return ""
 
 
 def _classify_weather_condition(condition: str) -> str:
@@ -1680,6 +1709,10 @@ def _make_miner_decision(
     required_wh = _required_bridge_wh_until_cover(now, cover_dt, hourly_profile, MINER_POWER_W) if cover_dt else 999999.0
     buffer_soc = WEAK_WEATHER_BRIDGE_SOC_BUFFER if wx5 == "solar_weak" else MIN_DAWN_BRIDGE_SOC_BUFFER
     safety_factor = BRIDGE_START_SAFETY_FACTOR + (0.10 if wx5 == "solar_weak" else 0.0)
+    dawn_weather_block_reason = _dawn_weather_block_reason(
+        current_condition, f1_cond, f1_clouds, f3_cond, f3_clouds, weather_outlook or {}
+    )
+    dawn_weather_block = bool(dawn_weather_block_reason)
     telem_ctx = _telemetry_context_for_history(now)
     telem_ctx["charge_rate_pct_per_hour_p50"] = _safe_float(hist.get("charge_rate_pct_per_hour_p50"), 0.0)
     refill = _predict_full_recharge_feasibility(now, battery_charge, sunset, hourly_profile, telem_ctx, weather_outlook or {})
@@ -1724,10 +1757,13 @@ def _make_miner_decision(
         and bridge_ok
         and cover_before_deadline
         and refill_ok
+        and not dawn_weather_block
         and not hard_stop
         and not force_cooldown_active
         and phase_safe
     )
+    if dawn_bridge_window and current_power <= DAWN_ZERO_PV_MAX_W and dawn_weather_block:
+        stop_hits.append(f"Dawn zero-PV bridge start blocked by weather: {dawn_weather_block_reason}")
     if dawn_zero_pv_start:
         start_hits.append("Dawn zero-PV bridge start: battery bridge energy can cover until predicted PV support and same-day refill is feasible")
 
@@ -1814,6 +1850,8 @@ def _make_miner_decision(
         "control_window_reason": str(control.get("reason", "unknown")),
         "min_stop_soc": round(min_stop_soc, 2),
         "dawn_soc_buffer": round(buffer_soc, 2),
+        "dawn_weather_block": bool(dawn_weather_block),
+        "dawn_weather_block_reason": dawn_weather_block_reason,
         "afternoon_reserve_soc": round(HARD_AFTERNOON_STOP_SOC, 2),
         "afternoon_reserve_hour": int(HARD_AFTERNOON_STOP_HOUR),
         "refill_model": refill,
@@ -1831,7 +1869,7 @@ def _make_miner_decision(
         "soft_stop": bool(soft_stop),
         "afternoon_reserve_stop": bool(afternoon_reserve_stop),
         "zero_pv_bridge_start": bool(dawn_zero_pv_start),
-        "dawn_start_allowed": bool(dawn_zero_pv_start or (dawn_bridge_window and bridge_ok and refill_ok and not hard_stop)),
+        "dawn_start_allowed": bool(dawn_zero_pv_start or (dawn_bridge_window and bridge_ok and refill_ok and not dawn_weather_block and not hard_stop)),
         "metrics": metrics,
     }
 
@@ -2723,7 +2761,7 @@ def _merge_decision_into_hints(hist: Dict[str, Any], decision: Dict[str, Any], s
     for key in (
         "available_bridge_wh", "required_bridge_wh", "bridge_safety_factor", "startup_energy_penalty_wh",
         "predicted_first_miner_cover_time", "predicted_full_charge_time", "predicted_refill_confidence",
-        "active_control_window", "control_window_reason",
+        "active_control_window", "control_window_reason", "dawn_weather_block", "dawn_weather_block_reason",
     ):
         hist[key] = metrics.get(key)
     return hist
@@ -2960,6 +2998,8 @@ def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power
         "predicted_refill_confidence": float((historical_hints or {}).get("predicted_refill_confidence") or 0.0),
         "active_control_window": bool((historical_hints or {}).get("active_control_window", False)),
         "control_window_reason": str((historical_hints or {}).get("control_window_reason", "unknown")),
+        "dawn_weather_block": bool((historical_hints or {}).get("dawn_weather_block", False)),
+        "dawn_weather_block_reason": str((historical_hints or {}).get("dawn_weather_block_reason", "")),
     }
     telemetry_history.append(record)
     _append_telemetry_to_file(record)
