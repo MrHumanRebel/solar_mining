@@ -75,6 +75,7 @@ DAWN_ZERO_PV_MAX_W = float(os.getenv("MY_DAWN_ZERO_PV_MAX_W", "80"))
 BRIDGE_START_SAFETY_FACTOR = float(os.getenv("MY_BRIDGE_START_SAFETY_FACTOR", "1.25"))
 STARTUP_ENERGY_PENALTY_WH = float(os.getenv("MY_STARTUP_ENERGY_PENALTY_WH", "120"))
 MIN_DAWN_BRIDGE_SOC_BUFFER = float(os.getenv("MY_MIN_DAWN_BRIDGE_SOC_BUFFER", "6"))
+DAWN_START_TARGET_SOC_MARGIN = float(os.getenv("MY_DAWN_START_TARGET_SOC_MARGIN", "3"))
 WEAK_WEATHER_BRIDGE_SOC_BUFFER = float(os.getenv("MY_WEAK_WEATHER_BRIDGE_SOC_BUFFER", "12"))
 ZERO_PV_REFILL_DEADLINE_HOUR = int(os.getenv("MY_ZERO_PV_REFILL_DEADLINE_HOUR", "13"))
 MIN_DECISION_CONFIDENCE_START = float(os.getenv("MY_MIN_DECISION_CONFIDENCE_START", "0.62"))
@@ -1747,14 +1748,19 @@ def _make_miner_decision(
         stop_hits.append("Outside active control window")
 
     cover_before_deadline = bool(cover_dt and cover_dt.hour < ZERO_PV_REFILL_DEADLINE_HOUR)
-    bridge_ok = available_wh >= (required_wh * safety_factor + STARTUP_ENERGY_PENALTY_WH)
+    required_with_safety_wh = (required_wh * safety_factor + STARTUP_ENERGY_PENALTY_WH) if required_wh < 999999 else 999999.0
+    bridge_ok = available_wh >= required_with_safety_wh
     refill_ok = bool(hist.get("can_refill_before_sunset", False)) or bool(refill.get("can_refill_before_sunset", False)) or refill_conf >= 0.62
+    battery_capacity_wh = max(1.0, battery_voltage * battery_ah)
+    projected_soc_at_cover = battery_charge - ((required_with_safety_wh / battery_capacity_wh) * 100.0 if required_with_safety_wh < 999999 else 999.0)
+    projected_soc_ok = projected_soc_at_cover >= (min_stop_soc + DAWN_START_TARGET_SOC_MARGIN)
     dawn_zero_pv_start = (
         control.get("active", False)
         and dawn_bridge_window
         and current_power <= DAWN_ZERO_PV_MAX_W
         and battery_charge >= min_stop_soc + buffer_soc
         and bridge_ok
+        and projected_soc_ok
         and cover_before_deadline
         and refill_ok
         and not dawn_weather_block
@@ -1765,7 +1771,7 @@ def _make_miner_decision(
     if dawn_bridge_window and current_power <= DAWN_ZERO_PV_MAX_W and dawn_weather_block:
         stop_hits.append(f"Dawn zero-PV bridge start blocked by weather: {dawn_weather_block_reason}")
     if dawn_zero_pv_start:
-        start_hits.append("Dawn zero-PV bridge start: battery bridge energy can cover until predicted PV support and same-day refill is feasible")
+        start_hits.append(f"Dawn zero-PV bridge start: delayed until projected SOC at cover stays >= min_stop+{DAWN_START_TARGET_SOC_MARGIN:.1f}%")
 
     pv_covers = current_power >= max(150.0, MINER_POWER_W * PV_COVERAGE_RATIO_START)
     normal_start = (
@@ -1778,6 +1784,7 @@ def _make_miner_decision(
     )
     if normal_start:
         start_hits.append("Bridge guard start: PV/forecast and refill model allow mining")
+
 
     if prev_state == "production" and not hard_stop:
         low_pv = current_power <= 150.0
