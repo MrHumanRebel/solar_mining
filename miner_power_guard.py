@@ -28,7 +28,6 @@ class MinerPowerGuard:
         self.baseline = None
         self.signature = None
         self.candidates = deque(maxlen=2)
-        self.hits = []
         self.poll_interval_seconds = 300
         self.learning_timeout_seconds = 900
         self.reason = "No witnessed miner start"
@@ -36,7 +35,6 @@ class MinerPowerGuard:
     def disarm(self, reason):
         self.started = self.baseline = self.signature = None
         self.candidates.clear()
-        self.hits.clear()
         self.learning_timeout_seconds = 900
         self.reason = reason
 
@@ -67,7 +65,6 @@ class MinerPowerGuard:
         """Return True only for a newly confirmed automatic shutdown."""
         self.poll_interval_seconds = max(300, poll_interval_seconds)
         if not self.fresh(sample, now):
-            self.hits.clear()
             self.reason = "Missing or stale consumption measurement"
             return False
         if self.last_at is not None and sample.at <= self.last_at:
@@ -106,7 +103,7 @@ class MinerPowerGuard:
                     self.signature = tuple(median(c[1][i] for c in self.candidates) for i in (0, 1))
                     self.reason = "Miner L2/L3 rise identified"
             return False
-        # Once both phase contributions disappear, later cooking loads must
+        # Once either phase contribution disappears, later cooking loads must
         # never re-arm this run, even when household consumption exceeds 1 kW.
         if any(delta[i+1] < self.signature[i] * 0.4 for i in (0, 1)):
             self.disarm("Miner load disappeared; no more automatic presses this run")
@@ -114,20 +111,14 @@ class MinerPowerGuard:
             self.off.append(sample)
             return False
         if expected_state != "stop":
-            self.hits.clear()
             return False
         matches = (abs(delta[0]) <= 100 and all(
             abs(delta[i+1] - self.signature[i]) <= max(80, self.signature[i] * 0.2)
             for i in (0, 1)))
         if sample.total <= 1000 or not matches:
-            self.hits.clear()
             self.reason = "No unambiguous mining load above 1000 W total"
             return False
-        if self.hits and (sample.at - self.hits[-1]).total_seconds() < 120:
-            return False
-        self.hits.append(sample.at)
-        self.reason = f"Matching L2/L3 miner load after STOP: {len(self.hits)}/3"
-        if len(self.hits) >= 3 and (self.hits[-1] - self.hits[0]).total_seconds() >= 240:
-            self.disarm("Automatic shutdown issued; re-press disabled for this run")
-            return True
-        return False
+        # Identification was learned while the rig ran. One newly collected
+        # matching STOP sample is enough; do not wait for more polling cycles.
+        self.disarm("Automatic shutdown issued; re-press disabled for this run")
+        return True

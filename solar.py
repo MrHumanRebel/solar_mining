@@ -2647,7 +2647,7 @@ def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[st
             if press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS):
                 _last_force_shutdown_at = now
                 save_prev_state(prev_state, uptime)
-                send_telegram_message("⚠️ STOP requested: fresh L2/L3 miner signature persisted for 3 samples and total consumption exceeds 1000 W. One force-shutdown signal sent.")
+                send_telegram_message("⚠️ STOP requested: one fresh measurement matches the identified L2/L3 miner signature and total consumption exceeds 1000 W. One force-shutdown signal sent.")
 
 
 def _update_pool_hashrate(now: datetime) -> None:

@@ -41,9 +41,10 @@ mindkét fáziskiosztása támogatott. A pool API nem vesz részt a vezérlésbe
   L2/L3 emelkedést, lényeges L1-változás nélkül. Az együttes többlet
   500–1000 W, a 3 GPU-s ág 250–550 W, a másik 200–650 W lehet.
 - STOP-kérés után **1000 W feletti teljes fogyasztás ÉS a megtanult L2/L3
-  terhelés** szükséges három egymást követő, legalább két percenkénti mérésben.
-  Nappal ez körülbelül tíz perc, a félórás éjszakai mintavételezéssel
-  körülbelül egy óra megerősítés.
+  terhelés** szükséges egyetlen friss mérésben. Az első megfelelő lekérés
+  engedélyezi a leállítást, nincs háromszoros megerősítés és további ciklusok
+  kivárása. Éjjel a következő ütemezett lekérésig legfeljebb körülbelül
+  30 perc telhet el; emiatt nincs külön sűrített API-hívás.
 - Futásonként legfeljebb egy automatikus hosszú gombnyomás engedélyezett.
   Bármelyik azonosított ág eltűnése visszavonja a felismerést: későbbi
   sütő/főzőlap-terhelés nem élesíti újra ugyanazt a futást.
@@ -96,8 +97,10 @@ python replay_power_guard.py --telemetry /útvonal/telemetry_history.json --assu
 ```
 
 A második módban 348 állapotváltásból 194-nél volt stabil indulási alap,
-77 szakaszban tanult a védelem L2/L3 mintát, automatikus leállítási jelzés
-nem keletkezett. Az `inv_lt` inverterkimenet, nem külön fogyasztásmérő;
+77 szakaszban tanult a védelem L2/L3 mintát; az egy friss STOP-mérésre
+engedélyező szabállyal 30 szimulált leállítási jelzés keletkezett. Ez nem
+minősíti őket igazolt vagy téves fizikai leállításnak. Az `inv_lt`
+inverterkimenet, nem külön fogyasztásmérő;
 a régi `ts` a napló időpontja, nem igazolt eszközoldali mérési idő.
 Az állapotváltás nem bizonyít GPIO-parancsot vagy fizikai gépállapotot.
 Ezek az eredmények ezért nem adnak tévesleállítási vagy felismerési

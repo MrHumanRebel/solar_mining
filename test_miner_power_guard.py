@@ -50,9 +50,9 @@ class PowerGuardTests(unittest.TestCase):
         self.assertEqual(result['counts']['identified_runs'],0)
         self.assertEqual(result['simulated_shutdown_signals'],[])
 
-    def test_three_fresh_matching_stop_samples_trigger_once(self):
+    def test_first_fresh_matching_stop_sample_triggers_once(self):
         guard = armed_guard()
-        for minute, expected in [(25, False), (30, False), (35, True), (40, False), (45, False)]:
+        for minute, expected in [(25, True), (30, False), (35, False), (40, False), (45, False)]:
             s = sample(minute)
             self.assertEqual(guard.observe(s, s.at, 'stop'), expected)
 
@@ -62,7 +62,7 @@ class PowerGuardTests(unittest.TestCase):
         for minute in (25, 30, 35):
             s = sample(minute, l2=450, l3=650)
             results.append(guard.observe(s, s.at, 'stop'))
-        self.assertEqual(results, [False, False, True])
+        self.assertEqual(results, [True, False, False])
 
     def test_oven_only_and_unknown_start_never_arm(self):
         guard = MinerPowerGuard()
@@ -120,15 +120,20 @@ class PowerGuardTests(unittest.TestCase):
     def test_missing_stale_future_and_repeated_samples_do_not_confirm(self):
         guard = armed_guard()
         s = sample(25)
-        self.assertFalse(guard.observe(s, s.at, 'stop'))
+        self.assertTrue(guard.observe(s, s.at, 'stop'))
         for _ in range(10):
             self.assertFalse(guard.observe(s, s.at, 'stop'))
-        self.assertEqual(len(guard.hits), 1)
         self.assertFalse(guard.observe(None, s.at, 'stop'))
-        self.assertEqual(guard.hits, [])
         self.assertFalse(guard.observe(s, s.at + timedelta(minutes=10), 'stop'))
         future = sample(40)
         self.assertFalse(guard.observe(future, s.at, 'stop'))
+
+    def test_armed_guard_rejects_repeated_stale_and_future_first_stop_readings(self):
+        for at_minute, now_minute in ((20,25),(25,35),(40,25)):
+            with self.subTest(at=at_minute,now=now_minute):
+                guard = armed_guard()
+                self.assertFalse(guard.observe(sample(at_minute),T+timedelta(minutes=now_minute),'stop'))
+                self.assertIsNotNone(guard.signature)
 
     def test_gap_loses_identity_instead_of_reusing_old_running_measurement(self):
         guard = armed_guard()

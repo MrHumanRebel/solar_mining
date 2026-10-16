@@ -52,7 +52,7 @@ class SolarPollingTests(unittest.TestCase):
             self.assertEqual(solar._solarman_poll_slot(stop+timedelta(minutes=30),dawn,stop)[0],300)
             self.assertEqual(solar._solarman_poll_slot(SUNSET,dawn,stop)[0],1800)
 
-    def test_half_hour_guard_samples_can_learn_and_confirm_without_reusing_old_data(self):
+    def test_half_hour_guard_stops_on_first_fresh_match_without_reusing_old_data(self):
         guard=MinerPowerGuard()
         for minute in (0,30,60):
             at=SUNSET+timedelta(minutes=minute)
@@ -68,7 +68,7 @@ class SolarPollingTests(unittest.TestCase):
         for minute in (150,180,210):
             at=SUNSET+timedelta(minutes=minute)
             results.append(guard.observe(PowerSample(at,1200,100,550,550),at,'stop',poll_interval_seconds=1800))
-        self.assertEqual(results,[False,False,True])
+        self.assertEqual(results,[True,False,False])
 
     def test_half_hour_cadence_does_not_make_half_hour_old_samples_fresh(self):
         guard=MinerPowerGuard()
