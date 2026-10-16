@@ -21,8 +21,6 @@ services:
       - MY_QUOTE_LIMIT=${MY_QUOTE_LIMIT}
       - MY_QUOTE_FILE=/app/quote_usage.json
       - MY_STATE_FILE=/app/state.json
-      - MY_SOLARMAN_FILE=/app/solarman_data.json
-      - MY_TELEMETRY_FILE=/app/solarminer_json/telemetry_history.json
       - WALLET_ADDRESS=${WALLET_ADDRESS:-0xaedac36dcfc956864fcc03ec2ef256facaefd991}
       - MY_MINING_ALGORITHM=${MY_MINING_ALGORITHM:-pearlpow}
       - MY_MINING_WORKER=${MY_MINING_WORKER:-solarminer}
@@ -33,10 +31,8 @@ services:
     volumes:
       - ./wait-for-dns.sh:/app/wait-for-dns.sh
       - ./state.json:/app/state.json
-      - ./solarman_data.json:/app/solarman_data.json
       - ./quote_usage.json:/app/quote_usage.json
-      - ./solarman_json:/app/solarman_json
-      - ./solarminer_json:/app/solarminer_json
+      - ./solarman_json:/app/solarman_json:ro
     devices:
       - "/dev/gpiomem:/dev/gpiomem"
       - "/dev/i2c-1:/dev/i2c-1"

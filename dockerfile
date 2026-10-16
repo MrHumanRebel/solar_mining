@@ -26,7 +26,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
    
 # Copy the app code and bundled historical tuning data
-COPY solar.py miner_power_guard.py ./
+COPY solar.py miner_power_guard.py history_model.py ./
 COPY solarmining_logo.png ./
 COPY favicon ./favicon
 COPY wait-for-dns.sh ./

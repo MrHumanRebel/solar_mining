@@ -142,7 +142,6 @@ class IdleMonitoringTests(unittest.TestCase):
         with patch.multiple(solar, historical_profile={}, state='stop', prev_state='stop',
                             last_quote_reset_date=SUNSET.date(), _solarman_poll_slot=Mock(side_effect=slots),
                             _solarman_poll_due=Mock(side_effect=[i%6==0 for i in range(13)])), \
-             patch.object(solar, '_load_telemetry_from_file'), \
              patch.object(solar, 'load_quote_usage',return_value=0), \
              patch.object(solar, 'save_quote_usage'), \
              patch.object(solar, 'get_current_weather',return_value=weather), \
