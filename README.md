@@ -5,6 +5,48 @@ Ez a projekt egy napelemes rendszer állapotának figyelésére, adatgyűjtésé
 
 ---
 
+## unMineable USDT (PearlPow)
+
+A vezérlő mostantól az **unMineable USDT** fiók `solarminer` nevű,
+**PearlPow** algoritmusú workerét figyeli. Alapértelmezett cím:
+
+https://unmineable.com/address/0xaedac36dcfc956864fcc03ec2ef256facaefd991?coin=USDT
+
+- `WALLET_ADDRESS`: USDT EVM-cím vagy a teljes unMineable USDT URL.
+  Üres vagy régi RVN-beállítás esetén a fenti cím az alapértelmezett.
+  A mentett RVN-cím nem állítja vissza a régi poolt.
+- `MY_MINING_ALGORITHM`: alapértelmezésben `pearlpow`.
+- `MY_MINING_WORKER`: alapértelmezésben `solarminer`; üres értékkel az adott
+  algoritmus összes workerének jelentett hashrátája összegezhető.
+- A `/wallet <cím vagy URL>` Telegram-parancs USDT EVM-címet fogad el.
+- API: `https://api.unminable.com/v4/address/<cím>?coin=USDT`, majd
+  `/v4/account/<uuid>/workers`. A jelentett `rhr` érték H/s-ban érkezik;
+  a kijelzés automatikusan kH/s–PH/s egységre vált. Az offline workerek
+  korábbi hashrátája nem számít aktív termelésnek. API-hiba esetén nincs
+  automatikus újraindítás; a megerősített nulla hashráta továbbra is kiváltja
+  a konfigurált védelmet.
+
+Ez a projekt a monitorozást és a GPIO-alapú gépvezérlést végzi, nem indít
+bányászprogramot. A tényleges bányászprogram poolját és USDT kifizetési címét
+a bányászgépen kell beállítani. A képernyőképen jelzett kifizetési hálózat BSC;
+ezt a beállítást az unMineable fiók kezeli.
+
+### Fejlesztés és ellenőrzés
+
+A `requirements.txt` a frissítéskor elérhető legújabb stabil közvetlen Python
+függőségeket rögzíti. Ellenőrzött Python-verzió: 3.11.
+A dashboard Chart.js 4.5.1 és Font Awesome 7.3.1 verziót használ.
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip check
+python -m unittest -v test_mining_pool
+python simulate_decisions.py --telemetry telemetry_history_20260524_161647.json --history-dir solarman_json
+```
+
+A tesztek helyettesített API-válaszokkal futnak, nem vezérelnek hardvert.
+Élő ellenőrzéshez engedélyezni kell az `api.unminable.com` HTTPS-elérését.
+
 ## 🚀 Fő funkciók
 
 - 🔋 **Valós idejű napelem adatok lekérése** (`solar.py`, `solarman.ipynb`)

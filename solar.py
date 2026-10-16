@@ -46,7 +46,11 @@ QUOTE_LIMIT = int(os.getenv('MY_QUOTE_LIMIT', '200000'))
 QUOTE_FILE = os.environ['MY_QUOTE_FILE']
 STATE_FILE = os.environ['MY_STATE_FILE']
 SOLARMAN_FILE = os.environ['MY_SOLARMAN_FILE']
-WALLET_ADDRESS = os.environ['WALLET_ADDRESS']
+DEFAULT_WALLET_ADDRESS = "0xaedac36dcfc956864fcc03ec2ef256facaefd991"
+WALLET_ADDRESS = os.getenv('WALLET_ADDRESS') or DEFAULT_WALLET_ADDRESS
+MINING_COIN = "USDT"
+MINING_ALGORITHM = os.getenv("MY_MINING_ALGORITHM", "pearlpow").strip().lower()
+MINING_WORKER = os.getenv("MY_MINING_WORKER", "solarminer").strip()
 HISTORY_DIR = os.getenv('MY_HISTORY_DIR', 'solarman_json')
 BATTERY_CAPACITY_AH = float(os.getenv("MY_BATTERY_CAPACITY_AH", "200"))
 BATTERY_NOMINAL_V = float(os.getenv("MY_BATTERY_NOMINAL_V", "55.2"))
@@ -301,6 +305,7 @@ _hashrate_low_streak: int = 0
 _last_hashrate_restart_at: Optional[datetime] = None
 _last_wallet_hashrate_hs: Optional[float] = None
 _last_wallet_hashrate_at: Optional[datetime] = None
+_last_wallet_hashrate_key: Optional[Tuple[str, str, str, str]] = None
 _restart_triggered_this_cycle: bool = False
 web_notifications: deque = deque(maxlen=160)
 
@@ -318,185 +323,125 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
 
 
 def _parse_wallet_address(value: str) -> Optional[str]:
+    """Accept an EVM USDT address or an unMineable USDT address-page URL."""
     raw = str(value or "").strip()
-    if not raw:
+    if raw.startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+        if parsed.scheme != "https" or parsed.netloc.lower() not in {"unmineable.com", "www.unmineable.com"}:
+            return None
+        if parse_qs(parsed.query).get("coin", [MINING_COIN]) != [MINING_COIN]:
+            return None
+        match = re.fullmatch(r"/address/(0x[0-9a-fA-F]{40})/?", parsed.path)
+        if not match:
+            return None
+        raw = match.group(1)
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", raw):
         return None
-    if raw.startswith("http://") or raw.startswith("https://"):
-        m = re.search(r"/wallet/([A-Za-z0-9]+)", raw)
-        if m:
-            raw = m.group(1)
-    raw = raw.strip()
-    if not re.fullmatch(r"[A-Za-z0-9]{24,64}", raw):
-        return None
-    return raw
+    return raw.lower()
 
 
 def _effective_wallet_address() -> str:
-    global WALLET_ADDRESS
-    parsed = _parse_wallet_address(WALLET_ADDRESS)
-    return parsed or str(WALLET_ADDRESS).strip()
+    # Ignore legacy RVN values in the environment or persisted state.
+    return _parse_wallet_address(WALLET_ADDRESS) or DEFAULT_WALLET_ADDRESS
 
 
-def _hashrate_to_hs(value: float, unit: str) -> float:
-    factor = {
-        "h/s": 1.0,
-        "kh/s": 1e3,
-        "mh/s": 1e6,
-        "gh/s": 1e9,
-        "th/s": 1e12,
-    }.get(str(unit or "").strip().lower(), 1.0)
-    return max(0.0, value) * factor
+def _format_hashrate(value: Optional[float]) -> str:
+    if value is None or not math.isfinite(value) or value < 0:
+        return "N/A"
+    for factor, unit in ((1e15, "PH/s"), (1e12, "TH/s"), (1e9, "GH/s"), (1e6, "MH/s"), (1e3, "kH/s")):
+        if value >= factor:
+            return f"{value / factor:.2f} {unit}"
+    return f"{value:.2f} H/s"
 
 
 def _extract_hashrate_from_wallet_payload(payload: Dict[str, Any]) -> Optional[float]:
+    """Read v4 account/workers reported rates (rhr in H/s) for this rig only.
+
+    Calculated rates and chart history can lag behind a stopped miner, so they
+    must not be used to confirm that the rig is still running.
     """
-    Parse RavenMiner wallet API payloads across multiple schema variants.
-    Returns H/s or None when no reliable value is found.
-    """
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or payload.get("success") is not True:
         return None
-
-    candidates: List[float] = []
-    preferred: List[float] = []
-
-    def _append_numeric(value: Any) -> None:
+    data = payload.get("data")
+    group = data.get(MINING_ALGORITHM) if isinstance(data, dict) else None
+    workers = group.get("workers") if isinstance(group, dict) else None
+    if not isinstance(workers, list):
+        return None
+    total = 0.0
+    for worker in workers:
+        if not isinstance(worker, dict):
+            return None
+        if MINING_WORKER and worker.get("name") != MINING_WORKER:
+            continue
+        online = worker.get("online")
+        if online is False or online == 0:
+            continue
+        if online is not True and online != 1:
+            return None
+        rate = worker.get("rhr")
+        if isinstance(rate, bool):
+            return None
         try:
-            if isinstance(value, bool):
-                return
-            if isinstance(value, (int, float)):
-                candidates.append(max(0.0, float(value)))
-                return
-            if isinstance(value, str):
-                cleaned = value.strip().replace(",", "")
-                if cleaned:
-                    candidates.append(max(0.0, float(cleaned)))
-        except Exception:
-            return
-    def _append_preferred(value: Any) -> None:
-        try:
-            if isinstance(value, bool):
-                return
-            if isinstance(value, (int, float)):
-                preferred.append(max(0.0, float(value)))
-                return
-            if isinstance(value, str):
-                cleaned = value.strip().replace(",", "")
-                if cleaned:
-                    preferred.append(max(0.0, float(cleaned)))
-        except Exception:
-            return
-
-    # Common flat keys.
-    for key in ("hashrate", "currentHashrate", "current_hashrate", "hash", "hr5m", "5min"):
-        _append_numeric(payload.get(key))
-
-    # Nested "hashrate" object returned by RavenMiner wallet endpoint.
-    hashrate_obj = payload.get("hashrate")
-    if isinstance(hashrate_obj, dict):
-        _append_preferred(hashrate_obj.get("5min"))
-        for key in ("5min", "1h", "6h", "12h", "24h", "current", "avg"):
-            _append_numeric(hashrate_obj.get(key))
-
-    # Nested data envelope variants.
-    data_obj = payload.get("data")
-    if isinstance(data_obj, dict):
-        for key in ("hashrate", "currentHashrate", "current_hashrate", "hash", "hr5m"):
-            _append_numeric(data_obj.get(key))
-        nested_hashrate = data_obj.get("hashrate")
-        if isinstance(nested_hashrate, dict):
-            _append_preferred(nested_hashrate.get("5min"))
-            for key in ("5min", "1h", "6h", "12h", "24h", "current", "avg"):
-                _append_numeric(nested_hashrate.get(key))
-
-    # Worker list can also hold immediate 5-minute hashrate values.
-    workers = payload.get("workers")
-    worker_list = workers.get("list") if isinstance(workers, dict) else None
-    if isinstance(worker_list, list):
-        for w in worker_list:
-            if not isinstance(w, dict):
-                continue
-            _append_preferred(w.get("hr5m"))
-            for key in ("hr5m", "hashrate", "currentHashrate", "current_hashrate"):
-                _append_numeric(w.get(key))
-
-    if preferred:
-        return max(preferred)
-    return max(candidates) if candidates else None
+            rate = float(rate)
+        except (ValueError, TypeError):
+            return None
+        if not math.isfinite(rate) or rate < 0:
+            return None
+        total += rate
+    return total if math.isfinite(total) else None
 
 
 def _wallet_hashrate_hs(wallet: str) -> Optional[float]:
-    wallet = _parse_wallet_address(wallet or "") or ""
+    wallet = _parse_wallet_address(wallet)
     if not wallet:
         return None
-    api_url = f"https://www.ravenminer.com/api/v1/wallet/{wallet}"
-    last_err: Optional[str] = None
+    base_url = "https://api.unminable.com/v4"
+    last_err = "unknown"
     for attempt in range(1, 4):
         try:
-            r = requests.get(
-                api_url,
-                timeout=(5, 12),
-                headers={"Accept": "application/json", "User-Agent": "solar-mining-bot/1.0"},
+            response = requests.get(
+                f"{base_url}/address/{wallet}", params={"coin": MINING_COIN},
+                timeout=(5, 12), headers={"Accept": "application/json"},
             )
-            if r.status_code != 200:
-                last_err = f"http_{r.status_code}"
-                time.sleep(0.35 * attempt)
-                continue
-
-            payload = r.json()
-            if isinstance(payload, dict):
-                parsed_hs = _extract_hashrate_from_wallet_payload(payload)
-                if parsed_hs is not None:
-                    return parsed_hs
-                last_err = "json_schema_no_hashrate"
-            else:
-                last_err = "json_not_dict"
-        except requests.RequestException as err:
-            last_err = f"request_exception:{err.__class__.__name__}"
-        except ValueError:
-            last_err = "json_decode_error"
-        except Exception as err:
-            last_err = f"unexpected:{err.__class__.__name__}"
-        time.sleep(0.35 * attempt)
-    if last_err:
-        print(f"[Hashrate guard] RavenMiner API parse failed for {wallet}: {last_err}")
-
-    # Fallback: parse wallet page text for any H/s values, keep highest.
-    try:
-        page_url = f"https://www.ravenminer.com/ravencoin/wallet/{wallet}"
-        resp = requests.get(
-            page_url,
-            timeout=(5, 12),
-            headers={"User-Agent": "solar-mining-bot/1.0"},
-        )
-        text = resp.text if resp.status_code == 200 else ""
-        matches = re.findall(r"([0-9]+(?:[.,][0-9]+)?)\s*([kmgth]?h/s)", text, flags=re.IGNORECASE)
-        if not matches:
-            return None
-        vals = []
-        for n, unit in matches:
-            try:
-                vals.append(_hashrate_to_hs(float(str(n).replace(",", ".")), unit))
-            except Exception:
-                continue
-        return max(vals) if vals else None
-    except Exception:
-        return None
+            response.raise_for_status()
+            account = response.json()
+            data = account.get("data") if isinstance(account, dict) else None
+            uuid = data.get("uuid") if isinstance(data, dict) else None
+            if account.get("success") is not True or not isinstance(uuid, str) or not re.fullmatch(r"[a-zA-Z0-9-]+", uuid):
+                raise ValueError("missing account UUID")
+            response = requests.get(
+                f"{base_url}/account/{uuid}/workers", timeout=(5, 12),
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            hs = _extract_hashrate_from_wallet_payload(response.json())
+            if hs is not None:
+                return hs
+            last_err = "workers_schema_or_hashrate_unavailable"
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as err:
+            last_err = type(err).__name__
+        if attempt < 3:
+            time.sleep(0.35 * attempt)
+    print(f"[Hashrate guard] unMineable {MINING_COIN}/{MINING_ALGORITHM} unavailable: {last_err}")
+    return None
 
 
 def _wallet_hashrate_hs_cached(wallet: str, now: Optional[datetime] = None, max_age_seconds: int = 120) -> Optional[float]:
-    global _last_wallet_hashrate_hs, _last_wallet_hashrate_at
+    global _last_wallet_hashrate_hs, _last_wallet_hashrate_at, _last_wallet_hashrate_key
     if now is None:
         now = datetime.now(tz=budapest_tz)
+    key = (_parse_wallet_address(wallet) or "", MINING_COIN, MINING_ALGORITHM, MINING_WORKER)
     if (
-        _last_wallet_hashrate_at is not None
+        key == _last_wallet_hashrate_key
+        and _last_wallet_hashrate_at is not None
         and _last_wallet_hashrate_hs is not None
-        and (now - _last_wallet_hashrate_at).total_seconds() <= max(1, int(max_age_seconds))
+        and 0 <= (now - _last_wallet_hashrate_at).total_seconds() <= max(1, int(max_age_seconds))
     ):
         return _last_wallet_hashrate_hs
     hs = _wallet_hashrate_hs(wallet)
-    if hs is not None:
-        _last_wallet_hashrate_hs = hs
-        _last_wallet_hashrate_at = now
+    _last_wallet_hashrate_key = key
+    _last_wallet_hashrate_hs = hs
+    _last_wallet_hashrate_at = now
     return hs
 
 
@@ -2225,7 +2170,7 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         now_dt = datetime.now(tz=budapest_tz)
         wallet = _effective_wallet_address()
         now_hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now_dt, max_age_seconds=120)
-        hashrate_text = f"{(now_hashrate_hs / 1e6):.2f} MH/s" if isinstance(now_hashrate_hs, (int, float)) else "N/A"
+        hashrate_text = _format_hashrate(now_hashrate_hs)
         hints = historical_hints if isinstance(historical_hints, dict) and historical_hints else _history_recommendation(
             now_dt,
             _safe_float(battery, 0.0),
@@ -2412,13 +2357,13 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             send_telegram_message("Force stop requested, but GPIO is not available on this host.")
 
     if message_text == "/wallet":
-        send_telegram_message(f"Current wallet: {_effective_wallet_address()}")
+        send_telegram_message(f"unMineable {MINING_COIN} ({MINING_ALGORITHM}, worker={MINING_WORKER or 'all'}): {_effective_wallet_address()}")
 
     if message_text.startswith("/wallet "):
         raw = message_text.split(" ", 1)[1].strip()
         parsed = _parse_wallet_address(raw)
         if not parsed:
-            send_telegram_message("Invalid wallet. Use Ravencoin wallet address or full RavenMiner wallet URL.")
+            send_telegram_message("Invalid wallet. Use a USDT EVM address (0x + 40 hex digits) or an unMineable address URL with coin=USDT.")
         else:
             WALLET_ADDRESS = parsed
             save_prev_state(prev_state, uptime)
@@ -2640,10 +2585,15 @@ def supervise_runtime_by_hashrate(now: datetime, expected_state: str) -> None:
     wallet = _effective_wallet_address()
     hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
     is_running = isinstance(hashrate_hs, (int, float)) and hashrate_hs > 0
-    hashrate_text = f"{(hashrate_hs / 1e6):.2f} MH/s" if isinstance(hashrate_hs, (int, float)) else "N/A"
+    hashrate_text = _format_hashrate(hashrate_hs)
 
     if str(expected_state).lower() != "stop":
         _miner_stop_reply_streak = 0
+        return
+
+    if hashrate_hs is None:
+        _miner_stop_reply_streak = 0
+        print("[Runtime guard] unMineable unavailable; STOP state cannot be confirmed.")
         return
 
     if not is_running:
@@ -2698,8 +2648,9 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
     wallet = _effective_wallet_address()
     hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
     if hashrate_hs is None:
-        _hashrate_low_streak += 1
-        print(f"[Hashrate guard] Unable to fetch hashrate for wallet {wallet}. streak={_hashrate_low_streak}/{HASHRATE_LOW_STREAK_LIMIT}")
+        _hashrate_low_streak = 0
+        print(f"[Hashrate guard] unMineable unavailable for {wallet}; skipping restart check.")
+        return
     elif hashrate_hs > HASHRATE_MIN_HS:
         _hashrate_low_streak = 0
         return
@@ -2720,11 +2671,11 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
         print("[Hashrate guard] Low hashrate detected but restart cooldown is still active.")
         return
 
-    measured_mhs = (hashrate_hs / 1e6) if isinstance(hashrate_hs, (int, float)) else 0.0
+    measured_text = _format_hashrate(hashrate_hs)
     msg = (
-        f"⚠️ Hashrate is 0 after startup window ({HASHRATE_CHECK_DELAY_MINUTES} min) "
+        f"⚠️ Hashrate is below the configured threshold after startup window ({HASHRATE_CHECK_DELAY_MINUTES} min) "
         f"for {HASHRATE_LOW_STREAK_LIMIT} consecutive checks. "
-        f"Wallet={wallet}, measured={measured_mhs:.2f} MH/s. Restarting miner."
+        f"Wallet={wallet}, measured={measured_text}. Restarting miner."
     )
     print(msg)
     send_telegram_message(msg)
@@ -2736,7 +2687,7 @@ def check_hashrate_guard(now: datetime, effective_state: str) -> None:
         _hashrate_low_streak = 0
         _restart_triggered_this_cycle = True
         save_prev_state(prev_state, now)
-        send_telegram_message(f"✅ Hashrate guard restart sequence completed. Latest hashrate: {measured_mhs:.2f} MH/s.")
+        send_telegram_message(f"✅ Hashrate guard restart sequence completed. Latest hashrate: {measured_text}.")
 
 def _merge_decision_into_hints(hist: Dict[str, Any], decision: Dict[str, Any], start_guard: Dict[str, Any]) -> Dict[str, Any]:
     metrics = decision.get("metrics", {}) if isinstance(decision, dict) else {}
@@ -3115,8 +3066,8 @@ DASHBOARD_HTML = """
 <title>Solar Mining Control</title>
 <link rel="icon" type="image/png" href="/solarmining_logo.png" />
 <link rel="apple-touch-icon" href="/solarmining_logo.png" />
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
 <style>
 :root{--bg:#0b1220;--bg2:#182845;--card:rgba(20,31,56,.72);--txt:#e9eefc;--muted:#9fb0d0;--ok:#47d16c;--warn:#f2b84b;--danger:#ff6b6b;--input:#1f2c48;--border:rgba(255,255,255,.2)}
 [data-theme="light"]{--bg:#eef3ff;--bg2:#d9e8ff;--card:rgba(255,255,255,.85);--txt:#111827;--muted:#4b5563;--input:#ffffff;--border:rgba(17,24,39,.15)}
@@ -3324,7 +3275,7 @@ function renderNotifications(items){
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
 renderNotifications(d.notifications||[]);
 const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-gauge-high'></i> ${t('hashrate')}</div><div class='v'>${Number.isFinite(Number(d.hashrate_mhs))?Number(d.hashrate_mhs).toFixed(2)+' MH/s':'N/A'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card metrics-history'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-gauge-high'></i> ${t('hashrate')}</div><div class='v'>${d.hashrate_text||'N/A'}</div><div class='sub'><a href='https://unmineable.com/address/${d.wallet_address}?coin=USDT' target='_blank' rel='noopener noreferrer'>unMineable · USDT</a></div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card metrics-history'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
 const hints=d.historical_hints||{};
 const monthQ=String(hints.month_quality||'neutral');
@@ -3445,6 +3396,12 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "clouds": snap.get("clouds", 0),
         "hashrate_hs": snap.get("hashrate_hs"),
         "hashrate_mhs": snap.get("hashrate_mhs"),
+        "hashrate_text": _format_hashrate(snap.get("hashrate_hs")),
+        "mining_pool": "unMineable",
+        "mining_coin": MINING_COIN,
+        "mining_algorithm": MINING_ALGORITHM,
+        "mining_worker": MINING_WORKER,
+        "wallet_address": _effective_wallet_address(),
         "sunrise": snap.get("sunrise").isoformat() if snap.get("sunrise") else "",
         "sunset": snap.get("sunset").isoformat() if snap.get("sunset") else "",
         "history_count": len(filtered_hist),
