@@ -63,6 +63,14 @@ A felismerés oka a `[Power guard]` naplóban és a snapshot API
 összesített fázismérésből nem bizonyítható egy fogyasztó azonossága. A két
 bányásztáp külön fogyasztásmérője szükséges a biztos elkülönítéshez.
 
+Napnyugta után az ötpercenkénti PV- és fogyasztáslekérés nem áll le: legalább
+30 percig, majd egész éjjel folytatódik STOP állapotban. A dashboard és az
+OLED a ténylegesen lekért PV-/akkuértéket mutatja; hiányzó adat `N/A`, illetve
+`--`, nem mesterséges nulla. OLED/I2C-hiba és hiányzó DHT-adat nem állíthatja
+le ezt a felügyeletet. Az éjszakai lekérések beleszámítanak az API-kvótába.
+A hiányzó fogyasztási minta naplója a rendelkezésre álló idő- és
+teljesítménymezők nevét is kiírja az élő mezőmegfeleltetés ellenőrzéséhez.
+
 #### Ellenőrzés a feltöltött telemetrián
 
 A 2026. október 16-án kapott, 36 139 soros naplóban 2071 STOP-sorban
@@ -95,7 +103,7 @@ A dashboard Chart.js 4.5.1 és Font Awesome 7.3.1 verziót használ.
 ```bash
 python -m pip install -r requirements.txt
 python -m pip check
-python -m unittest -v test_mining_pool test_miner_power_guard
+python -m unittest -v test_mining_pool test_miner_power_guard test_idle_monitoring
 python simulate_decisions.py --telemetry telemetry_history_20260524_161647.json --history-dir solarman_json
 ```
 
