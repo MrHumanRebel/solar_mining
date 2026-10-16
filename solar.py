@@ -1994,29 +1994,39 @@ def read_dht11(prev_temperature, prev_humidity):
 
 
 def clean_value(value):
-    return int(float(re.sub(r'[^\d.]+', '', str(value))))
+    """Format optional sensor values without inventing zero or losing signs."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, str):
+            match = re.fullmatch(r'\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:°?C|W|%)?\s*', value, re.IGNORECASE)
+            if not match:
+                return None
+            value = match.group(1)
+        number = float(value)
+        return int(number) if math.isfinite(number) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 def write_to_display(state_text, soc, solar_power, temperature, humidity):
     if not oled:
-        return
-    flush_display()
-    draw.rectangle((0, 0, oled.width, oled.height), outline=0, fill=0)
-
-    temperature = clean_value(temperature)
-    humidity = clean_value(humidity)
-    soc = clean_value(soc)
-    solar_power = clean_value(solar_power)
-
-    line1 = f"SOC: {soc}% PWR: {solar_power}W"
-    line2 = f"{state_text}"
-    line3 = f"{temperature}C {humidity}%"
-
-    draw.text((0, 0), line1, font=font, fill=25)
-    draw.text((0, 8), line2, font=font, fill=25)
-    draw.text((0, 16), line3, font=font, fill=25)
-
-    oled.image(image)
-    oled.show()
+        return False
+    def display(value):
+        result = clean_value(value)
+        return "--" if result is None else str(result)
+    try:
+        draw.rectangle((0, 0, oled.width, oled.height), outline=0, fill=0)
+        lines = [f"SOC: {display(soc)}% PWR: {display(solar_power)}W",
+                 str(state_text), f"{display(temperature)}C {display(humidity)}%"]
+        for y, line in zip((0, 8, 16), lines):
+            draw.text((0, y), line, font=font, fill=25)
+        oled.image(image)
+        oled.show()
+        return True
+    except Exception as err:
+        # OLED/DHT failures must never stop power supervision or the dashboard.
+        print(f"[OLED] Update skipped: {type(err).__name__}: {err}")
+        return False
 
 def sleep_until_next_5min(offset_seconds=60):
     now = datetime.now(tz=budapest_tz)
@@ -2383,7 +2393,6 @@ def save_quote_usage(used_quote_val: int):
 
 def sha256_hash(password):
     hashed = hashlib.sha256(password.encode('utf-8')).hexdigest()
-    print(f"Hashed password: {hashed}")
     return hashed
 
 def get_access_token():
@@ -2610,7 +2619,7 @@ def _extract_power_sample(data: Dict[str, Any], now: datetime) -> Optional[Power
         if abs(total - sum(phases)) > max(100, total * 0.1):
             return None
         return PowerSample(at, total, *phases)
-    except (ValueError, TypeError, OverflowError, OSError):
+    except (ValueError, TypeError, OverflowError, OSError, AttributeError):
         return None
 
 
@@ -2621,6 +2630,13 @@ def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[st
         with power_guard_lock:
             shutdown = _power_guard.observe(_latest_power_sample, now, expected_state)
             reason = _power_guard.reason
+            if _latest_power_sample is None and isinstance(data, dict):
+                timestamps = [k for k in ("collectionTime", "dataTime", "timestamp") if data.get(k) is not None]
+                items = data.get("dataList")
+                fields = [str(item.get("key", "")) for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+                power_fields = [key for key in fields if re.search(r'P_|load|consum', key, re.IGNORECASE)]
+                reason += f" | device_time_fields={timestamps}; power_fields={power_fields[:16]}"
+                _power_guard.reason = reason
         print(f"[Power guard] {reason}")
         if shutdown and is_rpi and GPIO_AVAILABLE:
             if press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS):
@@ -2634,6 +2650,43 @@ def _update_pool_hashrate(now: datetime) -> None:
     hs = _wallet_hashrate_hs_cached(_effective_wallet_address(), now=now, max_age_seconds=120)
     with snapshot_lock:
         _shared_snapshot.update({"hashrate_hs": hs, "hashrate_mhs": hs / 1e6 if hs is not None else None})
+
+
+def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum):
+    """Poll live PV and load every idle cycle, including all night.
+
+    This deliberately has no sunset cutoff: it covers at least the requested
+    30 minutes after sunset and cannot stop supervision after a failed OLED.
+    Monitoring never authorizes a new production start outside its window.
+    """
+    global used_quote
+    data = {}
+    try:
+        token = token_future.result(timeout=10)
+        if token:
+            used_quote += 1
+            save_quote_usage(used_quote)
+            data = fetch_current_data(token) or {}
+    except Exception as err:
+        print(f"[Safety monitoring] Solarman read unavailable: {type(err).__name__}")
+    supervise_runtime_by_power(now, "stop", data)
+    dl = data.get("dataList", []) if isinstance(data, dict) else []
+    dl = [item for item in dl if isinstance(item, dict)] if isinstance(dl, list) else []
+    readings = {
+        "battery": _find_value(dl, "BMS_SOC", None),
+        "power": _find_value(dl, "S_P_T", None),
+        **{f"inv_l{i}": _find_value(dl, f"INV_O_P_L{i}", None) for i in (1,2,3)},
+        "inv_lt": _find_value(dl, "INV_O_P_T", None),
+    }
+    readings = {key: value if value is not None and math.isfinite(value) else None
+                for key, value in readings.items()}
+    with snapshot_lock:
+        _shared_snapshot.update(readings)
+        _shared_snapshot.update({"state": "stop", "garage_temp": garage_temp,
+                                 "garage_hum": garage_hum, "monitoring_mode": "idle_safety"})
+    if is_rpi:
+        write_to_display("monitor", readings["battery"], readings["power"], garage_temp, garage_hum)
+    return data
 
 
 def _merge_decision_into_hints(hist: Dict[str, Any], decision: Dict[str, Any], start_guard: Dict[str, Any]) -> Dict[str, Any]:
@@ -3225,7 +3278,7 @@ function renderNotifications(items){
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
 renderNotifications(d.notifications||[]);
 const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-gauge-high'></i> ${t('hashrate')}</div><div class='v'>${d.hashrate_text||'N/A'}</div><div class='pool-meta'><a class='pool-link' href='https://unmineable.com/address/${d.wallet_address}?coin=USDT' target='_blank' rel='noopener noreferrer'>unMineable · USDT <i class='fa-solid fa-arrow-up-right-from-square' aria-hidden='true'></i></a><span class='pool-note'>${currentLang==='hu'?'Pool-adat · késhet':'Pool data · may lag'}</span></div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card metrics-history'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery==null?'N/A':d.battery+'%'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${d.power==null?'N/A':Math.round(d.power)+' W'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-gauge-high'></i> ${t('hashrate')}</div><div class='v'>${d.hashrate_text||'N/A'}</div><div class='pool-meta'><a class='pool-link' href='https://unmineable.com/address/${d.wallet_address}?coin=USDT' target='_blank' rel='noopener noreferrer'>unMineable · USDT <i class='fa-solid fa-arrow-up-right-from-square' aria-hidden='true'></i></a><span class='pool-note'>${currentLang==='hu'?'Pool-adat · késhet':'Pool data · may lag'}</span></div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card metrics-history'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
 const hints=d.historical_hints||{};
 const monthQ=String(hints.month_quality||'neutral');
@@ -3348,6 +3401,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "hashrate_mhs": snap.get("hashrate_mhs"),
         "hashrate_text": _format_hashrate(snap.get("hashrate_hs")),
         "power_guard_reason": _power_guard.reason,
+        "monitoring_mode": snap.get("monitoring_mode", "production_window"),
         "mining_pool": "unMineable",
         "mining_coin": MINING_COIN,
         "mining_algorithm": MINING_ALGORITHM,
@@ -3536,13 +3590,16 @@ def main_loop():
         except Exception:
             garage_data = {'temperature': prev_garage_temp, 'humidity': prev_garage_hum}
 
-        garage_temp = garage_data['temperature']
-        garage_hum = garage_data['humidity']
+        garage_temp = _safe_float(garage_data.get('temperature'), None)
+        garage_hum = _safe_float(garage_data.get('humidity'), None)
+        garage_temp = garage_temp if garage_temp is not None and math.isfinite(garage_temp) else None
+        garage_hum = garage_hum if garage_hum is not None and math.isfinite(garage_hum) else None
+        valid_garage_sample = garage_temp is not None and garage_hum is not None
+        if valid_garage_sample:
+            garage_temp_history.append(garage_temp)
+            garage_hum_history.append(garage_hum)
 
-        garage_temp_history.append(garage_temp)
-        garage_hum_history.append(garage_hum)
-
-        if len(garage_temp_history) == garage_temp_history.maxlen:
+        if valid_garage_sample and len(garage_temp_history) == garage_temp_history.maxlen:
             mean_temp = statistics.mean(garage_temp_history)
             mean_hum = statistics.mean(garage_hum_history)
 
@@ -3633,6 +3690,7 @@ def main_loop():
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
                     _shared_snapshot.update({
+                        "monitoring_mode": "production_window",
                         "battery": battery or 0,
                         "power": power or 0,
                         "state": state or "unknown",
@@ -3669,7 +3727,7 @@ def main_loop():
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
-            print(f"Outside of control window. Sleeping... (Sunrise: {sunrise.strftime('%H:%M')} | Sunset: {sunset.strftime('%H:%M')})")
+            print(f"[Safety monitoring] Outside production window: PV/load polling continues every 5 minutes, at least 30 minutes after sunset and throughout the night. (Sunset stop: {sunset.strftime('%H:%M')})")
             print(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
             (current_condition, sunrise, sunset, clouds,
@@ -3681,33 +3739,15 @@ def main_loop():
                 prev_state = state
                 uptime = now
                 save_prev_state(prev_state, uptime)
-            # Keep live consumption monitoring running overnight too.
-            try:
-                token = fut_token.result(timeout=10)
-                used_quote += 1
-                save_quote_usage(used_quote)
-                idle_data = fetch_current_data(token) if token else {}
-            except Exception:
-                idle_data = {}
-            supervise_runtime_by_power(now, state, idle_data)
-
-            if is_rpi:
-                write_to_display(
-                    state_text="sleep",
-                    soc=0,
-                    solar_power=0,
-                    temperature=garage_temp,
-                    humidity=garage_hum
-                )
+            _idle_monitor_cycle(now, fut_token, garage_temp, garage_hum)
 
             # update snapshot for telegram thread even during idle
             with snapshot_lock:
                 _shared_snapshot.update({
-                    "battery": 0, "power": 0, "state": state or "stop",
+                    "state": state or "stop",
                     "current_condition": current_condition or "unknown",
                     "sunrise": sunrise, "sunset": sunset, "clouds": clouds or 0,
-                    "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0,
-                    "inv_l1": 0, "inv_l2": 0, "inv_l3": 0, "inv_lt": 0,
+                    "garage_temp": garage_temp, "garage_hum": garage_hum,
                     "historical_hints": _idle_historical_hints()
                 })
 
