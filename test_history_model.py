@@ -134,6 +134,9 @@ class HistoryModelTests(unittest.TestCase):
              patch.object(solar,'_last_production_start_at',None):
             result = solar.check_crypto_production_conditions(data,'','','')
             self.assertEqual(result[2],'production')
+            data['dataList'] = [i for i in data['dataList'] if i['key'] != 'LOAD_P_T']
+            result = solar.check_crypto_production_conditions(data,'','','')
+            self.assertEqual(result[2],'production')
             data['collectionTime'] = (now-timedelta(minutes=10)).timestamp()
             result = solar.check_crypto_production_conditions(data,'','','')
             self.assertEqual(result[2],'stop')

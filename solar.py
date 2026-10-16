@@ -153,11 +153,17 @@ _shared_snapshot = {
 
 def _idle_historical_hints() -> Dict[str, Any]:
     """Reset hint payload during sleep/idle so /now does not show stale decisions."""
+    month = datetime.now(tz=budapest_tz).month
+    profile = ((historical_profile or {}).get("months") or {}).get(month, {})
     return {
+        "history_source": "solarman_json",
+        "history_days": profile.get("days", 0),
+        "history_samples": profile.get("samples", 0),
+        "history_coverage": min(1.0, profile.get("days", 0) / 20),
         "month_quality": "neutral",
         "early_start_soc": 0,
-        "min_stop_soc": 0,
-        "late_day_reserve_soc": 0,
+        "min_stop_soc": BATTERY_FLOOR_SOC,
+        "late_day_reserve_soc": HARD_AFTERNOON_STOP_SOC,
         "should_preserve_battery": False,
         "headroom_good": False,
         "start_guard_allow": False,
@@ -1423,20 +1429,45 @@ def _extract_power_sample(data: Dict[str, Any], now: datetime) -> Optional[Power
             if at.tzinfo is None:
                 at = at.replace(tzinfo=budapest_tz)
         dl = data.get("dataList", [])
-        total = _find_first_value(dl, ["LOAD_P_T", "C_P_T", "P_LOAD", "E_Puse_t1"], float("nan"))
-        if not math.isfinite(total):
-            for item in dl:
-                if str(item.get("name", "")).strip().lower() in {"total consumption power", "consumption power", "total load power", "load power"}:
-                    total = float(item.get("value")) * (1000 if str(item.get("unit", "")).lower() == "kw" else 1)
+        if not isinstance(dl, list):
+            return None
+
+        def watts(keys, names=()):
+            # Explicit keys take precedence; never reinterpret an energy counter.
+            for key in keys:
+                item = next((i for i in dl if isinstance(i, dict) and i.get("key") == key), None)
+                if item is not None:
                     break
-        phases = [_find_first_value(dl, [f"LOAD_P_L{i}", f"C_P_L{i}", f"INV_O_P_L{i}"], float("nan")) for i in (1, 2, 3)]
+            else:
+                item = next((i for i in dl if isinstance(i, dict) and
+                             str(i.get("name", "")).strip().lower() in names), None)
+            if item is None:
+                return None
+            unit = str(item.get("unit") or "W").strip().lower()
+            if unit not in {"w", "kw"}:
+                raise ValueError("Power field has non-power units")
+            return float(item["value"]) * (1000 if unit == "kw" else 1)
+
+        total = watts(["LOAD_P_T", "C_P_T", "P_LOAD"],
+                      {"total consumption power", "consumption power", "total load power", "load power"})
+        source = "consumption"
+        if total is None:
+            # This inverter exposes output power instead of a dedicated load
+            # register. Keep the total and all phases in the same meter domain.
+            total = watts(["INV_O_P_T"])
+            phases = [watts([f"INV_O_P_L{i}"]) for i in (1, 2, 3)]
+            source = "inverter_output"
+        else:
+            phases = [watts([f"LOAD_P_L{i}", f"C_P_L{i}", f"INV_O_P_L{i}"]) for i in (1, 2, 3)]
+        if any(v is None for v in [total] + phases):
+            return None
         if not all(math.isfinite(v) and v >= 0 for v in [total] + phases):
             return None
         # Inverter outputs are a usable proxy only when they account for the
         # measured load. Do not classify unrelated grid-side house loads.
         if abs(total - sum(phases)) > max(100, total * 0.1):
             return None
-        return PowerSample(at, total, *phases)
+        return PowerSample(at, total, *phases, source=source)
     except (ValueError, TypeError, OverflowError, OSError, AttributeError):
         return None
 
@@ -1455,7 +1486,7 @@ def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[st
                 fields = [str(item.get("key", "")) for item in items if isinstance(item, dict)] if isinstance(items, list) else []
                 power_fields = [key for key in fields if re.search(r'P_|load|consum', key, re.IGNORECASE)]
                 reason += f" | device_time_fields={timestamps}; power_fields={power_fields[:16]}"
-                _power_guard.reason = reason
+                # Field diagnostics belong in logs, not in the dashboard status.
         print(f"[Power guard] {reason}")
         if shutdown and is_rpi and GPIO_AVAILABLE:
             if press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS):
@@ -1705,39 +1736,160 @@ def _weather_icon(condition: str) -> str:
 
 
 DASHBOARD_HTML = r"""
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Solar Mining</title>
-<link rel="icon" href="/favicon.ico"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
-<style>
-:root{--bg:#101625;--panel:#1a2335;--text:#e5edf8;--muted:#a6b4cc;--border:#34425b;--accent:#ebba57}body[data-theme=light]{--bg:#f0f4fa;--panel:white;--text:#18243a;--muted:#52617a;--border:#ccd5e2}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,sans-serif}.wrap{max-width:1440px;margin:auto;padding:28px}header,.tools,.actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}header{justify-content:space-between;margin-bottom:24px}h1{font-size:28px;margin:0}h2{font-size:19px;margin:0 0 10px}p{color:var(--muted);line-height:1.5}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:14px;margin:18px 0}.card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:20px}.label{color:var(--muted);font-size:13px}.value{font-weight:700;font-size:25px;margin:9px 0}.pool-link,.pool-link:visited{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--border);border-radius:999px;padding:5px 9px;color:var(--text);font-size:12px;text-decoration:none}.pool-link:hover{border-color:var(--accent)}small{color:var(--muted)}button,input,.button{border:1px solid var(--border);border-radius:9px;padding:9px 12px;color:var(--text);background:var(--panel);font:inherit}button,.button{cursor:pointer;text-decoration:none}button:hover,.button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:wait}button.danger{border-color:#dd7a7a}.charts{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-top:18px}.chart{height:350px;position:relative}.tools label{display:flex;gap:6px;align-items:center}#message{min-height:24px;margin-top:10px}#budget{white-space:pre-line}.source{margin-top:24px}.controls{margin:18px 0}@media(max-width:800px){.charts{grid-template-columns:1fr}.wrap{padding:16px}.tools label{flex-wrap:wrap}h1{font-size:23px}}
-</style></head><body data-theme="dark"><main class="wrap"><header><h1>☀ Solar Mining</h1><div class="tools"><button id="lang">HU</button><button id="theme">Theme</button></div></header>
-<p id="sourceNote">Historical learning uses the provided solarman_json files only. Live readings are not recorded.</p>
-<section id="metrics" class="metrics"></section><section class="card"><h2 id="budgetTitle">Energy plan</h2><div id="budget">Waiting for live readings…</div><p id="decision"></p></section>
-<section class="controls"><div class="actions"><button data-action="start">Start miner</button><button data-action="stop">Stop miner</button><button class="danger" data-action="force_stop">Force stop</button></div><div id="message" role="status"></div></section>
-<section class="card source"><h2 id="historyTitle">Provided Solarman history</h2><p id="historyNote">Exported PV, household consumption and battery SOC. No historical miner state or phase readings are inferred.</p><div class="tools"><label>From <input id="from" type="date"></label><label>To <input id="to" type="date"></label><button id="apply">Apply</button><a class="button" href="/api/history/download" id="download">Download history</a></div><p id="count"></p><div class="charts"><div class="chart"><canvas id="powerChart"></canvas></div><div class="chart"><canvas id="batteryChart"></canvas></div></div></section></main>
-<script>
-let currentLang='en',range={},powerChart,batteryChart;
-const messages={en:{state:'Controller state',battery:'Battery',pv:'Live PV',hash:'Pool hashrate',load:'Live inverter output',weather:'Weather',note:'Historical learning uses the provided solarman_json files only. Live readings are not recorded.',history:'Provided Solarman history',hint:'Exported PV, household consumption and battery SOC. No historical miner state or phase readings are inferred.',budget:'Energy plan',waiting:'Planning is inactive or live data is unavailable.',lag:'Pool data may lag; display only.',samples:'historical measurements',days:'seasonal days',minimum:'Projected minimum SOC',end:'Projected ending SOC',pvwh:'Expected PV energy',loadwh:'Expected total demand',coverage:'Historical coverage',phase:'Power safety',download:'Download history',apply:'Apply'},hu:{state:'Vezérlőállapot',battery:'Akkumulátor',pv:'Élő PV',hash:'Pool hashráta',load:'Élő inverterkimenet',weather:'Időjárás',note:'A tanulás csak a megadott solarman_json fájlokat használja. Élő mérést nem rögzítünk.',history:'Megadott Solarman előzmények',hint:'Exportált PV, teljes fogyasztás és akkumulátortöltöttség. Korábbi gépállapotot vagy fázisterhelést nem következtetünk ki.',budget:'Energiaterv',waiting:'A tervezés inaktív vagy nincs élő adat.',lag:'A pool adata késhet; csak kijelzés.',samples:'történeti mérés',days:'szezonális nap',minimum:'Becsült minimum SOC',end:'Becsült záró SOC',pvwh:'Várható PV energia',loadwh:'Várható teljes fogyasztás',coverage:'Történeti lefedettség',phase:'Fogyasztási védelem',download:'Előzmények letöltése',apply:'Alkalmaz'}};
-const t=k=>messages[currentLang][k]||k;
-const text=(id,value)=>{document.getElementById(id).textContent=value;};
-const number=(v,unit='')=>v==null||!Number.isFinite(Number(v))?'N/A':Number(v).toFixed(1)+unit;
-function metric(label,value){const card=document.createElement('div');card.className='card';const l=document.createElement('div');l.className='label';l.textContent=label;const v=document.createElement('div');v.className='value';v.textContent=value;card.append(l,v);return card;}
-function render(data){
- text('sourceNote',t('note'));text('historyTitle',t('history'));text('historyNote',t('hint'));text('budgetTitle',t('budget'));text('download',t('download'));text('apply',t('apply'));
- const metrics=document.getElementById('metrics');metrics.replaceChildren(metric(t('state'),data.state),metric(t('battery'),number(data.battery,'%')),metric(t('pv'),number(data.power,' W')));
- const pool=metric(t('hash'),data.hashrate_text||'N/A');const link=document.createElement('a');link.className='pool-link';link.href='https://unmineable.com/address/'+encodeURIComponent(data.wallet_address)+'?coin=USDT';link.target='_blank';link.rel='noopener noreferrer';link.textContent='unMineable · USDT ↗';const note=document.createElement('p');const small=document.createElement('small');small.textContent=t('lag');note.append(small);pool.append(link,note);metrics.append(pool,metric(t('load'),number(data.inv_lt,' W')),metric(t('weather'),data.current_condition||'N/A'));
- const hints=data.historical_hints||{},budget=hints.energy_budget;
- text('budget',budget?[t('minimum')+': '+number(budget.minimum_soc,'%'),t('end')+': '+number(budget.end_soc,'%'),t('pvwh')+': '+number(budget.expected_pv_wh,' Wh'),t('loadwh')+': '+number(budget.expected_load_wh,' Wh'),t('coverage')+': '+number((hints.history_coverage||0)*100,'%')+' · '+(hints.history_days||0)+' '+t('days')].join('\n'):t('waiting'));
- text('decision',(hints.decision_summary||'')+'\n'+t('phase')+': '+(data.power_guard_reason||''));
- const hist=data.history||[];const step=Math.max(1,Math.ceil(hist.length/2000));const rows=hist.filter((_,i)=>i%step===0);text('count',data.history_count+' '+t('samples')+' · '+data.history_source);
- if(!powerChart){const options={responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{labels:{color:'#879ab5'}}},scales:{x:{ticks:{maxTicksLimit:8,color:'#879ab5'}},y:{ticks:{color:'#879ab5'}}}};powerChart=new Chart(document.getElementById('powerChart'),{type:'line',data:{datasets:[]},options});batteryChart=new Chart(document.getElementById('batteryChart'),{type:'line',data:{datasets:[]},options:{...options,scales:{...options.scales,y:{min:0,max:100,ticks:{color:'#879ab5'}}}}});}
- const labels=rows.map(r=>r.ts.slice(0,16).replace('T',' '));const series=(label,key,color)=>({label,data:rows.map(r=>r[key]),borderColor:color,pointRadius:0,borderWidth:1.5});powerChart.data={labels,datasets:[series('PV (W)','power','#e8b957'),series(currentLang==='hu'?'Fogyasztás (W)':'Consumption (W)','consumption','#69b4f0')]};batteryChart.data={labels,datasets:[series('SOC (%)','battery','#72cead')]};powerChart.update();batteryChart.update();
-}
-async function pull(){try{const r=await fetch('/api/snapshot?'+new URLSearchParams(range));if(!r.ok)throw Error('HTTP '+r.status);render(await r.json());}catch(e){text('message',e.message);}}
-document.getElementById('apply').onclick=()=>{range={from:document.getElementById('from').value,to:document.getElementById('to').value};pull();};document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};document.getElementById('lang').onclick=()=>{currentLang=currentLang==='en'?'hu':'en';text('lang',currentLang==='en'?'HU':'EN');pull();};
-for(const button of document.querySelectorAll('[data-action]'))button.onclick=async()=>{button.disabled=true;try{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:button.dataset.action})});const d=await r.json();text('message',d.message);}catch(e){text('message',e.message);}finally{button.disabled=false;}};
-pull();setInterval(pull,10000);
-</script></body></html>
 
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Solar Mining Control</title>
+<link rel="icon" type="image/png" href="/solarmining_logo.png" />
+<link rel="apple-touch-icon" href="/solarmining_logo.png" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0b1220;--bg2:#182845;--card:rgba(20,31,56,.72);--txt:#e9eefc;--muted:#9fb0d0;--ok:#47d16c;--warn:#f2b84b;--danger:#ff6b6b;--input:#1f2c48;--border:rgba(255,255,255,.2)}
+[data-theme="light"]{--bg:#eef3ff;--bg2:#d9e8ff;--card:rgba(255,255,255,.85);--txt:#111827;--muted:#4b5563;--input:#ffffff;--border:rgba(17,24,39,.15)}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+.wrap{padding:10px 18px 16px;max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
+.logo-wrap{display:flex;justify-content:center;padding-top:0;margin:-8px 0 -14px;line-height:0}
+.logo{display:block;max-width:min(300px,72vw);height:auto;filter:drop-shadow(0 8px 18px rgba(0,0,0,.28));}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.title{display:flex;align-items:center;gap:10px;margin:0;font-size:clamp(1.35rem,2.3vw,2rem)}
+.panel{background:var(--card);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:16px;padding:14px}
+.grid{display:grid;gap:12px}
+.metrics-grid{grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px}
+.metrics-grid .card.metrics-history{grid-column:span 2}
+@media(max-width:1280px){.metrics-grid{grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px}.metrics-grid .card.metrics-history{grid-column:span 1}}
+@media(max-width:760px){.metrics-grid{grid-template-columns:repeat(2,minmax(150px,1fr));gap:10px}}
+.card{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:14px;padding:14px;min-width:0}
+.metrics-grid .card{display:flex;flex-direction:column;justify-content:space-between;min-height:102px}.k{color:var(--muted);font-size:.88rem;margin-bottom:8px;display:flex;align-items:center;gap:8px}.v{font-size:clamp(1.08rem,1.25vw,1.35rem);font-weight:700;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:2.5em}
+.k i{opacity:.95}
+.chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.chart-title{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8px}
+.chart-sub{font-size:.78rem;color:var(--muted)}
+.toolbar{display:grid;grid-template-columns:2fr 1fr;gap:12px;align-items:end}
+.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.field{display:flex;flex-direction:column;gap:6px}
+.field label{font-size:.82rem;color:var(--muted)}
+.field input,.btn{border-radius:10px;border:1px solid var(--border);padding:10px 12px;font-size:.95rem}
+.field input{background:var(--input);color:var(--txt)}
+input[type="date"]{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.04));border:1px solid rgba(148,163,184,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 8px 18px rgba(2,6,23,.22);font-weight:700;letter-spacing:.02em;color:var(--txt);min-height:42px;color-scheme:dark;padding-right:36px}
+[data-theme="light"] input[type="date"]{background:linear-gradient(180deg,#ffffff,#eef4ff);border-color:rgba(71,85,105,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 6px 14px rgba(15,23,42,.08);color-scheme:light}
+input[type="date"]:hover{border-color:rgba(96,165,250,.75)}
+input[type="date"]:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25),0 10px 22px rgba(59,130,246,.2)}
+input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
+.field-date{position:relative}
+.field-date .calendar-icon{position:absolute;right:12px;bottom:12px;color:rgba(226,232,240,.95);font-size:.92rem;pointer-events:none;text-shadow:0 1px 2px rgba(2,6,23,.65)}
+[data-theme="light"] .field-date .calendar-icon{color:#334155;text-shadow:none}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{color:#fff;cursor:pointer;background:transparent;padding:7px 11px;font-size:.84rem;min-height:34px;line-height:1.2;transition:transform .15s ease,box-shadow .15s ease,opacity .15s ease}
+.btn:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(2,6,23,.24)}
+.btn:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none}
+.btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}.btn.ghost{background:transparent;color:var(--txt)}
+.toolbar-actions{justify-content:flex-end;align-items:center}
+.range-shortcuts{display:flex;gap:6px;flex-wrap:wrap}
+.range-shortcuts .btn{font-size:.8rem;min-height:30px;padding:6px 10px}
+#actionResult{margin-top:8px;min-height:22px;padding:6px 10px;border-radius:10px;border:1px solid transparent;display:none}
+#actionResult.show{display:flex;align-items:center;gap:8px}
+#actionResult.ok{background:rgba(34,197,94,.14);border-color:rgba(34,197,94,.42);color:#86efac}
+#actionResult.warn{background:rgba(245,158,11,.14);border-color:rgba(245,158,11,.42);color:#facc15}
+#actionResult.err{background:rgba(239,68,68,.14);border-color:rgba(239,68,68,.45);color:#fda4af}
+[data-theme="light"] #actionResult.ok{color:#166534}
+[data-theme="light"] #actionResult.warn{color:#92400e}
+[data-theme="light"] #actionResult.err{color:#991b1b}
+.notice-panel{margin-top:8px}
+.notice-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.notice-list{display:grid;gap:8px;max-height:200px;overflow:auto;padding-right:4px}
+.notice-item{border:1px solid var(--border);border-radius:10px;padding:8px 10px;background:rgba(255,255,255,.03)}
+.notice-item.warn{border-color:rgba(245,158,11,.5)}
+.notice-item.error{border-color:rgba(239,68,68,.5)}
+.notice-item.success{border-color:rgba(34,197,94,.48)}
+.notice-meta{font-size:.74rem;color:var(--muted);margin-bottom:4px}
+.notice-empty{font-size:.82rem;color:var(--muted);padding:10px;border:1px dashed var(--border);border-radius:10px}
+.charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.chart-card{height:360px;display:flex;flex-direction:column;overflow:hidden}
+.chart-card canvas{width:100% !important;flex:1 1 auto;min-height:0}
+.hints-panel{padding:16px}
+.hints-wrap{width:min(1280px,100%);margin:0 auto;display:grid;grid-template-columns:repeat(2,minmax(340px,1fr));gap:16px;align-items:start}
+.hints-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.hint-section-title{margin:0 0 10px;font-size:.86rem;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);font-weight:700;text-align:center}
+.hint-card{background:linear-gradient(165deg,rgba(99,102,241,.18),rgba(14,165,233,.12));border:1px solid var(--border);border-radius:16px;padding:14px;box-shadow:0 12px 26px rgba(2,6,23,.2);min-height:112px;display:flex;flex-direction:column;justify-content:center}
+.hint-title{font-size:.8rem;color:var(--muted);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.hint-value{font-size:1.15rem;font-weight:800;line-height:1.2}
+.hint-sub{margin-top:6px;color:var(--muted);font-size:.8rem}
+.decision-card{margin-top:12px;grid-column:1 / -1;min-height:170px;align-items:flex-start}
+.hint-list{margin:6px 0 8px 16px;padding:0;color:var(--txt);font-size:.84rem;line-height:1.35}
+.hint-list li{margin:2px 0}
+@media(max-width:1100px){.charts{grid-template-columns:1fr}.hints-wrap{grid-template-columns:1fr}}
+@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:320px}.hints-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.hints-grid{grid-template-columns:1fr}}
+.pool-meta{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:12px}
+.pool-link,.pool-link:visited{display:inline-flex;align-items:center;gap:7px;color:var(--txt);text-decoration:none;border:1px solid var(--border,#46516b);border-radius:999px;padding:5px 10px;font-size:12px;font-weight:600;line-height:1.4}
+.pool-link:hover,.pool-link:focus-visible{color:#e8b957;border-color:#e8b957;outline-offset:3px}
+.pool-note{font-size:11px;opacity:.7}
+</style></head>
+<body data-theme="dark"><div class="wrap">
+<div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
+<div class="top"><h2 id="dashTitle" class="title"><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
+<div class="actions"><button id="lang" class="btn ghost"><i class="fa-solid fa-earth-europe"></i> HU</button><button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button><button id="downloadHistory" class="btn ghost"><i class="fa-solid fa-download"></i> History JSON</button></div></div>
+<div class="grid metrics-grid" id="metrics"></div>
+<div class="panel hints-panel"><div class="hints-wrap" id="historyHints"></div></div>
+<div class="panel toolbar"><div class="filters">
+<div class="field field-date"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="date" /><i class="fa-solid fa-calendar-days calendar-icon"></i></div>
+<div class="field field-date"><label id="lblTo" for="toDate">To</label><input id="toDate" type="date" /><i class="fa-solid fa-calendar-days calendar-icon"></i></div>
+<div class="actions"><div class="range-shortcuts"><button class="btn ghost" id="shortcutDay"><i class="fa-solid fa-clock"></i> Last Day</button><button class="btn ghost" id="shortcutWeek"><i class="fa-solid fa-calendar-week"></i> Last Week</button><button class="btn ghost" id="shortcutMonth"><i class="fa-solid fa-calendar-days"></i> Last Month</button></div><button class="btn ok" id="applyRange"><i class="fa-solid fa-filter"></i> Apply range</button></div>
+</div><div class="actions toolbar-actions">
+<button id="btnStart" class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
+<button id="btnStop" class="btn warn" onclick="act('stop')"><i class="fa-solid fa-stop"></i> Stop miner</button>
+<button id="btnForce" class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
+</div></div>
+<div id="actionResult" class="k"></div>
+<div class="panel notice-panel"><div class="notice-head"><div id="notifTitle" class="chart-title"><i class="fa-solid fa-bell"></i> Notifications</div></div><div id="notifList" class="notice-list"></div></div>
+<div class="charts"><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-solar-panel"></i> <span id="powerChartTitle"></span></div><div id="powerChartSub" class="chart-sub"></div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-bolt"></i> <span id="consumptionChartTitle"></span></div><div id="consumptionChartSub" class="chart-sub"></div></div><canvas id="consumptionChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> <span id="batteryChartTitle"></span></div><div id="batteryChartSub" class="chart-sub"></div></div><canvas id="batteryChart"></canvas></div></div></div><script>
+let currentLang=localStorage.getItem('solar-lang')||'en',currentRange={},lastData,charts={};
+const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Power safety',decision:'Decision',minimum:'Projected minimum SOC',end:'Projected ending SOC',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Seasonal coverage',floor:'Protected SOC floor',reserve:'Evening reserve',source:'Provided solarman_json history · live readings are not recorded',load:'Consumption',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Fogyasztási védelem',decision:'Döntés',minimum:'Becsült minimum SOC',end:'Becsült záró SOC',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Szezonális lefedettség',floor:'Védett SOC minimum',reserve:'Esti tartalék',source:'Megadott solarman_json előzmények · élő mérést nem rögzítünk',load:'Fogyasztás',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
+const t=k=>words[currentLang][k]||k;
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num=(v,u='',digits=0)=>v==null||!Number.isFinite(Number(v))?'—':Number(v).toFixed(digits)+u;
+const icon=(name)=>`<i class="fa-solid ${name}" aria-hidden="true"></i>`;
+const card=(label,value,i='fa-circle-info',kind='card')=>`<div class="${kind}"><div class="${kind==='card'?'k':'hint-title'}">${icon(i)} ${esc(label)}</div><div class="${kind==='card'?'v':'hint-value'}">${esc(value)}</div></div>`;
+function dateText(v){return v?new Date(v).toLocaleString(currentLang==='hu'?'hu-HU':'en-GB'):'—';}
+function render(d){lastData=d;
+ document.documentElement.lang=currentLang;
+ document.getElementById('dashTitle').innerHTML=icon('fa-solar-panel')+' '+t('title');
+ document.getElementById('lang').innerHTML=icon('fa-earth-europe')+' '+(currentLang==='en'?'HU':'EN');
+ const texts={downloadHistory:['download','fa-download'],applyRange:['apply','fa-filter'],shortcutDay:['day','fa-clock'],shortcutWeek:['week','fa-calendar-week'],shortcutMonth:['month','fa-calendar-days'],btnStart:['start','fa-play'],btnStop:['stop','fa-stop'],btnForce:['force','fa-power-off']};
+ for(const [id,[key,i]] of Object.entries(texts))document.getElementById(id).innerHTML=icon(i)+' '+esc(t(key));
+ document.getElementById('lblFrom').textContent=t('from');document.getElementById('lblTo').textContent=t('to');document.getElementById('notifTitle').innerHTML=icon('fa-bell')+' '+t('notices');
+ const state=d.state==='production'?(currentLang==='hu'?'termelés':'production'):d.state==='stop'?(currentLang==='hu'?'leállítva':'stopped'):t('unknown');
+ let metrics=card(t('state'),state,'fa-toggle-on')+card(t('battery'),num(d.battery,'%'),'fa-battery-half')+card(t('pv'),num(d.power,' W'),'fa-solar-panel');
+ metrics+=`<div class="card"><div class="k">${icon('fa-gauge-high')} ${t('hash')}</div><div class="v">${esc(d.hashrate_text||'N/A')}</div><div class="pool-meta"><a class="pool-link" href="https://unmineable.com/address/${encodeURIComponent(d.wallet_address)}?coin=USDT" target="_blank" rel="noopener noreferrer">unMineable · USDT ${icon('fa-arrow-up-right-from-square')}</a><span class="pool-note">${t('lag')}</span></div></div>`;
+ metrics+=card(t('weather'),d.current_condition||t('unknown'),'fa-cloud-sun')+card(t('sunrise'),(d.sunrise||'').slice(11,16)||'—','fa-sun')+card(t('sunset'),(d.sunset||'').slice(11,16)||'—','fa-moon')+card(t('clouds'),num(d.clouds,'%'),'fa-cloud')+card(t('history'),num(d.history_count),'fa-clock-rotate-left');
+ document.getElementById('metrics').innerHTML=metrics;
+ const hints=d.historical_hints||{},b=hints.energy_budget;
+ const budget=b?card(t('minimum'),num(b.minimum_soc,'%'),'fa-battery-quarter','hint-card')+card(t('end'),num(b.end_soc,'%'),'fa-battery-full','hint-card')+card(t('pvwh'),num(b.expected_pv_wh,' Wh'),'fa-solar-panel','hint-card')+card(t('loadwh'),num(b.expected_load_wh,' Wh'),'fa-bolt','hint-card')+card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card'):card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+`<div class="hint-card decision-card">${esc(d.monitoring_mode==='idle_safety'?t('idle'):t('waiting'))}</div>`;
+ const phase=[1,2,3].map(i=>card('L'+i,num(d['inv_l'+i],' W'),'fa-bolt','hint-card')).join('')+card(t('inverter'),num(d.inv_lt,' W'),'fa-gauge-high','hint-card')+card(t('temp'),num(d.garage_temp,' °C',1),'fa-temperature-half','hint-card')+card(t('hum'),num(d.garage_hum,'%'),'fa-droplet','hint-card');
+ document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${t('plan')}</h3><div class="hints-grid">${budget}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div><div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):d.power_measurement_source==='consumption'?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
+ const notices=Array.isArray(d.notifications)?d.notifications:[];
+ document.getElementById('notifList').innerHTML=notices.length?notices.slice(0,5).map(n=>`<div class="notice-item ${['info','warn','error','success'].includes(n.level)?n.level:'info'}"><div class="notice-meta">${esc(dateText(n.ts))}</div><div>${esc(n.message)}</div></div>`).join(''):`<div class="notice-empty">${t('empty')}</div>`;
+ const h=d.history||[],step=Math.max(1,Math.ceil(h.length/2000)),rows=h.filter((_,i)=>i%step===0);
+ for(const [id,key,title,color,unit] of [['powerChart','power',t('pv'),'#4ade80','W'],['consumptionChart','consumption',t('load'),'#60a5fa','W'],['batteryChart','battery',t('battery'),'#a78bfa','%']]){
+  document.getElementById(id+'Title').textContent=title;document.getElementById(id+'Sub').textContent=`solarman_json · ${rows.length}/${h.length} ${t('samples')}`;
+  if(!charts[id])charts[id]=new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[]},options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'nearest',intersect:false,axis:'x'},plugins:{legend:{labels:{color:'#94a3b8'}},tooltip:{backgroundColor:'rgba(14,23,41,.95)',padding:12,cornerRadius:12}},scales:{x:{ticks:{maxTicksLimit:8,color:'#94a3b8'}},y:{min:0,...(key==='battery'?{max:100}:{}),ticks:{color:'#94a3b8'}}}}});
+  charts[id].data={labels:rows.map(r=>dateText(r.ts)),datasets:[{label:title+' ('+unit+')',data:rows.map(r=>r[key]),borderColor:color,backgroundColor:color,pointRadius:0,pointHoverRadius:5,borderWidth:2,tension:.2}]};charts[id].update();
+ }
+}
+async function pull(){try{const r=await fetch('/api/snapshot?'+new URLSearchParams(currentRange));if(!r.ok)throw Error('HTTP '+r.status);render(await r.json());}catch(e){showActionResult(String(e),'err');}}
+function showActionResult(message,level='warn'){const el=document.getElementById('actionResult');el.className='k show '+level;el.textContent=message;}
+async function act(action){const buttons=['btnStart','btnStop','btnForce'].map(id=>document.getElementById(id));buttons.forEach(b=>b.disabled=true);try{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});const d=await r.json();showActionResult(d.message,d.ok?'ok':'err');}catch(e){showActionResult(String(e),'err');}finally{buttons.forEach(b=>b.disabled=false);}}
+function setRangeDays(days){const rows=lastData?.history||[];const latest=rows.length?rows[rows.length-1].ts.slice(0,10):new Date().toISOString().slice(0,10);const to=new Date(latest+'T12:00:00Z'),from=new Date(to);from.setUTCDate(to.getUTCDate()-days);document.getElementById('fromDate').value=from.toISOString().slice(0,10);document.getElementById('toDate').value=latest;applyRange();}
+function applyRange(){currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};pull();}
+document.getElementById('applyRange').onclick=applyRange;for(const [id,days] of [['shortcutDay',1],['shortcutWeek',7],['shortcutMonth',30]])document.getElementById(id).onclick=()=>setRangeDays(days);
+document.getElementById('downloadHistory').onclick=()=>{window.location.href='/api/history/download';};
+document.body.dataset.theme=localStorage.getItem('solar-theme')||'dark';document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';localStorage.setItem('solar-theme',document.body.dataset.theme);};document.getElementById('lang').onclick=()=>{currentLang=currentLang==='en'?'hu':'en';localStorage.setItem('solar-lang',currentLang);if(lastData)render(lastData);};
+pull();setInterval(pull,10000);
+
+</script></body></html>
 """
 
 
@@ -1783,6 +1935,11 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "battery": snap.get("battery", 0),
         "power": snap.get("power"),
         "inv_lt": snap.get("inv_lt"),
+        "inv_l1": snap.get("inv_l1"),
+        "inv_l2": snap.get("inv_l2"),
+        "inv_l3": snap.get("inv_l3"),
+        "garage_temp": snap.get("garage_temp"),
+        "garage_hum": snap.get("garage_hum"),
         "state": snap.get("state", "unknown"),
         "current_condition": snap.get("current_condition", "unknown"),
         "weather_icon": _weather_icon(snap.get("current_condition", "")),
@@ -1791,6 +1948,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "hashrate_mhs": snap.get("hashrate_mhs"),
         "hashrate_text": _format_hashrate(snap.get("hashrate_hs")),
         "power_guard_reason": _power_guard.reason,
+        "power_measurement_source": _latest_power_sample.source if _latest_power_sample else None,
         "monitoring_mode": snap.get("monitoring_mode", "production_window"),
         "solarman_polled_at": snap.get("solarman_polled_at"),
         "solarman_poll_interval_seconds": snap.get("solarman_poll_interval_seconds"),

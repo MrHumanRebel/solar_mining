@@ -12,6 +12,7 @@ class PowerSample:
     l1: float
     l2: float
     l3: float
+    source: str = "consumption"
 
 
 class MinerPowerGuard:
@@ -24,6 +25,7 @@ class MinerPowerGuard:
     def __init__(self):
         self.off = deque(maxlen=3)
         self.last_at = None
+        self.source = None
         self.started = None
         self.baseline = None
         self.signature = None
@@ -45,6 +47,9 @@ class MinerPowerGuard:
     def command_start(self, sample, now):
         self.disarm("Start has no stable off baseline")
         if not self.fresh(sample, now):
+            return
+        if any(s.source != sample.source for s in self.off):
+            self.off.clear()
             return
         if not self.off or sample.at > self.off[-1].at:
             self.off.append(sample)
@@ -69,6 +74,10 @@ class MinerPowerGuard:
             return False
         if self.last_at is not None and sample.at <= self.last_at:
             return False
+        if self.source is not None and self.source != sample.source:
+            self.disarm("Power meter source changed; start identification lost")
+            self.off.clear()
+        self.source = sample.source
         slack = 120 if self.poll_interval_seconds == 300 else 360
         if self.last_at and (sample.at - self.last_at).total_seconds() > self.poll_interval_seconds + slack:
             self.disarm("Measurement gap; start identification lost")
