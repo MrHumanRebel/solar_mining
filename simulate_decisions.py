@@ -13,7 +13,7 @@ _DEFAULT_ENV = {
     "MY_LOCATION_LAT": "47.4979", "MY_LOCATION_LON": "19.0402", "MY_APP_ID": "simulate",
     "MY_APP_SECRET": "simulate", "MY_EMAIL": "simulate", "MY_PASSWORD": "simulate",
     "MY_DEVICE_SN": "simulate", "MY_QUOTE_FILE": "quote_sim.json", "MY_STATE_FILE": "state_sim.json",
-    "MY_SOLARMAN_FILE": "solarman_sim.json", "WALLET_ADDRESS": "R" + "1" * 33,
+    "MY_SOLARMAN_FILE": "solarman_sim.json", "WALLET_ADDRESS": "0xaedac36dcfc956864fcc03ec2ef256facaefd991",
 }
 for key, value in _DEFAULT_ENV.items():
     os.environ.setdefault(key, value)
