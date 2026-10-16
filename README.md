@@ -54,6 +54,13 @@ there is at most one automatic shutdown press per witnessed run. Aggregate
 meters cannot uniquely distinguish every oven/hob combination from a miner.
 The guard retains only bounded working samples in memory, never a JSON history.
 
+If the inverter exposes no dedicated load register, the guard accepts
+`INV_O_P_T` together with all three `INV_O_P_L1/L2/L3` readings when their sum
+matches the total. The dashboard labels this source as inverter output, which
+does not establish consumption of grid-side appliances. A change between meter
+sources discards the learned identity. W and kW are normalized; energy counters
+such as `E_Puse_t1` are never interpreted as instantaneous power.
+
 Solarman authentication and device polling run every five minutes between
 astronomical sunrise and sunset, and once every 30 minutes overnight. Failed
 attempts also consume a polling slot. Dashboard refresh, sensors and pool
@@ -107,7 +114,7 @@ skipped off the Pi. The tests use simulation defaults and mock external services
 do not launch the live main loop with production credentials for a replay.
 
 ```sh
-python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool
+python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields
 python simulate_decisions.py --history-dir solarman_json
 python simulate_decisions.py --history-dir solarman_json --date 2026-10-16
 ```
