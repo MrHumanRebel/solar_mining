@@ -1,4 +1,5 @@
 import requests
+from miner_power_guard import MinerPowerGuard, PowerSample
 import hashlib
 import json
 import time
@@ -65,12 +66,7 @@ PV_COVERAGE_RATIO_STOP = float(os.getenv("MY_PV_COVERAGE_RATIO_STOP", "0.9"))
 PV_COVERAGE_RATIO_START = float(os.getenv("MY_PV_COVERAGE_RATIO_START", "0.75"))
 MIN_RUN_MINUTES = int(os.getenv("MY_MIN_RUN_MINUTES", "18"))
 MIN_RESTART_DELAY_MINUTES = int(os.getenv("MY_MIN_RESTART_DELAY_MINUTES", "10"))
-MINER_STOP_FORCE_CONSECUTIVE = max(1, int(os.getenv("MY_MINER_STOP_FORCE_CONSECUTIVE", "2")))
 MINER_STOP_FORCE_COOLDOWN_MINUTES = max(1, int(os.getenv("MY_MINER_STOP_FORCE_COOLDOWN_MINUTES", "20")))
-HASHRATE_CHECK_DELAY_MINUTES = max(1, int(os.getenv("MY_HASHRATE_CHECK_DELAY_MINUTES", "15")))
-HASHRATE_MIN_HS = max(0.0, float(os.getenv("MY_HASHRATE_MIN_HS", "0")))
-HASHRATE_LOW_STREAK_LIMIT = max(1, int(os.getenv("MY_HASHRATE_LOW_STREAK_LIMIT", "3")))
-HASHRATE_RESTART_COOLDOWN_MINUTES = max(5, int(os.getenv("MY_HASHRATE_RESTART_COOLDOWN_MINUTES", "30")))
 POWER_BUTTON_SHORT_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_SHORT_PRESS_SECONDS", "0.55"))
 POWER_BUTTON_LONG_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_LONG_PRESS_SECONDS", "10"))
 
@@ -114,7 +110,10 @@ TELEGRAM_BASE = f'https://api.telegram.org/bot{BOT_TOKEN}'
 
 # Locks for thread safety
 session_lock = threading.Lock()
-gpio_lock = threading.Lock()
+gpio_lock = threading.RLock()
+power_guard_lock = threading.RLock()
+_power_guard = MinerPowerGuard()
+_latest_power_sample = None
 snapshot_lock = threading.Lock()
 
 # Shared snapshot for Telegram thread
@@ -298,15 +297,12 @@ telemetry_history: deque = deque()
 _pending_transition_state: Optional[str] = None
 _pending_transition_since: Optional[datetime] = None
 _pending_transition_hits: int = 0
-_miner_stop_reply_streak: int = 0
 _last_force_shutdown_at: Optional[datetime] = None
 _last_production_start_at: Optional[datetime] = None
-_hashrate_low_streak: int = 0
 _last_hashrate_restart_at: Optional[datetime] = None
 _last_wallet_hashrate_hs: Optional[float] = None
 _last_wallet_hashrate_at: Optional[datetime] = None
 _last_wallet_hashrate_key: Optional[Tuple[str, str, str, str]] = None
-_restart_triggered_this_cycle: bool = False
 web_notifications: deque = deque(maxlen=160)
 
 
@@ -2564,7 +2560,7 @@ def get_current_weather(api_key, location_lat, location_lon):
 def press_power_button(gpio_pin, press_time):
     if not (is_rpi and GPIO_AVAILABLE):
         print(f"[Info] GPIO not available. Skipping power button press ({gpio_pin}, {press_time}s).")
-        return
+        return False
     print(f"Pressing power button on GPIO pin {gpio_pin} for {press_time} seconds...")
     try:
         with gpio_lock:
@@ -2574,119 +2570,71 @@ def press_power_button(gpio_pin, press_time):
             time.sleep(press_time)
             GPIO.output(gpio_pin, GPIO.LOW)
             GPIO.cleanup()
+        with power_guard_lock:
+            if press_time == POWER_BUTTON_SHORT_PRESS_SECONDS:
+                _power_guard.command_start(_latest_power_sample, datetime.now(tz=budapest_tz))
+            else:
+                _power_guard.disarm("Shutdown command sent; repeat presses disabled")
         print("Power button press completed.")
+        return True
     except Exception as e:
         print(f"[Warning] GPIO press failed: {e}")
+        return False
 
 
-def supervise_runtime_by_hashrate(now: datetime, expected_state: str) -> None:
-    global _miner_stop_reply_streak, _last_force_shutdown_at
-    wallet = _effective_wallet_address()
-    hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
-    is_running = isinstance(hashrate_hs, (int, float)) and hashrate_hs > 0
-    hashrate_text = _format_hashrate(hashrate_hs)
-
-    if str(expected_state).lower() != "stop":
-        _miner_stop_reply_streak = 0
-        return
-
-    if hashrate_hs is None:
-        _miner_stop_reply_streak = 0
-        print("[Runtime guard] unMineable unavailable; STOP state cannot be confirmed.")
-        return
-
-    if not is_running:
-        _miner_stop_reply_streak = 0
-        print(f"[Runtime guard] STOP state confirmed by hashrate={hashrate_text}.")
-        return
-
-    _miner_stop_reply_streak += 1
-    cooldown_ok = (
-        _last_force_shutdown_at is None
-        or (now - _last_force_shutdown_at) >= timedelta(minutes=MINER_STOP_FORCE_COOLDOWN_MINUTES)
-    )
-    if _miner_stop_reply_streak < MINER_STOP_FORCE_CONSECUTIVE:
-        print(
-            f"[Runtime guard] STOP expected but hashrate still >0 ({hashrate_text}). "
-            f"streak={_miner_stop_reply_streak}/{MINER_STOP_FORCE_CONSECUTIVE}. Waiting."
-        )
-        return
-    if not cooldown_ok:
-        wait_left = max(
-            0.0,
-            MINER_STOP_FORCE_COOLDOWN_MINUTES - (now - _last_force_shutdown_at).total_seconds() / 60.0
-        )
-        print(f"[Runtime guard] Force shutdown cooldown active ({wait_left:.1f} min remaining).")
-        return
-
-    print("[Runtime guard] STOP expected but hashrate >0. Force shutdown sequence started.")
-    send_telegram_message(
-        f"⚠️ STOP expected but hashrate still {hashrate_text}. Force shutdown started."
-    )
-    if is_rpi and GPIO_AVAILABLE:
-        press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-        time.sleep(5)
-    send_telegram_message("✅ STOP safety force shutdown completed.")
-    _last_force_shutdown_at = now
-    _miner_stop_reply_streak = 0
-    save_prev_state(prev_state, now)
+def _extract_power_sample(data: Dict[str, Any], now: datetime) -> Optional[PowerSample]:
+    """Only timestamped live consumption data can authorize a GPIO action."""
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None
+    raw_time = next((data.get(k) for k in ("collectionTime", "dataTime", "timestamp") if data.get(k) is not None), None)
+    try:
+        if isinstance(raw_time, (int, float)) or str(raw_time).replace(".", "", 1).isdigit():
+            epoch = float(raw_time)
+            at = datetime.fromtimestamp(epoch / 1000 if epoch > 1e11 else epoch, tz=budapest_tz)
+        else:
+            at = datetime.fromisoformat(str(raw_time))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=budapest_tz)
+        dl = data.get("dataList", [])
+        total = _find_first_value(dl, ["LOAD_P_T", "C_P_T", "P_LOAD", "E_Puse_t1"], float("nan"))
+        if not math.isfinite(total):
+            for item in dl:
+                if str(item.get("name", "")).strip().lower() in {"total consumption power", "consumption power", "total load power", "load power"}:
+                    total = float(item.get("value")) * (1000 if str(item.get("unit", "")).lower() == "kw" else 1)
+                    break
+        phases = [_find_first_value(dl, [f"LOAD_P_L{i}", f"C_P_L{i}", f"INV_O_P_L{i}"], float("nan")) for i in (1, 2, 3)]
+        if not all(math.isfinite(v) and v >= 0 for v in [total] + phases):
+            return None
+        # Inverter outputs are a usable proxy only when they account for the
+        # measured load. Do not classify unrelated grid-side house loads.
+        if abs(total - sum(phases)) > max(100, total * 0.1):
+            return None
+        return PowerSample(at, total, *phases)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
 
 
-def check_hashrate_guard(now: datetime, effective_state: str) -> None:
-    global _hashrate_low_streak, _last_hashrate_restart_at, _restart_triggered_this_cycle
-    if _restart_triggered_this_cycle:
-        print("[Hashrate guard] Restart already triggered in this cycle. Skipping hashrate restart check.")
-        return
-    if str(effective_state).lower() != "production":
-        _hashrate_low_streak = 0
-        return
-    if _last_production_start_at is None:
-        return
-    if (now - _last_production_start_at) < timedelta(minutes=HASHRATE_CHECK_DELAY_MINUTES):
-        return
-    wallet = _effective_wallet_address()
-    hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
-    if hashrate_hs is None:
-        _hashrate_low_streak = 0
-        print(f"[Hashrate guard] unMineable unavailable for {wallet}; skipping restart check.")
-        return
-    elif hashrate_hs > HASHRATE_MIN_HS:
-        _hashrate_low_streak = 0
-        return
-    else:
-        _hashrate_low_streak += 1
+def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[str, Any]) -> None:
+    global _latest_power_sample, _last_force_shutdown_at
+    _latest_power_sample = _extract_power_sample(data, now)
+    with gpio_lock:
+        with power_guard_lock:
+            shutdown = _power_guard.observe(_latest_power_sample, now, expected_state)
+            reason = _power_guard.reason
+        print(f"[Power guard] {reason}")
+        if shutdown and is_rpi and GPIO_AVAILABLE:
+            if press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS):
+                _last_force_shutdown_at = now
+                save_prev_state(prev_state, uptime)
+                send_telegram_message("⚠️ STOP requested: fresh L2/L3 miner signature persisted for 3 samples and total consumption exceeds 1000 W. One force-shutdown signal sent.")
 
-    if _hashrate_low_streak < HASHRATE_LOW_STREAK_LIMIT:
-        print(
-            f"[Hashrate guard] Hashrate not above 0 H/s yet for wallet {wallet}. "
-            f"streak={_hashrate_low_streak}/{HASHRATE_LOW_STREAK_LIMIT}. Waiting before restart."
-        )
-        return
-    cooldown_ok = (
-        _last_hashrate_restart_at is None
-        or (now - _last_hashrate_restart_at) >= timedelta(minutes=HASHRATE_RESTART_COOLDOWN_MINUTES)
-    )
-    if not cooldown_ok:
-        print("[Hashrate guard] Low hashrate detected but restart cooldown is still active.")
-        return
 
-    measured_text = _format_hashrate(hashrate_hs)
-    msg = (
-        f"⚠️ Hashrate is below the configured threshold after startup window ({HASHRATE_CHECK_DELAY_MINUTES} min) "
-        f"for {HASHRATE_LOW_STREAK_LIMIT} consecutive checks. "
-        f"Wallet={wallet}, measured={measured_text}. Restarting miner."
-    )
-    print(msg)
-    send_telegram_message(msg)
-    if is_rpi and GPIO_AVAILABLE:
-        press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-        time.sleep(15)
-        press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
-        _last_hashrate_restart_at = now
-        _hashrate_low_streak = 0
-        _restart_triggered_this_cycle = True
-        save_prev_state(prev_state, now)
-        send_telegram_message(f"✅ Hashrate guard restart sequence completed. Latest hashrate: {measured_text}.")
+def _update_pool_hashrate(now: datetime) -> None:
+    """Pool telemetry is display-only, including outside the control window."""
+    hs = _wallet_hashrate_hs_cached(_effective_wallet_address(), now=now, max_age_seconds=120)
+    with snapshot_lock:
+        _shared_snapshot.update({"hashrate_hs": hs, "hashrate_mhs": hs / 1e6 if hs is not None else None})
+
 
 def _merge_decision_into_hints(hist: Dict[str, Any], decision: Dict[str, Any], start_guard: Dict[str, Any]) -> Dict[str, Any]:
     metrics = decision.get("metrics", {}) if isinstance(decision, dict) else {}
@@ -2819,10 +2767,9 @@ ________________________________
         elif state == "stop" and prev_state != "stop":
             _last_production_start_at = None
             print("Crypto production over.")
-            if is_rpi:
-                press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
+            # The power guard alone may authorize an automatic long press.
             send_telegram_message(
-                f""" Production stopped.
+                f""" Production stop requested; power verification pending.
 ________________________________
  Battery: {battery_charge}%
  Current power: {current_power}W
@@ -3033,8 +2980,8 @@ def _miner_action(action: str) -> Dict[str, Any]:
         return {"ok": False, "message": msg, "ts": now}
 
     try:
-        with gpio_lock:
-            press_power_button(16, duration)
+        if not press_power_button(16, duration):
+            raise RuntimeError("GPIO command was not sent")
         msg = f"{action} signal sent ({duration}s)"
         _push_web_notification(f"✅ GUI action: {msg}", level="success")
         send_telegram_message_async(f"GUI action: {msg}", max_retries=4, keyboard=True, mirror_web=False)
@@ -3145,6 +3092,10 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
 @media(max-width:1100px){.charts{grid-template-columns:1fr}.hints-wrap{grid-template-columns:1fr}}
 @media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:320px}.hints-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:560px){.hints-grid{grid-template-columns:1fr}}
+.pool-meta{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:12px}
+.pool-link,.pool-link:visited{display:inline-flex;align-items:center;gap:7px;color:var(--txt);text-decoration:none;border:1px solid var(--border,#46516b);border-radius:999px;padding:5px 10px;font-size:12px;font-weight:600;line-height:1.4}
+.pool-link:hover,.pool-link:focus-visible{color:#e8b957;border-color:#e8b957;outline-offset:3px}
+.pool-note{font-size:11px;opacity:.7}
 </style></head>
 <body data-theme="dark"><div class="wrap">
 <div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
@@ -3274,7 +3225,7 @@ function renderNotifications(items){
 async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
 renderNotifications(d.notifications||[]);
 const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-gauge-high'></i> ${t('hashrate')}</div><div class='v'>${d.hashrate_text||'N/A'}</div><div class='sub'><a href='https://unmineable.com/address/${d.wallet_address}?coin=USDT' target='_blank' rel='noopener noreferrer'>unMineable · USDT</a></div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card metrics-history'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
+document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery}%</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${Math.round(d.power)} W</div></div><div class='card'><div class='k'><i class='fa-solid fa-gauge-high'></i> ${t('hashrate')}</div><div class='v'>${d.hashrate_text||'N/A'}</div><div class='pool-meta'><a class='pool-link' href='https://unmineable.com/address/${d.wallet_address}?coin=USDT' target='_blank' rel='noopener noreferrer'>unMineable · USDT <i class='fa-solid fa-arrow-up-right-from-square' aria-hidden='true'></i></a><span class='pool-note'>${currentLang==='hu'?'Pool-adat · késhet':'Pool data · may lag'}</span></div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card metrics-history'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
 const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
 const hints=d.historical_hints||{};
 const monthQ=String(hints.month_quality||'neutral');
@@ -3396,6 +3347,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "hashrate_hs": snap.get("hashrate_hs"),
         "hashrate_mhs": snap.get("hashrate_mhs"),
         "hashrate_text": _format_hashrate(snap.get("hashrate_hs")),
+        "power_guard_reason": _power_guard.reason,
         "mining_pool": "unMineable",
         "mining_coin": MINING_COIN,
         "mining_algorithm": MINING_ALGORITHM,
@@ -3540,7 +3492,7 @@ def _telegram_loop():
 
 def main_loop():
     global prev_state, state, used_quote, sunrise, sunset, uptime, last_quote_reset_date, historical_profile
-    global _restart_triggered_this_cycle
+    global _latest_power_sample
 
     if historical_profile is None:
         historical_profile = build_historical_profile(HISTORY_DIR)
@@ -3572,7 +3524,6 @@ def main_loop():
 
     while True:
         now = datetime.now(tz=budapest_tz)
-        _restart_triggered_this_cycle = False
 
         # Concurrently read DHT and prefetch next weather + token
         fut_dht = executor.submit(read_dht11, prev_garage_temp, prev_garage_hum)
@@ -3635,6 +3586,7 @@ def main_loop():
         within_active = bool(control_details.get("active", False))
         print(f"Control window: {within_active} ({control_details.get('reason')})")
 
+        _update_pool_hashrate(now)
         if within_active:
             try:
                 used_quote += 1
@@ -3662,15 +3614,13 @@ def main_loop():
                 data, used_previous_payload = _with_daytime_data_fallback(raw_data or {}, now, sunrise, sunset)
                 store_data(data)  # attaches phasePowers
 
+                _latest_power_sample = _extract_power_sample(raw_data or {}, now)
                 (battery, power, state, current_condition, sunrise, sunset, clouds,
                 f1_cond, f1_clouds, f1_ts, f3_cond, f3_clouds, f3_ts, hist_hints) = check_crypto_production_conditions(
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
-                check_hashrate_guard(now, state or "unknown")
-                supervise_runtime_by_hashrate(now, state or "unknown")
-                wallet = _effective_wallet_address()
-                current_hashrate_hs = _wallet_hashrate_hs_cached(wallet, now=now, max_age_seconds=120)
-                current_hashrate_mhs = (current_hashrate_hs / 1e6) if isinstance(current_hashrate_hs, (int, float)) else None
+                # Cached daytime fallbacks may be displayed, never used for GPIO.
+                supervise_runtime_by_power(now, state or "unknown", raw_data or {})
 
                 has_usable_solarman_data = _has_solarman_payload(data)
                 if not has_usable_solarman_data:
@@ -3688,8 +3638,6 @@ def main_loop():
                         "state": state or "unknown",
                         "current_condition": current_condition or "unknown",
                         "sunrise": sunrise, "sunset": sunset, "clouds": clouds or 0,
-                        "hashrate_hs": current_hashrate_hs,
-                        "hashrate_mhs": current_hashrate_mhs,
                         "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0,
                         "inv_l1": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L1", 0.0)),
                         "inv_l2": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L2", 0.0)),
@@ -3729,18 +3677,19 @@ def main_loop():
              f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
             state = "stop"
-            if prev_state == "production":
-                print("Miner did not shut down correctly, shutting down...")
-                send_telegram_message("Miner did not shut down correctly, shutting down...")
-                print("Trying to press power button.")
-                if is_rpi:
-                    press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-                if state != prev_state:
-                    prev_state = state
-                    uptime = now
-                    save_prev_state(prev_state, uptime)
-
-            supervise_runtime_by_hashrate(now, state)
+            if prev_state != "stop":
+                prev_state = state
+                uptime = now
+                save_prev_state(prev_state, uptime)
+            # Keep live consumption monitoring running overnight too.
+            try:
+                token = fut_token.result(timeout=10)
+                used_quote += 1
+                save_quote_usage(used_quote)
+                idle_data = fetch_current_data(token) if token else {}
+            except Exception:
+                idle_data = {}
+            supervise_runtime_by_power(now, state, idle_data)
 
             if is_rpi:
                 write_to_display(
