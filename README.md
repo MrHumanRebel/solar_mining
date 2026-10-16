@@ -63,6 +63,29 @@ A felismerés oka a `[Power guard]` naplóban és a snapshot API
 összesített fázismérésből nem bizonyítható egy fogyasztó azonossága. A két
 bányásztáp külön fogyasztásmérője szükséges a biztos elkülönítéshez.
 
+#### Ellenőrzés a feltöltött telemetrián
+
+A 2026. október 16-án kapott, 36 139 soros naplóban 2071 STOP-sorban
+1000 W feletti inverterkimenet szerepel. A 2026-10-16 16:23 és 16:26-os
+1206/1226 W-os, a felhasználó szerint már leállt gép melletti pillanatképek
+külön regressziós fixture-be kerültek: nem engedélyeznek automatikus nyomást.
+
+Az offline visszajátszás hardvert és külső API-t nem használ:
+
+```bash
+python replay_power_guard.py --telemetry /útvonal/telemetry_history.json
+# Feltáró vizsgálat: feltételezett indítások a vezérlőállapot váltásaiból.
+python replay_power_guard.py --telemetry /útvonal/telemetry_history.json --assume-start-commands-from-state-changes
+```
+
+A második módban 348 állapotváltásból 194-nél volt stabil indulási alap,
+77 szakaszban tanult a védelem L2/L3 mintát, automatikus leállítási jelzés
+nem keletkezett. Az `inv_lt` inverterkimenet, nem külön fogyasztásmérő;
+a régi `ts` a napló időpontja, nem igazolt eszközoldali mérési idő.
+Az állapotváltás nem bizonyít GPIO-parancsot vagy fizikai gépállapotot.
+Ezek az eredmények ezért nem adnak tévesleállítási vagy felismerési
+pontossági arányt, és nem helyettesítik az éles mérési ellenőrzést.
+
 ### Fejlesztés és ellenőrzés
 
 A `requirements.txt` a frissítéskor elérhető legújabb stabil közvetlen Python

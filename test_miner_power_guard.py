@@ -2,8 +2,11 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import Mock, patch
 from concurrent.futures import Future
+import json
+from pathlib import Path
 
 from miner_power_guard import MinerPowerGuard, PowerSample
+from replay_power_guard import replay
 import simulate_decisions
 
 solar = simulate_decisions.solar
@@ -28,6 +31,25 @@ def armed_guard(swap=False):
 
 
 class PowerGuardTests(unittest.TestCase):
+    def test_uploaded_oct16_stopped_rig_load_does_not_authorize_shutdown(self):
+        path = Path(__file__).parent / 'tests/fixtures/stopped_rig_oct16.json'
+        rows = json.loads(path.read_text())
+        self.assertEqual([r['inv_lt'] for r in rows], [872,1206,1226])
+        result = replay(rows)
+        self.assertEqual(result['counts']['stop_rows_over_1000W'], 2)
+        self.assertEqual(result['simulated_shutdown_signals'], [])
+
+    def test_replay_does_not_treat_software_state_as_verified_gpio_command(self):
+        rows = []
+        for minute in (0,5,10,15,20,25,30,35):
+            rows.append({'ts':(T+timedelta(minutes=minute)).isoformat(),
+                         'state':'production' if minute in (10,15,20) else 'stop',
+                         'inv_lt':1200,'inv_l1':100,'inv_l2':550,'inv_l3':550})
+        result = replay(rows)
+        self.assertEqual(result['counts']['recorded_start_transitions'],1)
+        self.assertEqual(result['counts']['identified_runs'],0)
+        self.assertEqual(result['simulated_shutdown_signals'],[])
+
     def test_three_fresh_matching_stop_samples_trigger_once(self):
         guard = armed_guard()
         for minute, expected in [(25, False), (30, False), (35, True), (40, False), (45, False)]:
