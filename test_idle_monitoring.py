@@ -95,12 +95,12 @@ class IdleMonitoringTests(unittest.TestCase):
         guard = MinerPowerGuard()
         for minute in (-25,-20,-15):
             at = SUNSET + timedelta(minutes=minute)
-            off = PowerSample(at,400,100,100,200)
+            off = PowerSample(at,400,100,100,200,source="consumption:INV_O_P")
             guard.observe(off,at,'stop')
         guard.command_start(off,off.at+timedelta(seconds=1))
         for minute in (-10,-5):
             at = SUNSET + timedelta(minutes=minute)
-            guard.observe(PowerSample(at,1200,100,550,550),at,'production')
+            guard.observe(PowerSample(at,1200,100,550,550,source="consumption:INV_O_P"),at,'production')
         self.assertIsNotNone(guard.signature)
         future = Future()
         future.set_result('test-token')

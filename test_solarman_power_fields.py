@@ -1,5 +1,7 @@
 """Exercise the inverter-only schema reported by the deployed Pi."""
 from dataclasses import replace
+from pathlib import Path
+import json
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
@@ -21,6 +23,73 @@ def payload(unit='W', total=1200, phases=(100,550,550)):
 
 
 class SolarmanPowerFieldTests(unittest.TestCase):
+    def test_reported_deye_schema_pairs_consumption_with_lpp_not_backup_load(self):
+        data=json.loads((Path(__file__).parent/'tests/fixtures/solarman_deye_power.json').read_text())
+        now=datetime.fromtimestamp(data['collectionTime'],timezone.utc)+timedelta(seconds=60)
+        result,error=solar._parse_power_measurement(data,now)
+        self.assertIsNone(error)
+        self.assertEqual((result.total,result.l1,result.l2,result.l3),(1241,25,808,408))
+        self.assertEqual(result.source,'consumption:LPP')
+        self.assertIsNone(solar._power_measurement_reason(data,result,now))
+        self.assertIn('old',solar._power_measurement_reason(data,result,now+timedelta(hours=5)))
+
+    def test_reported_schema_flows_through_idle_monitor_and_dashboard(self):
+        data=json.loads((Path(__file__).parent/'tests/fixtures/solarman_deye_power.json').read_text())
+        now=datetime.fromtimestamp(data['collectionTime'],timezone.utc)+timedelta(seconds=60)
+        with patch.object(solar,'_power_guard',solar.MinerPowerGuard()), \
+             patch.object(solar,'_latest_power_sample',None), \
+             patch.object(solar,'fetch_current_data',return_value=data), \
+             patch.object(solar,'save_quote_usage'), patch.object(solar,'used_quote',0), \
+             patch.object(solar,'is_rpi',False), patch.object(solar,'press_power_button') as press, \
+             patch.dict(solar._shared_snapshot):
+            from concurrent.futures import Future
+            token=Future()
+            token.set_result('test')
+            solar._idle_monitor_cycle(now,token,None,None,poll_interval_seconds=1800)
+            snapshot=solar._build_snapshot_payload()
+            self.assertEqual(snapshot['power_measurement']['total'],1241)
+            self.assertEqual(snapshot['power_measurement']['l2'],808)
+            self.assertEqual(snapshot['inv_l2'],797)
+            self.assertEqual(snapshot['power_measurement_source'],'consumption:LPP')
+            self.assertNotIn('Missing',snapshot['power_guard_reason'])
+            press.assert_not_called()
+
+    def test_successful_read_clears_previous_measurement_error_without_rearming(self):
+        data=payload()
+        with patch.object(solar,'_power_guard',solar.MinerPowerGuard()), \
+             patch.object(solar,'_power_measurement_error',None), \
+             patch.object(solar,'_latest_power_sample',None), \
+             patch.object(solar,'is_rpi',False):
+            solar.supervise_runtime_by_power(T,'stop',{})
+            self.assertIn('timestamp',solar._build_snapshot_payload()['power_guard_reason'])
+            solar.supervise_runtime_by_power(T,'stop',data)
+            self.assertEqual(solar._build_snapshot_payload()['power_guard_reason'],'No witnessed miner start')
+            self.assertIsNone(solar._power_guard.signature)
+
+    def test_e_puse_requires_explicit_power_units(self):
+        data=payload()
+        data['dataList'].append({'key':'E_Puse_t1','value':1200,'unit':None})
+        result,error=solar._parse_power_measurement(data,T)
+        self.assertIsNone(result)
+        self.assertIn('requires explicit',error)
+
+    def test_partial_lpp_never_mixes_with_backup_port_or_inverter_phases(self):
+        data=json.loads((Path(__file__).parent/'tests/fixtures/solarman_deye_power.json').read_text())
+        data['dataList']=[i for i in data['dataList'] if i['key']!='LPP_C']
+        result,error=solar._parse_power_measurement(data,T)
+        self.assertIsNone(result)
+        self.assertIn('Incomplete consumption phases',error)
+
+    def test_measurement_failures_have_specific_reasons(self):
+        self.assertIn('timestamp',solar._power_measurement_reason({},None,T))
+        data=payload()
+        data['collectionTime']='broken'
+        self.assertIn('Invalid device timestamp',solar._power_measurement_reason(data,None,T))
+        self.assertIn('mismatch',solar._power_measurement_reason(payload(total=3000),None,T))
+        data=payload()
+        data['dataList'][2]['unit']='kWh'
+        self.assertIn('Non-power unit',solar._power_measurement_reason(data,None,T))
+
     def test_inverter_total_and_matching_phases_are_valid_without_load_register(self):
         result=solar._extract_power_sample(payload(),T)
         self.assertEqual((result.total,result.l1,result.l2,result.l3),(1200,100,550,550))
@@ -48,7 +117,7 @@ class SolarmanPowerFieldTests(unittest.TestCase):
         for item in data['dataList']:
             if item['key']=='LOAD_P_T':
                 item['value']=1200
-        self.assertEqual(solar._extract_power_sample(data,T).source,'consumption')
+        self.assertEqual(solar._extract_power_sample(data,T).source,'consumption:INV_O_P')
 
     def test_invalid_values_missing_phases_and_disagreeing_sum_fail_closed(self):
         for bad in ('nan',-1,None):

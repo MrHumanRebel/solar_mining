@@ -54,12 +54,18 @@ there is at most one automatic shutdown press per witnessed run. Aggregate
 meters cannot uniquely distinguish every oven/hob combination from a miner.
 The guard retains only bounded working samples in memory, never a JSON history.
 
-If the inverter exposes no dedicated load register, the guard accepts
-`INV_O_P_T` together with all three `INV_O_P_L1/L2/L3` readings when their sum
-matches the total. The dashboard labels this source as inverter output, which
-does not establish consumption of grid-side appliances. A change between meter
-sources discards the learned identity. W and kW are normalized; energy counters
-such as `E_Puse_t1` are never interpreted as instantaneous power.
+On the supplied Deye schema, `E_Puse_t1` with explicit W/kW units is total
+instantaneous consumption. Pair it with `LPP_A/B/C` (whole-house phases), not
+`C_P_L1/L2/L3` (a different load port). The supplied example is 1241 W =
+25 + 808 + 408 W; the C_P readings sum to only 50 W. Each phase family is
+selected as a complete group and checked against its total, never mixed.
+
+When no consumption register exists, the guard accepts `INV_O_P_T` with
+`INV_O_P_L1/L2/L3`, labelled as inverter output. It does not establish
+consumption of grid-side appliances. Changes in source or phase family discard
+the learned identity. kWh/VA counters are rejected. The dashboard shows the
+selected safety meter and device collection time separately from HTTP polling
+time, with specific missing-field, timestamp, unit or total/phase errors.
 
 Solarman authentication and device polling run every five minutes between
 astronomical sunrise and sunset, and once every 30 minutes overnight. Failed
