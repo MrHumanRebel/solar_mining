@@ -355,7 +355,7 @@ def _format_hashrate(value: Optional[float]) -> str:
 
 
 def _extract_hashrate_from_wallet_payload(payload: Dict[str, Any]) -> Optional[float]:
-    """Read v4 account/workers reported rates (rhr in H/s) for this rig only.
+    """Read v5 account/workers reported rates (rhr in H/s) for this rig only.
 
     Calculated rates and chart history can lag behind a stopped miner, so they
     must not be used to confirm that the rig is still running.
@@ -395,7 +395,7 @@ def _wallet_hashrate_hs(wallet: str) -> Optional[float]:
     wallet = _parse_wallet_address(wallet)
     if not wallet:
         return None
-    base_url = "https://api.unminable.com/v4"
+    base_url = "https://api.unmineable.com/v5"
     last_err = "unknown"
     for attempt in range(1, 4):
         try:
@@ -434,7 +434,6 @@ def _wallet_hashrate_hs_cached(wallet: str, now: Optional[datetime] = None, max_
     if (
         key == _last_wallet_hashrate_key
         and _last_wallet_hashrate_at is not None
-        and _last_wallet_hashrate_hs is not None
         and 0 <= (now - _last_wallet_hashrate_at).total_seconds() <= max(1, int(max_age_seconds))
     ):
         return _last_wallet_hashrate_hs

@@ -19,8 +19,8 @@ https://unmineable.com/address/0xaedac36dcfc956864fcc03ec2ef256facaefd991?coin=U
 - `MY_MINING_WORKER`: alapértelmezésben `solarminer`; üres értékkel az adott
   algoritmus összes workerének jelentett hashrátája összegezhető.
 - A `/wallet <cím vagy URL>` Telegram-parancs USDT EVM-címet fogad el.
-- API: `https://api.unminable.com/v4/address/<cím>?coin=USDT`, majd
-  `/v4/account/<uuid>/workers`. A jelentett `rhr` érték H/s-ban érkezik;
+- API: `https://api.unmineable.com/v5/address/<cím>?coin=USDT`, majd
+  `/v5/account/<uuid>/workers`. A jelentett `rhr` érték H/s-ban érkezik;
   a kijelzés automatikusan kH/s–PH/s egységre vált. Az offline workerek
   korábbi hashrátája nem számít aktív termelésnek. API-hiba esetén nincs
   automatikus újraindítás; a megerősített nulla hashráta továbbra is kiváltja
@@ -45,7 +45,7 @@ python simulate_decisions.py --telemetry telemetry_history_20260524_161647.json 
 ```
 
 A tesztek helyettesített API-válaszokkal futnak, nem vezérelnek hardvert.
-Élő ellenőrzéshez engedélyezni kell az `api.unminable.com` HTTPS-elérését.
+Élő ellenőrzéshez engedélyezni kell az `api.unmineable.com` HTTPS-elérését.
 
 ## 🚀 Fő funkciók
 
