@@ -1,5 +1,6 @@
 import requests
 from miner_power_guard import MinerPowerGuard, PowerSample
+from history_model import load_exports, seasonal_profile, plan as plan_energy
 import hashlib
 import json
 import time
@@ -46,7 +47,6 @@ DEVICE_SN = os.environ['MY_DEVICE_SN']
 QUOTE_LIMIT = int(os.getenv('MY_QUOTE_LIMIT', '200000'))
 QUOTE_FILE = os.environ['MY_QUOTE_FILE']
 STATE_FILE = os.environ['MY_STATE_FILE']
-SOLARMAN_FILE = os.environ['MY_SOLARMAN_FILE']
 DEFAULT_WALLET_ADDRESS = "0xaedac36dcfc956864fcc03ec2ef256facaefd991"
 WALLET_ADDRESS = os.getenv('WALLET_ADDRESS') or DEFAULT_WALLET_ADDRESS
 MINING_COIN = "USDT"
@@ -114,6 +114,7 @@ gpio_lock = threading.RLock()
 power_guard_lock = threading.RLock()
 _power_guard = MinerPowerGuard()
 _latest_power_sample = None
+_weather_daylight = None
 snapshot_lock = threading.Lock()
 
 # Shared snapshot for Telegram thread
@@ -292,11 +293,6 @@ def _summarize_free_weather_outlook(forecast_payload: Dict[str, Any], now: Optio
         "samples_5d": int(total),
     }
 
-# Unbounded in-memory telemetry history (no MAX_HISTORY_POINTS cap).
-telemetry_history: deque = deque()
-_pending_transition_state: Optional[str] = None
-_pending_transition_since: Optional[datetime] = None
-_pending_transition_hits: int = 0
 _last_force_shutdown_at: Optional[datetime] = None
 _last_production_start_at: Optional[datetime] = None
 _last_hashrate_restart_at: Optional[datetime] = None
@@ -441,25 +437,8 @@ def _wallet_hashrate_hs_cached(wallet: str, now: Optional[datetime] = None, max_
 
 
 def _last_state_change_ts() -> Optional[datetime]:
-    """Find the last timestamp where persisted telemetry state changed."""
-    items = list(telemetry_history)
-    if len(items) < 2:
-        return None
-    for i in range(len(items) - 1, 0, -1):
-        cur = items[i]
-        prev = items[i - 1]
-        s1 = str(cur.get("state", "")).strip().lower()
-        s0 = str(prev.get("state", "")).strip().lower()
-        if not s1 or not s0 or s1 == s0:
-            continue
-        try:
-            ts = datetime.fromisoformat(str(cur.get("ts", "")))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=budapest_tz)
-            return ts
-        except Exception:
-            continue
-    return None
+    # Minimal controller state, not a recorded measurement dataset.
+    return uptime if isinstance(uptime, datetime) else None
 
 
 def _apply_transition_guard(prev_state_val: str, desired_state: str, now: datetime,
@@ -491,27 +470,6 @@ def _apply_transition_guard(prev_state_val: str, desired_state: str, now: dateti
             return prev_state_val, True, f"restart_delay({minutes_since_change:.1f}<{MIN_RESTART_DELAY_MINUTES}min)"
 
     return desired_state, False, "time_guard_passed"
-
-
-def _resolve_telemetry_file() -> Path:
-    raw = os.getenv("MY_TELEMETRY_FILE", "").strip()
-    if not raw:
-        # Use the state file directory by default, because it is usually a bind-mounted path.
-        state_path = Path(STATE_FILE)
-        default_dir = state_path.parent if str(state_path).strip() else Path(__file__).resolve().parent
-        return (default_dir / "telemetry_history.json").resolve()
-
-    p = Path(raw)
-    if p.is_absolute():
-        return p
-    # Keep default file near script to avoid cwd-dependent path issues.
-    return (Path(__file__).resolve().parent / p).resolve()
-
-
-TELEMETRY_FILE = _resolve_telemetry_file()
-TELEMETRY_BACKUP_FILE = (Path(STATE_FILE).resolve().parent / "telemetry_history_backup.json").resolve()
-print(f"[Telemetry] Using telemetry store: {TELEMETRY_FILE}")
-print(f"[Telemetry] Using telemetry backup store: {TELEMETRY_BACKUP_FILE}")
 
 
 # Historical profile cache (derived from solarman_json/*.json)
@@ -614,978 +572,42 @@ def _effective_battery_capacity_wh(battery_voltage: float, battery_ah: float) ->
     ah = battery_ah if battery_ah > 0 else BATTERY_CAPACITY_AH
     return max(100.0, ah * v)
 
-def _extract_phase_powers(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extract per-phase inverter output power. Always present in saved JSON under 'phasePowers'.
-    """
-    dl = data.get("dataList", []) if isinstance(data, dict) else []
-    l1 = int(_find_value(dl, "INV_O_P_L1", 0.0))
-    l2 = int(_find_value(dl, "INV_O_P_L2", 0.0))
-    l3 = int(_find_value(dl, "INV_O_P_L3", 0.0))
-    lt = int(_find_value(dl, "INV_O_P_T", 0.0))
-    return {"L1": l1, "L2": l2, "L3": l3, "LT": lt, "unit": "W"}
-
-
-def _parse_history_ts(value: str) -> Optional[datetime]:
-    try:
-        return datetime.strptime(value.strip(), "%Y/%m/%d %H:%M").replace(tzinfo=budapest_tz)
-    except Exception:
-        return None
-
-
-def _history_float(value: Any, default: float = 0.0) -> float:
-    if value in (None, ""):
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _percentile(values: List[float], pct: float, default: float = 0.0) -> float:
-    vals = sorted(float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v)))
-    if not vals:
-        return default
-    if len(vals) == 1:
-        return vals[0]
-    pos = (len(vals) - 1) * max(0.0, min(1.0, pct))
-    lo = int(math.floor(pos))
-    hi = int(math.ceil(pos))
-    if lo == hi:
-        return vals[lo]
-    frac = pos - lo
-    return vals[lo] * (1.0 - frac) + vals[hi] * frac
-
-
-def build_historical_profile(history_dir: str = "solarman_json") -> Dict[str, Any]:
-    """
-    Build month/hour Solarman PV profile.
-    Keeps timestamp dedupe, exposes mean/p50/p75/p90 counts plus monthly refill metrics.
-    """
-    files = sorted(glob.glob(os.path.join(history_dir, "*.json")))
-    if not files:
-        print(f"[History] No history files found in {history_dir}. Using static defaults.")
-        return {}
-
-    sample_by_ts: Dict[datetime, Dict[str, List[float]]] = defaultdict(lambda: {"prod": [], "soc": []})
-    invalid_rows = 0
-    parsed_rows = 0
-
-    for fp in files:
-        try:
-            with open(fp, "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except Exception as err:
-            print(f"[History] Failed loading {fp}: {err}")
-            continue
-        if not isinstance(payload, list):
-            print(f"[History] Ignoring non-list JSON payload in {fp}")
-            continue
-        for row in payload:
-            if not isinstance(row, dict):
-                invalid_rows += 1
-                continue
-            ts = _parse_history_ts(str(row.get("Updated Time", "")).strip())
-            if ts is None:
-                invalid_rows += 1
-                continue
-            prod = max(0.0, min(_history_float(row.get("Production Power(W)"), 0.0), 25000.0))
-            soc = max(0.0, min(_history_float(row.get("SoC(%)"), 0.0), 100.0))
-            sample_by_ts[ts]["prod"].append(prod)
-            sample_by_ts[ts]["soc"].append(soc)
-            parsed_rows += 1
-
-    if not sample_by_ts:
-        print("[History] All rows were invalid or empty. Using static defaults.")
-        return {}
-
-    canonical: List[Dict[str, Any]] = []
-    duplicate_timestamps = 0
-    for ts in sorted(sample_by_ts.keys()):
-        prod_values = sample_by_ts[ts]["prod"]
-        soc_values = sample_by_ts[ts]["soc"]
-        if len(prod_values) > 1:
-            duplicate_timestamps += 1
-        canonical.append({
-            "ts": ts,
-            "prod": statistics.median(prod_values) if prod_values else 0.0,
-            "soc": statistics.median(soc_values) if soc_values else 0.0,
-        })
-
-    month_hour_prod: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
-    month_hour_soc: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
-    month_day_rows: Dict[int, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
-
-    for item in canonical:
-        ts = item["ts"]
-        month = ts.month
-        hour = ts.hour
-        day_key = ts.strftime("%Y-%m-%d")
-        month_hour_prod[month][hour].append(float(item["prod"]))
-        month_hour_soc[month][hour].append(float(item["soc"]))
-        month_day_rows[month][day_key].append(item)
-
-    profile: Dict[str, Any] = {
-        "months": {},
-        "files": len(files),
-        "parsed_rows": parsed_rows,
-        "invalid_rows": invalid_rows,
-        "unique_timestamps": len(canonical),
-        "duplicate_timestamps": duplicate_timestamps,
-    }
-
-    for month in range(1, 13):
-        hourly_prod = month_hour_prod.get(month, {})
-        if not hourly_prod:
-            continue
-
-        hourly_stats: Dict[str, Any] = {}
-        for h, vals in hourly_prod.items():
-            clean = [float(v) for v in vals if math.isfinite(float(v))]
-            if not clean:
-                continue
-            hourly_stats[str(h)] = {
-                "mean": float(statistics.mean(clean)),
-                "p50": float(_percentile(clean, 0.50)),
-                "median": float(_percentile(clean, 0.50)),
-                "p75": float(_percentile(clean, 0.75)),
-                "p90": float(_percentile(clean, 0.90)),
-                "count": len(clean),
-            }
-
-        hourly_mean = {h: st["mean"] for h, st in hourly_stats.items()}
-        hourly_p50 = {h: st["p50"] for h, st in hourly_stats.items()}
-        hourly_p75 = {h: st["p75"] for h, st in hourly_stats.items()}
-        hourly_p90 = {h: st["p90"] for h, st in hourly_stats.items()}
-
-        daily_peaks: List[float] = []
-        daily_energy_wh: List[float] = []
-        charge_rates: List[float] = []
-        first_100: List[float] = []
-        first_500: List[float] = []
-        first_cover: List[float] = []
-        refill_days = 0
-        total_days = 0
-
-        for _day, rows in month_day_rows.get(month, {}).items():
-            if not rows:
-                continue
-            rows = sorted(rows, key=lambda x: x["ts"])
-            total_days += 1
-            prods = [float(r["prod"]) for r in rows]
-            socs = [float(r["soc"]) for r in rows]
-            daily_peaks.append(max(prods) if prods else 0.0)
-            energy = 0.0
-            for i, r in enumerate(rows):
-                if i + 1 < len(rows):
-                    dt_h = max(0.0, min(1.0, (rows[i + 1]["ts"] - r["ts"]).total_seconds() / 3600.0))
-                else:
-                    dt_h = 5.0 / 60.0
-                energy += max(0.0, float(r["prod"])) * dt_h
-            daily_energy_wh.append(energy)
-            if max(socs or [0.0]) >= 99.0:
-                refill_days += 1
-            for threshold, target in ((100.0, first_100), (500.0, first_500), (MINER_POWER_W, first_cover)):
-                hit = next((r["ts"].hour + r["ts"].minute / 60.0 for r in rows if float(r["prod"]) >= threshold), None)
-                if hit is not None:
-                    target.append(float(hit))
-            for i in range(1, len(rows)):
-                dt_h = (rows[i]["ts"] - rows[i - 1]["ts"]).total_seconds() / 3600.0
-                if dt_h <= 0 or dt_h > 0.6:
-                    continue
-                if max(float(rows[i]["prod"]), float(rows[i - 1]["prod"])) < 500:
-                    continue
-                rate = (float(rows[i]["soc"]) - float(rows[i - 1]["soc"])) / dt_h
-                if 0.05 <= rate <= 18.0:
-                    charge_rates.append(rate)
-
-        daylight_hours = [h for h, vals in hourly_prod.items() if vals and _percentile(vals, 0.50) >= 100]
-        solar_start_hour = min(daylight_hours) if daylight_hours else int(_percentile(first_100, 0.50, 8))
-        solar_end_hour = max(daylight_hours) if daylight_hours else 15
-        midday_hours = [h for h in range(10, 15) if str(h) in hourly_stats]
-        midday_avg = statistics.mean([hourly_stats[str(h)]["p50"] for h in midday_hours]) if midday_hours else statistics.mean(hourly_mean.values())
-        evening_soc_values: List[float] = []
-        for h in range(16, 24):
-            evening_soc_values.extend(month_hour_soc.get(month, {}).get(h, []))
-        evening_soc_p40 = _percentile(evening_soc_values, 0.40, 45.0)
-        refill_confidence = refill_days / total_days if total_days else 0.0
-        if _percentile(daily_peaks, 0.75, 0.0) >= MINER_POWER_W * 2.0 and _percentile(daily_energy_wh, 0.50, 0.0) >= MINER_POWER_W * 3.5:
-            refill_confidence = max(refill_confidence, 0.65)
-
-        profile["months"][month] = {
-            "solar_start_hour": int(solar_start_hour),
-            "solar_end_hour": int(solar_end_hour),
-            "daylight_span": int(max(0, solar_end_hour - solar_start_hour + 1)),
-            "midday_avg": float(midday_avg),
-            "daily_peak_p75": float(_percentile(daily_peaks, 0.75)),
-            "daily_energy_wh_p50": float(_percentile(daily_energy_wh, 0.50)),
-            "daily_energy_wh_p75": float(_percentile(daily_energy_wh, 0.75)),
-            "charge_rate_pct_per_hour_p50": float(_percentile(charge_rates, 0.50)),
-            "refill_confidence": float(max(0.0, min(1.0, refill_confidence))),
-            "first_100w_hour": float(_percentile(first_100, 0.50, solar_start_hour)),
-            "first_500w_hour": float(_percentile(first_500, 0.50, solar_start_hour + 1)),
-            "first_miner_cover_hour": float(_percentile(first_cover, 0.50, solar_start_hour + 2)),
-            "evening_soc_p40": float(evening_soc_p40),
-            "hourly_prod": hourly_stats,
-            "hourly_prod_mean": hourly_mean,
-            "hourly_prod_p50": hourly_p50,
-            "hourly_prod_p75": hourly_p75,
-            "hourly_prod_p90": hourly_p90,
-        }
-
-    print(
-        f"[History] Profile ready from {profile['files']} files | parsed={profile['parsed_rows']} "
-        f"invalid={profile['invalid_rows']} unique_ts={profile['unique_timestamps']} "
-        f"dup_ts={profile['duplicate_timestamps']} months={sorted(profile['months'].keys())}"
-    )
-    return profile
-
-def _interpolate_month_config(target_month: int, months_cfg: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
-    """Interpolate missing month values from nearest available months (circular calendar distance)."""
-    if target_month in months_cfg:
-        return dict(months_cfg[target_month])
-    if not months_cfg:
-        return {}
-
-    keys = [
-        "solar_start_hour", "solar_end_hour", "daylight_span",
-        "midday_avg", "daily_peak_p75", "evening_soc_p40"
-    ]
-
-    weighted: Dict[str, float] = defaultdict(float)
-    weights: Dict[str, float] = defaultdict(float)
-
-    for m, cfg in months_cfg.items():
-        dist = min((target_month - m) % 12, (m - target_month) % 12)
-        if dist == 0:
-            dist = 0.5
-        w = 1.0 / dist
-        for k in keys:
-            if k in cfg:
-                weighted[k] += w * float(cfg[k])
-                weights[k] += w
-
-    out: Dict[str, Any] = {}
-    for k in keys:
-        if weights[k] > 0:
-            out[k] = weighted[k] / weights[k]
-    return out
-
-
-def _interpolate_hourly_profile_for_month(target_month: int, months_cfg: Dict[int, Dict[str, Any]]) -> Dict[str, float]:
-    """Builds an interpolated hourly PV profile for a month (0..23) from nearby months."""
-    if target_month in months_cfg:
-        direct = months_cfg[target_month].get("hourly_prod_mean", {})
-        if isinstance(direct, dict) and direct:
-            return {str(int(k)): float(v) for k, v in direct.items()}
-
-    blended: Dict[int, float] = defaultdict(float)
-    weights: Dict[int, float] = defaultdict(float)
-    for m, cfg in months_cfg.items():
-        hourly = cfg.get("hourly_prod_mean", {}) if isinstance(cfg, dict) else {}
-        if not isinstance(hourly, dict) or not hourly:
-            continue
-        dist = min((target_month - m) % 12, (m - target_month) % 12)
-        if dist == 0:
-            dist = 0.5
-        w = 1.0 / dist
-        for h_raw, p_raw in hourly.items():
-            try:
-                h = max(0, min(23, int(h_raw)))
-                p = max(0.0, float(p_raw))
-            except (TypeError, ValueError):
-                continue
-            blended[h] += w * p
-            weights[h] += w
-
-    return {str(h): (blended[h] / weights[h]) for h in sorted(weights.keys()) if weights[h] > 0}
-
-
-def _hourly_profile_from_hist(hist: Dict[str, Any], quantile: str = "p50") -> Dict[str, float]:
-    quantile = str(quantile or "p50").lower()
-    key = "hourly_prod_mean" if quantile in {"mean", "avg"} else f"hourly_prod_{quantile}"
-    profile = hist.get(key, {}) if isinstance(hist, dict) else {}
-    if not isinstance(profile, dict) or not profile:
-        profile = hist.get("hourly_prod_mean", {}) if isinstance(hist, dict) else {}
-    return {str(int(k)): max(0.0, _safe_float(v, 0.0)) for k, v in (profile or {}).items()}
-
-
-def _pv_estimate_at(dt: datetime, hourly_profile: Dict[str, Any]) -> float:
-    """Linear interpolation between hourly means for smoother bridge estimation."""
-    if not hourly_profile:
-        return 0.0
-    h0 = dt.hour
-    h1 = min(23, h0 + 1)
-    p0 = max(0.0, _safe_float(hourly_profile.get(str(h0), 0.0), 0.0))
-    p1 = max(0.0, _safe_float(hourly_profile.get(str(h1), p0), p0))
-    frac = dt.minute / 60.0
-    return p0 + (p1 - p0) * frac
-
-
-def _estimate_full_supply_and_energy(sunrise_dt: datetime, now: datetime,
-                                     hourly_profile: Dict[str, Any]) -> Tuple[Optional[datetime], float]:
-    """Returns expected full-supply timestamp and needed bridge energy from sunrise."""
-    if not hourly_profile:
-        return None, 0.0
-
-    start = sunrise_dt.replace(second=0, microsecond=0)
-    end = (start + timedelta(hours=12)).replace(second=0, microsecond=0)
-    t = start
-    step_min = 5
-    needed_wh = 0.0
-    full_supply_dt: Optional[datetime] = None
-
-    while t < end:
-        pv = _pv_estimate_at(t, hourly_profile)
-        deficit = max(0.0, MINER_POWER_W - pv)
-        # We need a future full-supply point for runtime start-guard decisions.
-        if full_supply_dt is None and t >= now and deficit <= 1e-6:
-            full_supply_dt = t
-            break
-        needed_wh += deficit * (step_min / 60.0)
-        t += timedelta(minutes=step_min)
-
-    if full_supply_dt is None:
-        # if we never reach full feed in modeled window, use conservative future fallback
-        base = max(now, sunrise_dt).replace(second=0, microsecond=0)
-        full_supply_dt = base + timedelta(hours=3)
-    return full_supply_dt, max(0.0, needed_wh)
-
-
-def _estimate_minutes_for_energy_budget(sunrise_dt: datetime, hourly_profile: Dict[str, Any],
-                                        energy_budget_wh: float) -> float:
-    """Estimate bridge minutes from sunrise until a given energy budget is consumed."""
-    if not hourly_profile or energy_budget_wh <= 0:
-        return 0.0
-
-    start = sunrise_dt.replace(second=0, microsecond=0)
-    end = (start + timedelta(hours=12)).replace(second=0, microsecond=0)
-    t = start
-    step_min = 5
-    spent_wh = 0.0
-
-    while t < end:
-        pv = _pv_estimate_at(t, hourly_profile)
-        deficit = max(0.0, MINER_POWER_W - pv)
-        step_wh = deficit * (step_min / 60.0)
-        if spent_wh + step_wh >= energy_budget_wh:
-            if step_wh <= 1e-9:
-                break
-            frac = (energy_budget_wh - spent_wh) / step_wh
-            return max(0.0, (t - start).total_seconds() / 60.0 + frac * step_min)
-        spent_wh += step_wh
-        t += timedelta(minutes=step_min)
-
-    return max(0.0, (end - start).total_seconds() / 60.0)
-
-
-def _estimate_bridge_energy_between(start_dt: datetime, end_dt: datetime,
-                                    hourly_profile: Dict[str, Any]) -> float:
-    """Estimate required bridge energy (Wh) between two timestamps."""
-    if not hourly_profile or not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
-        return 0.0
-
-    start = start_dt.replace(second=0, microsecond=0)
-    end = end_dt.replace(second=0, microsecond=0)
-    if end <= start:
-        return 0.0
-
-    t = start
-    step_min = 5
-    needed_wh = 0.0
-
-    while t < end:
-        next_t = min(t + timedelta(minutes=step_min), end)
-        pv = _pv_estimate_at(t, hourly_profile)
-        deficit = max(0.0, MINER_POWER_W - pv)
-        needed_wh += deficit * ((next_t - t).total_seconds() / 3600.0)
-        t = next_t
-
-    return max(0.0, needed_wh)
-
-
-def _telemetry_context_for_history(now: datetime) -> Dict[str, Any]:
-    """Recent telemetry context (fresh/runtime signal) to blend with long-range Solarman history."""
-    items = list(telemetry_history)
-    if not items:
-        return {
-            "samples": 0,
-            "fresh_midday_pv": 0.0,
-            "fresh_charge_rate_pct_per_hour": 0.0,
-            "fresh_clouds": 100.0,
-            "fresh_soc_floor": 0.0,
-            "fresh_month_quality": "neutral",
-            "confidence": 0.0,
-        }
-
-    points: List[Dict[str, Any]] = []
-    for rec in items[-1200:]:  # cap scan cost
-        try:
-            ts = datetime.fromisoformat(str(rec.get("ts", "")))
-        except Exception:
-            continue
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=budapest_tz)
-
-        # Prefer fresh data from the same month and within ~10 days.
-        age_h = (now - ts).total_seconds() / 3600.0
-        if age_h < 0 or age_h > 24 * 10:
-            continue
-        if ts.month != now.month:
-            continue
-
-        points.append({
-            "ts": ts,
-            "battery": _safe_float(rec.get("battery"), 0.0),
-            "power": _safe_float(rec.get("power"), 0.0),
-            "clouds": _safe_float(rec.get("clouds"), 100.0),
-        })
-
-    if len(points) < 8:
-        return {
-            "samples": len(points),
-            "fresh_midday_pv": 0.0,
-            "fresh_charge_rate_pct_per_hour": 0.0,
-            "fresh_clouds": 100.0,
-            "fresh_soc_floor": 0.0,
-            "fresh_month_quality": "neutral",
-            "confidence": 0.2 if points else 0.0,
-        }
-
-    points.sort(key=lambda x: x["ts"])
-    midday = [x["power"] for x in points if 10 <= x["ts"].hour <= 14]
-    fresh_midday_pv = statistics.median(midday) if midday else statistics.median([x["power"] for x in points])
-
-    charge_rates: List[float] = []
-    for i in range(1, len(points)):
-        p0 = points[i - 1]
-        p1 = points[i]
-        dt_h = (p1["ts"] - p0["ts"]).total_seconds() / 3600.0
-        if dt_h <= 0 or dt_h > 0.5:
-            continue
-        if max(p0["power"], p1["power"]) < 700:
-            continue
-        rate = (p1["battery"] - p0["battery"]) / dt_h
-        if 0.05 <= rate <= 18:
-            charge_rates.append(rate)
-
-    fresh_charge_rate = statistics.median(charge_rates) if charge_rates else 0.0
-    fresh_clouds = statistics.median([x["clouds"] for x in points])
-
-    # Recent low-SOC behavior during active hours to shape reserve discipline.
-    active_soc = [x["battery"] for x in points if 9 <= x["ts"].hour <= 18]
-    fresh_soc_floor = statistics.quantiles(active_soc, n=5)[1] if len(active_soc) >= 5 else (min(active_soc) if active_soc else 0.0)
-
-    if fresh_midday_pv >= 2300 and fresh_charge_rate >= 2.2 and fresh_clouds <= 70:
-        fresh_month_quality = "strong"
-    elif fresh_midday_pv <= 1500 or fresh_charge_rate <= 1.0 or fresh_clouds >= 85:
-        fresh_month_quality = "weak"
-    else:
-        fresh_month_quality = "neutral"
-
-    confidence = min(1.0, len(points) / 120.0)
+def build_historical_profile(history_dir: str = "solarman_json", before=None) -> Dict[str, Any]:
+    dataset = load_exports(history_dir, before=before or datetime.now(tz=budapest_tz))
+    dataset["months"] = {month: seasonal_profile(dataset["rows"],month) for month in range(1,13)}
+    print(f"[History] Read-only exports: {dataset['files']} files, {dataset['unique_timestamps']} measurements, {dataset['invalid_rows']} invalid rows")
+    return dataset
+
+
+def _history_recommendation(now, battery_charge, current_power, sunrise_dt, sunset_dt,
+                            weather_outlook=None, current_load=0.0, running=False,
+                            battery_voltage=BATTERY_NOMINAL_V, battery_ah=BATTERY_CAPACITY_AH):
+    profile = ((historical_profile or {}).get("months") or {}).get(now.month,{})
+    weather = (weather_outlook or {}).get("summary_5d","unknown")
+    floor = BATTERY_FLOOR_SOC if running else BATTERY_FLOOR_SOC + MIN_DAWN_BRIDGE_SOC_BUFFER
+    budget = plan_energy(profile,now,sunset_dt,battery_charge,current_power,current_load,running,
+                         _effective_battery_capacity_wh(battery_voltage,battery_ah),MINER_POWER_W,
+                         floor,HARD_AFTERNOON_STOP_SOC,weather,STARTUP_ENERGY_PENALTY_WH)
+    hours = profile.get("hours",{})
+    midday = statistics.mean([hours[h]['pv_p25'] for h in range(10,15) if h in hours]) if any(h in hours for h in range(10,15)) else 0
+    quality = "strong" if midday>=2300 else ("weak" if midday<1650 else "neutral")
     return {
-        "samples": len(points),
-        "fresh_midday_pv": float(fresh_midday_pv),
-        "fresh_charge_rate_pct_per_hour": float(fresh_charge_rate),
-        "fresh_clouds": float(fresh_clouds),
-        "fresh_soc_floor": float(fresh_soc_floor),
-        "fresh_month_quality": fresh_month_quality,
-        "confidence": float(confidence),
-    }
-
-
-def _history_recommendation(now: datetime, battery_charge: float, current_power: float,
-                            sunrise_dt: datetime, sunset_dt: datetime,
-                            weather_outlook: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Creates dynamic decision hints from historical production behavior for current month.
-    Blends long-range Solarman history with fresh runtime telemetry context.
-    """
-    global historical_profile
-    months = (historical_profile or {}).get("months", {})
-    month_cfg = _interpolate_month_config(now.month, months)
-    interpolated_hourly = _interpolate_hourly_profile_for_month(now.month, months)
-    telem_ctx = _telemetry_context_for_history(now)
-    wx = weather_outlook or {}
-    wx5 = str(wx.get("summary_5d", "unknown")).lower()
-
-    if not month_cfg:
-        return {
-            "month_quality": telem_ctx.get("fresh_month_quality", "neutral"),
-            "early_start_soc": 55,
-            "min_stop_soc": 20,
-            "late_day_reserve_soc": 80,
-            "should_preserve_battery": now.hour >= 15 and battery_charge < 80,
-            "headroom_good": current_power >= 2500,
-            "hourly_prod_mean": {},
-            "predicted_minutes_to_full": None,
-            "predicted_full_charge_time": None,
-            "can_refill_before_sunset": False,
-            "telemetry_samples": int(telem_ctx.get("samples", 0)),
-            "telemetry_confidence": float(telem_ctx.get("confidence", 0.0)),
-            "telemetry_month_quality": str(telem_ctx.get("fresh_month_quality", "neutral")),
-            "weather_risk_5d": wx5,
-            "weather_sunny_ratio_5d": float(wx.get("sunny_ratio_5d", 0.0)),
-            "weather_bad_ratio_5d": float(wx.get("bad_ratio_5d", 0.0)),
-            "weather_confidence": float(wx.get("confidence", 0.0)),
-        }
-
-    daylight_span = int(month_cfg.get("daylight_span", 8))
-    midday_avg = float(month_cfg.get("midday_avg", 2000))
-    daily_peak_p75 = float(month_cfg.get("daily_peak_p75", 3500))
-    solar_start_hour = int(month_cfg.get("solar_start_hour", sunrise_dt.hour))
-    evening_soc_p40 = float(month_cfg.get("evening_soc_p40", 45.0))
-
-    # Blend historical (slow) with telemetry (fresh) for stronger adaptivity.
-    telem_weight = min(0.45, max(0.0, float(telem_ctx.get("confidence", 0.0)) * 0.45))
-    blended_midday = (1.0 - telem_weight) * midday_avg + telem_weight * float(telem_ctx.get("fresh_midday_pv", midday_avg))
-
-    strong_month = daylight_span >= 9 and blended_midday >= 2300
-    weak_month = daylight_span <= 7 or blended_midday <= 1650
-
-    telem_quality = str(telem_ctx.get("fresh_month_quality", "neutral"))
-    if telem_quality == "strong" and not weak_month:
-        strong_month = True
-    if telem_quality == "weak":
-        weak_month = True
-        strong_month = False
-
-    if wx5 == "solar_friendly":
-        strong_month = True
-        weak_month = False if telem_quality != "weak" else weak_month
-    elif wx5 == "solar_weak":
-        weak_month = True
-        strong_month = False
-
-    # Lower baseline start SOCs so bridge capacity can be used earlier in the morning.
-    # Weak months still keep stricter discipline.
-    early_start_soc = 28 if strong_month else (52 if weak_month else 42)
-    min_stop_soc = 26 if weak_month else 20
-    late_day_reserve_soc = max(70, int(evening_soc_p40 + (8 if weak_month else 4)))
-
-    fresh_floor = float(telem_ctx.get("fresh_soc_floor", 0.0))
-    if fresh_floor > 0:
-        late_day_reserve_soc = max(late_day_reserve_soc, int(min(88.0, fresh_floor + (8 if weak_month else 5))))
-
-    # Keep reserve discipline realistic so the miner does not stop too early on good days.
-    # In non-export systems an overfilled battery causes PV curtailment; reserve should not
-    # be so high that we waste midday/afternoon production windows.
-    reserve_cap = 88 if weak_month else (86 if strong_month else 87)
-    late_day_reserve_soc = min(reserve_cap, late_day_reserve_soc)
-
-    headroom_good = (
-        current_power >= max(1800.0, 0.55 * daily_peak_p75)
-        and now.hour <= max(solar_start_hour + 5, sunrise_dt.hour + 4)
-    )
-
-    # Preserve battery in weaker months or later afternoon.
-    should_preserve_battery = (
-        now.hour >= (14 if weak_month else 16)
-        and battery_charge < late_day_reserve_soc
-        and current_power < max(1400.0, 0.4 * daily_peak_p75)
-    )
-
-    full_charge_pred = _predict_time_to_full_charge(now, battery_charge, current_power, sunrise_dt, sunset_dt, interpolated_hourly)
-
-    refill_confident_morning = False
-    full_charge_time_raw = full_charge_pred.get("full_charge_time")
-    full_charge_dt: Optional[datetime] = None
-    if isinstance(full_charge_time_raw, str) and full_charge_time_raw:
-        try:
-            full_charge_dt = datetime.fromisoformat(full_charge_time_raw)
-            if full_charge_dt.tzinfo is None:
-                full_charge_dt = full_charge_dt.replace(tzinfo=budapest_tz)
-        except Exception:
-            full_charge_dt = None
-
-    # If history suggests the battery will refill before sunset, allow earlier starts.
-    if wx5 == "solar_weak":
-        early_start_soc = max(early_start_soc, min_stop_soc + 8)
-        late_day_reserve_soc = min(90, max(late_day_reserve_soc, 82))
-    elif wx5 == "solar_friendly":
-        early_start_soc = max(min_stop_soc + 4, early_start_soc - 3)
-
-    if full_charge_pred.get("can_refill_before_sunset", False) and full_charge_pred.get("minutes_to_full") is not None:
-        margin_min = float(full_charge_pred.get("sunset_margin_minutes", 0.0))
-
-        # Stronger relaxation when full recharge is predicted before late morning.
-        if full_charge_dt is not None and full_charge_dt <= now.replace(hour=11, minute=30, second=0, microsecond=0):
-            refill_confident_morning = True
-            early_start_soc = max(min_stop_soc + 4, early_start_soc - 16)
-        elif margin_min >= 120:
-            early_start_soc = max(min_stop_soc + 5, early_start_soc - 12)
-        elif margin_min >= 45:
-            early_start_soc = max(min_stop_soc + 6, early_start_soc - 10)
-        elif margin_min >= 15:
-            early_start_soc = max(min_stop_soc + 8, early_start_soc - 6)
-
-    return {
-        "month_quality": "strong" if strong_month else ("weak" if weak_month else "neutral"),
-        "early_start_soc": early_start_soc,
-        "min_stop_soc": min_stop_soc,
-        "late_day_reserve_soc": late_day_reserve_soc,
-        "should_preserve_battery": should_preserve_battery,
-        "headroom_good": headroom_good,
-        "hourly_prod_mean": month_cfg.get("hourly_prod_mean", {}) or interpolated_hourly,
-        "hourly_prod_p50": month_cfg.get("hourly_prod_p50", {}) or interpolated_hourly,
-        "hourly_prod_p75": month_cfg.get("hourly_prod_p75", {}) or interpolated_hourly,
-        "hourly_prod_p90": month_cfg.get("hourly_prod_p90", {}) or interpolated_hourly,
-        "first_miner_cover_hour": float(month_cfg.get("first_miner_cover_hour", 0.0)),
-        "daily_energy_wh_p50": float(month_cfg.get("daily_energy_wh_p50", 0.0)),
-        "daily_energy_wh_p75": float(month_cfg.get("daily_energy_wh_p75", 0.0)),
-        "charge_rate_pct_per_hour_p50": float(month_cfg.get("charge_rate_pct_per_hour_p50", 0.0)),
-        "refill_confidence": float(month_cfg.get("refill_confidence", 0.0)),
-        "predicted_minutes_to_full": full_charge_pred.get("minutes_to_full"),
-        "predicted_full_charge_time": full_charge_pred.get("full_charge_time"),
-        "can_refill_before_sunset": bool(full_charge_pred.get("can_refill_before_sunset", False)),
-        "sunset_margin_minutes": float(full_charge_pred.get("sunset_margin_minutes", 0.0)),
-        "predicted_charge_rate_pct_per_hour": float(full_charge_pred.get("rate_pct_per_hour", 0.0)),
-        "refill_confident_morning": bool(refill_confident_morning),
-        "telemetry_samples": int(telem_ctx.get("samples", 0)),
-        "telemetry_confidence": float(telem_ctx.get("confidence", 0.0)),
-        "telemetry_month_quality": telem_quality,
-        "blended_midday_pv": float(blended_midday),
-        "weather_risk_5d": wx5,
-        "weather_sunny_ratio_5d": float(wx.get("sunny_ratio_5d", 0.0)),
-        "weather_bad_ratio_5d": float(wx.get("bad_ratio_5d", 0.0)),
-        "weather_confidence": float(wx.get("confidence", 0.0)),
-        "weather_source": str(wx.get("source", "none")),
-    }
-
-
-def _predict_time_to_full_charge(now: datetime, battery_charge: float, current_power: float,
-                                 sunrise_dt: datetime, sunset_dt: datetime,
-                                 hourly_prod_mean: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Estimate minutes to 100% SOC based on recent telemetry trend and historical month profile.
-    This is intentionally conservative: it only allows early-start relaxation when refill
-    is likely before sunset.
-    """
-    if battery_charge >= 99.5:
-        return {
-            "minutes_to_full": 0.0,
-            "full_charge_time": now.isoformat(),
-            "can_refill_before_sunset": True,
-            "sunset_margin_minutes": max(0.0, (sunset_dt - now).total_seconds() / 60.0),
-            "rate_pct_per_hour": 0.0,
-        }
-
-    # 1) Learn charge-rate from telemetry deltas (same month, daytime, positive charging periods).
-    rates: List[float] = []
-    hist_items = list(telemetry_history)
-    for i in range(1, len(hist_items)):
-        prev = hist_items[i - 1]
-        cur = hist_items[i]
-        try:
-            t0 = datetime.fromisoformat(str(prev.get("ts", "")))
-            t1 = datetime.fromisoformat(str(cur.get("ts", "")))
-        except Exception:
-            continue
-
-        if t0.tzinfo is None:
-            t0 = t0.replace(tzinfo=budapest_tz)
-        if t1.tzinfo is None:
-            t1 = t1.replace(tzinfo=budapest_tz)
-
-        if t1 <= t0 or t1.month != now.month:
-            continue
-
-        dt_h = (t1 - t0).total_seconds() / 3600.0
-        if dt_h <= 0 or dt_h > 0.5:
-            continue
-
-        b0 = _safe_float(prev.get("battery"), -1)
-        b1 = _safe_float(cur.get("battery"), -1)
-        if not (0 <= b0 <= 100 and 0 <= b1 <= 100):
-            continue
-
-        p0 = _safe_float(prev.get("power"), 0)
-        p1 = _safe_float(cur.get("power"), 0)
-        c0 = _safe_float(prev.get("clouds"), 100)
-        c1 = _safe_float(cur.get("clouds"), 100)
-
-        # Prefer segments where PV is meaningful and weather is not heavily overcast.
-        if max(p0, p1) < 700 or max(c0, c1) > 90:
-            continue
-
-        rate = (b1 - b0) / dt_h
-        if 0.05 <= rate <= 18.0:
-            rates.append(rate)
-
-    rate_pct_per_hour = statistics.median(rates) if rates else 0.0
-
-    # 2) Blend with profile confidence from expected hourly PV around "now".
-    expected_now_pv = _pv_estimate_at(now, hourly_prod_mean) if hourly_prod_mean else 0.0
-    if rate_pct_per_hour <= 0.0 and expected_now_pv > MINER_POWER_W * 0.8:
-        # fallback conservative synthetic rate when telemetry is sparse
-        rate_pct_per_hour = 2.8 if now.month in (4, 5, 6, 7, 8) else 1.8
-
-    if rate_pct_per_hour <= 0.0:
-        return {
-            "minutes_to_full": None,
-            "full_charge_time": None,
-            "can_refill_before_sunset": False,
-            "sunset_margin_minutes": 0.0,
-            "rate_pct_per_hour": 0.0,
-        }
-
-    missing_pct = max(0.0, 100.0 - battery_charge)
-    minutes_to_full = (missing_pct / rate_pct_per_hour) * 60.0
-    full_dt = now + timedelta(minutes=minutes_to_full)
-    margin_min = (sunset_dt - full_dt).total_seconds() / 60.0
-
-    return {
-        "minutes_to_full": round(max(0.0, minutes_to_full), 2),
-        "full_charge_time": full_dt.isoformat(),
-        "can_refill_before_sunset": margin_min >= 0,
-        "sunset_margin_minutes": round(margin_min, 2),
-        "rate_pct_per_hour": round(rate_pct_per_hour, 3),
+        "history_source":"solarman_json", "history_samples":profile.get('samples',0),
+        "history_days":profile.get('days',0), "history_coverage":budget['coverage'],
+        "history_interpolated":profile.get('interpolated',False), "energy_budget":budget,
+        "month_quality":quality,"early_start_soc":floor,"min_stop_soc":BATTERY_FLOOR_SOC,
+        "late_day_reserve_soc":HARD_AFTERNOON_STOP_SOC,
+        "should_preserve_battery":not budget['safe'],"headroom_good":budget['safe'],
+        "hourly_prod_mean":{str(h):v['pv_p25'] for h,v in hours.items()},
+        "weather_risk_5d":weather,"weather_sunny_ratio_5d":(weather_outlook or {}).get('sunny_ratio_5d',0),
+        "weather_bad_ratio_5d":(weather_outlook or {}).get('bad_ratio_5d',0),
+        "predicted_full_charge_time":budget.get('full_charge_time'),
+        "can_refill_before_sunset":bool(budget.get('full_charge_time')),
     }
 
 
 def _has_solarman_payload(data: Optional[Dict[str, Any]]) -> bool:
     return bool(isinstance(data, dict) and isinstance(data.get("dataList"), list) and len(data.get("dataList")) > 0)
-
-
-def _with_daytime_data_fallback(data: Dict[str, Any], now: datetime,
-                                sunrise_dt: datetime, sunset_dt: datetime) -> Tuple[Dict[str, Any], bool]:
-    """During active daylight window, keep the previous non-empty payload if API returns empty dataList."""
-    if _has_solarman_payload(data):
-        return data, False
-
-    if not _is_control_window(now, sunrise_dt, sunset_dt):
-        return data, False
-
-    previous = load_data()
-    if _has_solarman_payload(previous):
-        print("[Fallback] Empty Solarman dataList in daytime -> using previous stored payload to avoid false stop/start toggles.")
-        return previous, True
-
-    return data, False
-
-
-def _compute_start_bridge_guard(now: datetime, battery_charge: float, current_power: float,
-                                sunrise_dt: datetime, sunset_dt: datetime,
-                                hist: Dict[str, Any], battery_voltage: float, battery_ah: float) -> Dict[str, Any]:
-    """
-    Prevent rapid ON/OFF cycles near minimum SOC by requiring enough battery energy
-    to bridge the period until typical PV can continuously feed the miner load.
-    """
-    min_stop_soc = float(hist.get("min_stop_soc", BATTERY_FLOOR_SOC))
-    hourly_prod_mean = hist.get("hourly_prod_mean", {}) if isinstance(hist, dict) else {}
-    if not isinstance(hourly_prod_mean, dict):
-        hourly_prod_mean = {}
-
-    capacity_wh = _effective_battery_capacity_wh(battery_voltage, battery_ah)
-
-    # Usable bridge energy for start permission is intentionally measured only above min_stop_soc reserve.
-    # Example: at 100% SOC and 26% min-stop reserve, usable window is 74% of capacity.
-    soc_window_pct = max(0.0, battery_charge - min_stop_soc)
-    usable_wh = max(0.0, soc_window_pct / 100.0 * capacity_wh)
-    # Operational bridge runtime should reflect the actual BMS floor window (20-100%).
-    bms_floor_soc = 20.0
-    bridge_soc_window_pct = max(0.0, battery_charge - bms_floor_soc)
-    bridge_usable_wh = max(0.0, bridge_soc_window_pct / 100.0 * capacity_wh)
-    deficit_w = max(0.0, MINER_POWER_W - max(0.0, current_power))
-    guard_bridge_minutes = 999.0 if deficit_w <= 0 else (usable_wh / deficit_w) * 60.0
-    current_bridge_minutes = 0.0 if deficit_w <= 0 else (bridge_usable_wh / deficit_w) * 60.0
-
-    estimated_full_supply_dt, daily_needed_bridge_wh = _estimate_full_supply_and_energy(
-        sunrise_dt, now, hourly_prod_mean
-    )
-    daily_needed_bridge_minutes = (
-        _estimate_minutes_for_energy_budget(sunrise_dt, hourly_prod_mean, daily_needed_bridge_wh)
-        if daily_needed_bridge_wh > 0 else 0.0
-    )
-
-    eta_minutes = 999.0
-    needed_bridge_minutes = daily_needed_bridge_minutes
-    needed_bridge_wh = daily_needed_bridge_wh
-
-    if estimated_full_supply_dt is not None:
-        # Remaining time from now until expected full PV supply.
-        eta_minutes = max(0.0, (estimated_full_supply_dt - now).total_seconds() / 60.0)
-
-        # Remaining requirement from now to full-supply moment for runtime safety checks.
-        remaining_bridge_wh = (
-            _estimate_bridge_energy_between(now, estimated_full_supply_dt, hourly_prod_mean)
-            if eta_minutes > 0.0 else 0.0
-        )
-    else:
-        remaining_bridge_wh = 0.0
-        if deficit_w <= 0:
-            eta_minutes = 0.0
-
-    # Real-time override: if PV already (or almost) covers miner demand, we're in full-supply mode.
-    # Historical interpolation can still yield a small positive ETA near hour boundaries (e.g. 1-3 min),
-    # and meter jitter can report tiny deficits; both should display as 0 and require no bridge energy.
-    realtime_full_supply_margin_w = max(50.0, MINER_POWER_W * 0.015)
-    if deficit_w <= realtime_full_supply_margin_w:
-        eta_minutes = 0.0
-        remaining_bridge_wh = 0.0
-
-    # Avoid zero ETA when real-time PV is still below miner demand.
-    if deficit_w > realtime_full_supply_margin_w and eta_minutes <= 0.0:
-        eta_minutes = 5.0
-        remaining_bridge_wh = max(remaining_bridge_wh, deficit_w * (eta_minutes / 60.0))
-
-    # BMS floor applies system-wide: battery operational bridge window is 20-100% SOC.
-    bms_window_pct = max(0.0, 100.0 - bms_floor_soc)
-    bms_window_wh = (bms_window_pct / 100.0) * capacity_wh
-    if needed_bridge_wh > bms_window_wh:
-        needed_bridge_wh = bms_window_wh
-        needed_bridge_minutes = min(
-            needed_bridge_minutes,
-            _estimate_minutes_for_energy_budget(sunrise_dt, hourly_prod_mean, needed_bridge_wh)
-        )
-    remaining_bridge_wh = min(remaining_bridge_wh, bms_window_wh)
-
-    # Morning-only relevance: after full supply, current bridge/LTA is obsolete,
-    # but daily needed bridge stats remain useful as day-level requirements.
-    if now >= sunrise_dt and eta_minutes <= 0.0:
-        current_bridge_minutes = 0.0
-        eta_minutes = 0.0
-
-    energy_cover_ok = remaining_bridge_wh > 0 and usable_wh >= remaining_bridge_wh
-    allow_start = battery_charge > min_stop_soc and (guard_bridge_minutes >= eta_minutes or energy_cover_ok)
-
-    # If historical profile predicts refill before sunset, relax morning start conservatively
-    # to avoid missing production windows in non-export systems.
-    refill_confident_morning = bool(hist.get("refill_confident_morning", False))
-    refill_pv_threshold = max(120.0, MINER_POWER_W * 0.12) if refill_confident_morning else max(300.0, MINER_POWER_W * 0.30)
-    refill_soc_buffer = 6 if refill_confident_morning else 10
-    refill_morning_window_ok = now.hour < (11 if refill_confident_morning else 13)
-
-    refill_relax = (
-        bool(hist.get("can_refill_before_sunset", False))
-        and refill_morning_window_ok
-        and battery_charge >= (min_stop_soc + refill_soc_buffer)
-        and current_power >= refill_pv_threshold
-    )
-    if (not allow_start) and refill_relax:
-        allow_start = True
-
-    refill_feasibility_block = (
-        not bool(hist.get("can_refill_before_sunset", True))
-        and now.hour >= 10
-        and battery_charge < max(min_stop_soc + 18, 48.0)
-        and current_power < max(320.0, MINER_POWER_W * 0.30)
-    )
-    if allow_start and refill_feasibility_block:
-        allow_start = False
-
-    refill_reason = "refill_confident_morning_relaxation" if refill_confident_morning else "refill_confident_relaxation"
-    if refill_feasibility_block:
-        reason = "cannot_refill_before_sunset_guard"
-    elif allow_start and not refill_relax:
-        reason = "ok"
-    elif allow_start and refill_relax:
-        reason = refill_reason
-    else:
-        reason = "soc_below_min_stop" if battery_charge <= min_stop_soc else "insufficient_bridge_energy"
-
-    return {
-        "allow_start": allow_start,
-        "energy_cover_ok": bool(energy_cover_ok),
-        "usable_wh": round(usable_wh, 2),
-        "deficit_w": round(deficit_w, 2),
-        "bridge_minutes": round(current_bridge_minutes, 2),
-        "eta_minutes": round(eta_minutes, 2),
-        "needed_bridge_minutes": round(needed_bridge_minutes, 2),
-        "needed_bridge_wh": round(needed_bridge_wh, 2),
-        "remaining_bridge_wh": round(remaining_bridge_wh, 2),
-        "reason": reason,
-        "capacity_wh": round(capacity_wh, 2),
-        "battery_voltage": round(max(0.0, battery_voltage), 2),
-        "battery_ah": round(max(0.0, battery_ah), 2),
-        "soc_window_pct": round(soc_window_pct, 2),
-        "min_stop_soc": round(min_stop_soc, 2),
-        "bms_floor_soc": round(bms_floor_soc, 2),
-        "bms_window_wh": round(bms_window_wh, 2),
-    }
-
-
-def _available_bridge_wh(battery_soc, min_stop_soc, battery_voltage, battery_ah) -> float:
-    capacity_wh = _effective_battery_capacity_wh(_safe_float(battery_voltage, BATTERY_NOMINAL_V), _safe_float(battery_ah, BATTERY_CAPACITY_AH))
-    usable_pct = max(0.0, _safe_float(battery_soc, 0.0) - _safe_float(min_stop_soc, BATTERY_FLOOR_SOC))
-    return max(0.0, capacity_wh * usable_pct / 100.0)
-
-
-def _required_bridge_wh_until_cover(now, cover_dt, hourly_profile, miner_power_w) -> float:
-    if not isinstance(now, datetime) or not isinstance(cover_dt, datetime) or cover_dt <= now:
-        return 0.0
-    profile = hourly_profile if isinstance(hourly_profile, dict) else {}
-    t = now.replace(second=0, microsecond=0)
-    end = cover_dt.replace(second=0, microsecond=0)
-    step_min = 5
-    total_wh = 0.0
-    while t < end:
-        nxt = min(t + timedelta(minutes=step_min), end)
-        pv = _pv_estimate_at(t, profile)
-        total_wh += max(0.0, float(miner_power_w) - pv) * ((nxt - t).total_seconds() / 3600.0)
-        t = nxt
-    return max(0.0, total_wh)
-
-
-def _predict_first_miner_cover_time(now, sunrise_dt, hourly_profile, miner_power_w, quantile="p50") -> Optional[datetime]:
-    if not isinstance(now, datetime):
-        return None
-    profile = hourly_profile if isinstance(hourly_profile, dict) else {}
-    if not profile:
-        return None
-    start = max(now, sunrise_dt if isinstance(sunrise_dt, datetime) else now).replace(second=0, microsecond=0)
-    end = start.replace(hour=23, minute=59, second=0, microsecond=0)
-    t = start
-    while t <= end:
-        if _pv_estimate_at(t, profile) >= float(miner_power_w):
-            return t
-        t += timedelta(minutes=5)
-    return None
-
-
-def _predict_full_recharge_feasibility(now, battery_soc, sunset_dt, hourly_profile, telemetry_context, weather_outlook) -> Dict[str, Any]:
-    missing_pct = max(0.0, 100.0 - _safe_float(battery_soc, 0.0))
-    if missing_pct <= 0.5:
-        return {
-            "can_refill_before_sunset": True,
-            "predicted_full_charge_time": now.isoformat() if isinstance(now, datetime) else None,
-            "confidence": 1.0,
-            "required_charge_rate": 0.0,
-            "predicted_charge_rate": 0.0,
-        }
-    remaining_h = max(0.0, ((sunset_dt - now).total_seconds() / 3600.0) if isinstance(sunset_dt, datetime) and isinstance(now, datetime) else 0.0)
-    required_rate = missing_pct / remaining_h if remaining_h > 0 else 999.0
-    telem_rate = _safe_float((telemetry_context or {}).get("fresh_charge_rate_pct_per_hour"), 0.0)
-    hist_rate = _safe_float((telemetry_context or {}).get("charge_rate_pct_per_hour_p50"), 0.0)
-    predicted_rate = max(telem_rate, hist_rate)
-    if predicted_rate <= 0:
-        # PV-energy fallback: 1 SOC pct = capacity/100 Wh, use conservative 55% charge usefulness.
-        capacity_wh = _effective_battery_capacity_wh(BATTERY_NOMINAL_V, BATTERY_CAPACITY_AH)
-        future_wh = 0.0
-        t = now.replace(second=0, microsecond=0)
-        while isinstance(sunset_dt, datetime) and t < sunset_dt:
-            future_wh += _pv_estimate_at(t, hourly_profile or {}) * (5.0 / 60.0) * 0.55
-            t += timedelta(minutes=5)
-        predicted_rate = (future_wh / max(1.0, capacity_wh) * 100.0) / max(0.25, remaining_h)
-    wx = str((weather_outlook or {}).get("summary_5d", "unknown")).lower()
-    confidence = 0.52
-    if predicted_rate >= required_rate:
-        confidence += min(0.35, (predicted_rate - required_rate) / max(1.0, required_rate) * 0.25)
-    if wx == "solar_friendly":
-        confidence += 0.08
-    elif wx == "solar_weak":
-        confidence -= 0.08
-    confidence += min(0.12, _safe_float((telemetry_context or {}).get("confidence"), 0.0) * 0.12)
-    full_dt = now + timedelta(hours=(missing_pct / predicted_rate)) if predicted_rate > 0 and isinstance(now, datetime) else None
-    can = bool(full_dt and isinstance(sunset_dt, datetime) and full_dt <= sunset_dt and confidence >= 0.50)
-    return {
-        "can_refill_before_sunset": can,
-        "predicted_full_charge_time": full_dt.isoformat() if full_dt else None,
-        "confidence": round(max(0.0, min(1.0, confidence)), 3),
-        "required_charge_rate": round(required_rate, 3),
-        "predicted_charge_rate": round(predicted_rate, 3),
-    }
 
 
 def _control_window_details(now, sunrise_dt, sunset_dt, hist=None) -> Dict[str, Any]:
@@ -1600,7 +622,7 @@ def _control_window_details(now, sunrise_dt, sunset_dt, hist=None) -> Dict[str, 
     if sunrise_dt <= now <= sunset_dt:
         return {"active": True, "reason": "daylight"}
     dawn_start = sunrise_dt - timedelta(minutes=max(0, PRE_SUNRISE_CONTROL_MINUTES))
-    has_context = bool((historical_profile or {}).get("months")) or bool(telemetry_history) or bool(hist)
+    has_context = bool((historical_profile or {}).get("months")) or bool(hist)
     if has_context and dawn_start <= now < sunrise_dt:
         return {"active": True, "reason": "dawn_pre_sunrise"}
     return {"active": False, "reason": "outside_control_window"}
@@ -1636,189 +658,56 @@ def _make_miner_decision(
     battery_voltage,
     battery_ah,
     weather_outlook,
+    current_load=None,
 ) -> Dict[str, Any]:
-    hist = hist if isinstance(hist, dict) else {}
-    start_guard = start_guard if isinstance(start_guard, dict) else {}
-    wx5 = str(hist.get("weather_risk_5d") or (weather_outlook or {}).get("summary_5d", "unknown")).lower()
-    min_stop_soc = _safe_float(hist.get("min_stop_soc"), BATTERY_FLOOR_SOC)
-    hourly_quantile = "p75" if wx5 == "solar_weak" else "p50"
-    hourly_profile = _hourly_profile_from_hist(hist, hourly_quantile)
-    control = _control_window_details(now, sunrise, sunset, hist)
-    dawn_bridge_window = isinstance(sunrise, datetime) and (sunrise - timedelta(minutes=PRE_SUNRISE_CONTROL_MINUTES)) <= now <= (sunrise + timedelta(minutes=60))
-    available_wh = _available_bridge_wh(battery_charge, min_stop_soc, battery_voltage, battery_ah)
-    cover_dt = _predict_first_miner_cover_time(now, sunrise, hourly_profile, MINER_POWER_W, hourly_quantile)
-    required_wh = _required_bridge_wh_until_cover(now, cover_dt, hourly_profile, MINER_POWER_W) if cover_dt else 999999.0
-    buffer_soc = WEAK_WEATHER_BRIDGE_SOC_BUFFER if wx5 == "solar_weak" else MIN_DAWN_BRIDGE_SOC_BUFFER
-    safety_factor = BRIDGE_START_SAFETY_FACTOR + (0.10 if wx5 == "solar_weak" else 0.0)
-    dawn_weather_block_reason = _dawn_weather_block_reason(
-        current_condition, f1_cond, f1_clouds, f3_cond, f3_clouds, weather_outlook or {}
-    )
-    dawn_weather_block = bool(dawn_weather_block_reason)
-    telem_ctx = _telemetry_context_for_history(now)
-    telem_ctx["charge_rate_pct_per_hour_p50"] = _safe_float(hist.get("charge_rate_pct_per_hour_p50"), 0.0)
-    refill = _predict_full_recharge_feasibility(now, battery_charge, sunset, hourly_profile, telem_ctx, weather_outlook or {})
-    refill_conf = max(_safe_float(hist.get("refill_confidence"), 0.0), _safe_float(refill.get("confidence"), 0.0))
-    phase_safe = _is_phase_power_safe(inv_l1, inv_l2, inv_l3, inv_lt)
-    force_cooldown_active = isinstance(_last_force_shutdown_at, datetime) and (now - _last_force_shutdown_at).total_seconds() < MINER_STOP_FORCE_COOLDOWN_MINUTES * 60
-    hard_stop = False
-    afternoon_reserve_stop = False
-    soft_stop = False
-    start_hits: List[str] = []
-    stop_hits: List[str] = []
-
-    if battery_charge <= min_stop_soc:
-        hard_stop = True
-        stop_hits.append("Battery at/below protected min_stop_soc")
-    if not phase_safe:
-        hard_stop = True
-        stop_hits.append("Phase/total inverter safety threshold exceeded")
-
-    # Night-house reserve: after the configured afternoon cutoff, mining must not
-    # spend the battery below the protected reserve target. This is intentionally
-    # immediate (no debounce), because that SOC is reserved for overnight house load.
-    afternoon_reserve_stop = (
-        now.hour >= HARD_AFTERNOON_STOP_HOUR
-        and battery_charge < HARD_AFTERNOON_STOP_SOC
-    )
-    if afternoon_reserve_stop:
-        hard_stop = True
-        stop_hits.append(f"Afternoon night reserve: SOC below {HARD_AFTERNOON_STOP_SOC:.0f}% after {HARD_AFTERNOON_STOP_HOUR}:00")
-
-    if not control.get("active", False):
-        stop_hits.append("Outside active control window")
-
-    cover_before_deadline = bool(cover_dt and cover_dt.hour < ZERO_PV_REFILL_DEADLINE_HOUR)
-    required_with_safety_wh = (required_wh * safety_factor + STARTUP_ENERGY_PENALTY_WH) if required_wh < 999999 else 999999.0
-    bridge_ok = available_wh >= required_with_safety_wh
-    refill_ok = bool(hist.get("can_refill_before_sunset", False)) or bool(refill.get("can_refill_before_sunset", False)) or refill_conf >= 0.62
-    battery_capacity_wh = max(1.0, battery_voltage * battery_ah)
-    projected_soc_at_cover = battery_charge - ((required_with_safety_wh / battery_capacity_wh) * 100.0 if required_with_safety_wh < 999999 else 999.0)
-    projected_soc_ok = projected_soc_at_cover >= (min_stop_soc + DAWN_START_TARGET_SOC_MARGIN)
-    dawn_zero_pv_start = (
-        control.get("active", False)
-        and dawn_bridge_window
-        and current_power <= DAWN_ZERO_PV_MAX_W
-        and battery_charge >= min_stop_soc + buffer_soc
-        and bridge_ok
-        and projected_soc_ok
-        and cover_before_deadline
-        and refill_ok
-        and not dawn_weather_block
-        and not hard_stop
-        and not force_cooldown_active
-        and phase_safe
-    )
-    if dawn_bridge_window and current_power <= DAWN_ZERO_PV_MAX_W and dawn_weather_block:
-        stop_hits.append(f"Dawn zero-PV bridge start blocked by weather: {dawn_weather_block_reason}")
-    if dawn_zero_pv_start:
-        start_hits.append(f"Dawn zero-PV bridge start: delayed until projected SOC at cover stays >= min_stop+{DAWN_START_TARGET_SOC_MARGIN:.1f}%")
-
-    pv_covers = current_power >= max(150.0, MINER_POWER_W * PV_COVERAGE_RATIO_START)
-    normal_start = (
-        control.get("active", False)
-        and not hard_stop
-        and not force_cooldown_active
-        and bool(start_guard.get("allow_start", False))
-        and battery_charge >= min_stop_soc + 4
-        and (pv_covers or (current_power >= max(120.0, MINER_POWER_W * 0.10) and refill_ok))
-    )
-    if normal_start:
-        start_hits.append("Bridge guard start: PV/forecast and refill model allow mining")
-
-
-    if prev_state == "production" and not hard_stop:
-        low_pv = current_power <= 150.0
-        bridge_budget_insufficient = available_wh < (required_wh * 0.85 + STARTUP_ENERGY_PENALTY_WH) if required_wh < 999999 else True
-        dawn_allow_active = dawn_bridge_window and bridge_ok and refill_ok
-        if low_pv and (not dawn_allow_active) and (bridge_budget_insufficient or battery_charge <= min_stop_soc + 4):
-            soft_stop = True
-            stop_hits.append("PV deficit confirmed and bridge budget insufficient")
-        if hist.get("should_preserve_battery", False) and current_power < MINER_POWER_W * 0.75 and battery_charge < _safe_float(hist.get("late_day_reserve_soc"), 80.0):
-            soft_stop = True
-            stop_hits.append("Late-day reserve protection")
-        if now.hour >= HARD_AFTERNOON_STOP_HOUR and battery_charge >= HIGH_SOC_STOP_SOC and current_power <= HIGH_SOC_STOP_MAX_PV_W:
-            soft_stop = True
-            stop_hits.append("High-SOC low-PV afternoon curtailment stop")
-
-    start_score = 0.0
-    if battery_charge > min_stop_soc:
-        start_score += min(0.25, (battery_charge - min_stop_soc) / 100.0)
-    if bridge_ok:
-        start_score += 0.30
-    if refill_ok:
-        start_score += 0.25
-    if cover_before_deadline:
-        start_score += 0.10
-    if phase_safe:
-        start_score += 0.10
-    if wx5 == "solar_weak":
-        start_score -= 0.05
-    start_score = max(0.0, min(1.0, start_score))
-    stop_score = 0.95 if hard_stop else (0.72 if soft_stop else 0.15)
-    confidence = max(start_score if start_hits else 0.0, stop_score if (hard_stop or soft_stop) else 0.0, refill_conf)
-
-    desired = "hold"
-    if hard_stop:
-        desired = "stop"
-    elif start_hits and start_score >= MIN_DECISION_CONFIDENCE_START:
-        desired = "production"
-    elif prev_state == "production" and soft_stop and stop_score >= MIN_DECISION_CONFIDENCE_STOP:
-        desired = "stop"
-    elif prev_state == "production":
-        desired = "production"
-    elif not control.get("active", False):
-        desired = "stop"
-    else:
-        desired = "stop"
-
-    summary = "HOLD: no decision"
-    if hard_stop and afternoon_reserve_stop:
-        summary = "STOP: afternoon night reserve protection"
-    elif hard_stop:
-        summary = "STOP: hard safety rule"
-    elif desired == "production" and dawn_zero_pv_start:
-        summary = "START: dawn zero-PV bridge energy and refill model allow mining"
-    elif desired == "production":
-        summary = "START: bridge/refill start rules satisfied"
-    elif desired == "stop" and soft_stop:
-        summary = "STOP: soft economic rules confirmed"
-    elif desired == "stop":
-        summary = "STOP: no valid start rule"
-
+    hints = _history_recommendation(now,battery_charge,current_power,sunrise,sunset,weather_outlook,
+                                    inv_lt if current_load is None else current_load,
+                                    prev_state=="production",battery_voltage,battery_ah)
+    budget = hints['energy_budget']
+    control = _control_window_details(now,sunrise,sunset,hints)
+    reasons = []
+    hard = False
+    if not control['active']:
+        reasons.append('Outside production window')
+        hard = True
+    if battery_charge<=BATTERY_FLOOR_SOC:
+        reasons.append('Battery protected floor')
+        hard = True
+    if not _is_phase_power_safe(inv_l1,inv_l2,inv_l3,inv_lt):
+        reasons.append('Phase/total inverter limit')
+        hard = True
+    if not budget['safe']:
+        reasons.append('Historical energy budget cannot protect battery and evening reserve')
+    if prev_state!='production' and (sunset-now).total_seconds()<MIN_RUN_MINUTES*60:
+        reasons.append('Insufficient time for minimum run before stop window')
+    rain = _dawn_weather_block_reason(current_condition,f1_cond,f1_clouds,f3_cond,f3_clouds,weather_outlook or {})
+    if prev_state!='production' and now<sunrise and rain:
+        reasons.append(rain)
+    cooldown = isinstance(_last_force_shutdown_at,datetime) and (now-_last_force_shutdown_at).total_seconds()<MINER_STOP_FORCE_COOLDOWN_MINUTES*60
+    if cooldown and prev_state!='production':
+        reasons.append('Shutdown cooldown')
+    desired = 'stop' if reasons else 'production'
+    # A forecast reserve violation must not wait through additional STOP samples.
+    hard = hard or (prev_state=='production' and not budget['safe'])
     metrics = {
-        "available_bridge_wh": round(available_wh, 2),
-        "required_bridge_wh": round(required_wh if required_wh < 999999 else 0.0, 2),
-        "bridge_safety_factor": round(safety_factor, 3),
-        "startup_energy_penalty_wh": round(STARTUP_ENERGY_PENALTY_WH, 2),
-        "predicted_first_miner_cover_time": cover_dt.isoformat() if cover_dt else None,
-        "predicted_full_charge_time": refill.get("predicted_full_charge_time"),
-        "predicted_refill_confidence": round(refill_conf, 3),
-        "active_control_window": bool(control.get("active", False)),
-        "control_window_reason": str(control.get("reason", "unknown")),
-        "min_stop_soc": round(min_stop_soc, 2),
-        "dawn_soc_buffer": round(buffer_soc, 2),
-        "dawn_weather_block": bool(dawn_weather_block),
-        "dawn_weather_block_reason": dawn_weather_block_reason,
-        "afternoon_reserve_soc": round(HARD_AFTERNOON_STOP_SOC, 2),
-        "afternoon_reserve_hour": int(HARD_AFTERNOON_STOP_HOUR),
-        "refill_model": refill,
+        'available_bridge_wh':budget.get('available_bridge_wh',0),
+        'required_bridge_wh':budget.get('required_bridge_wh',0),
+        'bridge_safety_factor':1.0,'startup_energy_penalty_wh':STARTUP_ENERGY_PENALTY_WH,
+        'predicted_first_miner_cover_time':budget.get('cover_time'),
+        'predicted_full_charge_time':budget.get('full_charge_time'),
+        'predicted_refill_confidence':budget['coverage'],
+        'active_control_window':control['active'],'control_window_reason':control['reason'],
+        'dawn_weather_block':bool(rain),'dawn_weather_block_reason':rain,
     }
-    return {
-        "desired_state": desired,
-        "decision_summary": summary,
-        "decision_state": desired,
-        "start_score": round(start_score, 3),
-        "stop_score": round(stop_score, 3),
-        "confidence": round(max(0.0, min(1.0, confidence)), 3),
-        "start_rule_hits": start_hits,
-        "stop_rule_hits": stop_hits,
-        "hard_stop": bool(hard_stop),
-        "soft_stop": bool(soft_stop),
-        "afternoon_reserve_stop": bool(afternoon_reserve_stop),
-        "zero_pv_bridge_start": bool(dawn_zero_pv_start),
-        "dawn_start_allowed": bool(dawn_zero_pv_start or (dawn_bridge_window and bridge_ok and refill_ok and not dawn_weather_block and not hard_stop)),
-        "metrics": metrics,
-    }
+    return {'desired_state':desired,'decision_state':desired,
+            'decision_summary':('STOP: '+'; '.join(reasons)) if reasons else 'RUN: history-based energy budget protects reserve',
+            'start_rule_hits':[] if reasons else ['Seasonal PV/load budget covers battery reserve'],
+            'stop_rule_hits':reasons,'hard_stop':hard,'soft_stop':desired=='stop' and not hard,
+            'confidence':budget['coverage'],'start_score':budget['coverage'] if desired=='production' else 0,
+            'stop_score':1 if desired=='stop' else 0,'zero_pv_bridge_start':desired=='production' and current_power<=DAWN_ZERO_PV_MAX_W,
+            'dawn_start_allowed':desired=='production' and now<sunrise,
+            'metrics':metrics,'history_hints':hints}
+
 
 def _runtime_info() -> str:
     try:
@@ -2144,29 +1033,10 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         temps = get_temperatures()
         percentage = (used_quote / QUOTE_LIMIT) * 100 if QUOTE_LIMIT else 0
 
-        # read inverter phase powers from live snapshot first; fall back to saved file.
-        l1 = l2 = l3 = lt = 0 if (_safe_float(power, 0.0) == 0 and str(state).lower() in {"stop", "sleep"}) else None
-        unit = "W"
         with snapshot_lock:
             snap = dict(_shared_snapshot)
-        if l1 is None:
-            l1 = snap.get("inv_l1")
-            l2 = snap.get("inv_l2")
-            l3 = snap.get("inv_l3")
-            lt = snap.get("inv_lt")
-        try:
-            if (l1 is None or l2 is None or l3 is None or lt is None) and os.path.exists(SOLARMAN_FILE):
-                with open(SOLARMAN_FILE, 'r', encoding='utf-8') as f:
-                    saved = json.load(f)
-                phase = saved.get("phasePowers", {})
-                l1 = phase.get("L1") if l1 is None else l1
-                l2 = phase.get("L2") if l2 is None else l2
-                l3 = phase.get("L3") if l3 is None else l3
-                lt = phase.get("LT") if lt is None else lt
-                unit = phase.get("unit", "W")
-        except Exception as e:
-            print(f"/now phase read error: {e}")
-
+        l1,l2,l3,lt = (snap.get(k) for k in ('inv_l1','inv_l2','inv_l3','inv_lt'))
+        unit = "W"
         l1_str = f"{l1} {unit}" if isinstance(l1, (int, float)) else "N/A"
         l2_str = f"{l2} {unit}" if isinstance(l2, (int, float)) else "N/A"
         l3_str = f"{l3} {unit}" if isinstance(l3, (int, float)) else "N/A"
@@ -2222,10 +1092,6 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         decision_stop_rules = hints.get("decision_stop_rules", []) if isinstance(hints.get("decision_stop_rules", []), list) else []
         decision_start_text = "; ".join(str(x) for x in decision_start_rules) if decision_start_rules else "No matched rules"
         decision_stop_text = "; ".join(str(x) for x in decision_stop_rules) if decision_stop_rules else "No matched rules"
-        telem_samples = int(_safe_float(hints.get("telemetry_samples", 0), 0.0))
-        telem_confidence = _safe_float(hints.get("telemetry_confidence", 0.0), 0.0)
-        telem_quality = str(hints.get("telemetry_month_quality", "neutral"))
-        blended_midday = _safe_float(hints.get("blended_midday_pv", 0.0), 0.0)
         weather_risk_5d = str(hints.get("weather_risk_5d", "unknown"))
         weather_sunny_ratio_5d = 100.0 * _safe_float(hints.get("weather_sunny_ratio_5d", 0.0), 0.0)
         weather_bad_ratio_5d = 100.0 * _safe_float(hints.get("weather_bad_ratio_5d", 0.0), 0.0)
@@ -2295,11 +1161,9 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"• Bridge energy: {available_bridge_wh:.0f}Wh available / {required_bridge_wh:.0f}Wh required × {bridge_safety_factor:.2f} + {startup_energy_penalty_wh:.0f}Wh startup\n"
             f"• First miner-cover time: {first_cover_time}\n"
             f"• Predicted full charge: {full_charge_time} (confidence {refill_conf:.2f})\n\n"
-            f"📈 Telemetry blend\n"
-            f"• Samples: {telem_samples}\n"
-            f"• Confidence: {telem_confidence:.2f}\n"
-            f"• Fresh month quality: {telem_quality}\n"
-            f"• Blended midday PV: {blended_midday:.0f}W\n"
+            f"📈 Solarman export model\n"
+            f"• Historical days: {hints.get('history_days',0)}\n"
+            f"• Historical samples: {hints.get('history_samples',0)}\n"
             f"• 5-day risk: {weather_risk_5d} (sunny: {weather_sunny_ratio_5d:.0f}%, bad: {weather_bad_ratio_5d:.0f}%)\n\n"
             f"🖥️ System\n"
             f"• IP: {ip}\n"
@@ -2312,35 +1176,11 @@ def process_message(message_text, battery, power, state, current_condition, sunr
         send_telegram_message(message, mirror_web=False)
 
     if message_text == "/phase":
-        try:
-            if os.path.exists(SOLARMAN_FILE):
-                with open(SOLARMAN_FILE, 'r', encoding='utf-8') as f:
-                    saved = json.load(f)
-                phase = saved.get("phasePowers")
-                ts = None
-                try:
-                    for e in saved.get("dataList", []):
-                        if e.get("key") == "SYSTIM1":
-                            ts = e.get("value")
-                            break
-                except Exception:
-                    pass
-                if phase:
-                    msg = (
-                        f"Per-phase inverter output power\n"
-                        f"L1: {phase.get('L1', 0)} {phase.get('unit', 'W')}\n"
-                        f"L2: {phase.get('L2', 0)} {phase.get('unit', 'W')}\n"
-                        f"L3: {phase.get('L3', 0)} {phase.get('unit', 'W')}\n"
-                        f"Total: {phase.get('LT', 0)} {phase.get('unit', 'W')}"
-                    )
-                    send_telegram_message(msg)
-                else:
-                    send_telegram_message("No phase data available yet.")
-            else:
-                send_telegram_message("No saved device data found.")
-        except Exception as e:
-            print(f"/phase handling error: {e}")
-            send_telegram_message("Failed to read phase data.")
+        with snapshot_lock:
+            snap = dict(_shared_snapshot)
+        send_telegram_message("Live inverter output: " + " | ".join(
+            f"{label}: {snap.get(key) if snap.get(key) is not None else 'N/A'} W"
+            for label,key in [('L1','inv_l1'),('L2','inv_l2'),('L3','inv_l3'),('Total','inv_lt')]))
 
     if message_text == "/start":
         if is_rpi and GPIO_AVAILABLE:
@@ -2437,31 +1277,6 @@ def fetch_current_data(access_token):
             f"{f' | HTTP {sc} {rsn}' if sc else ''} | {e}")
         return {}
 
-def store_data(data, filename=SOLARMAN_FILE):
-    """
-    Save raw JSON and attach per-phase inverter powers into 'phasePowers'.
-    No CSV logging (as requested).
-    """
-    try:
-        out = dict(data) if isinstance(data, dict) else {"raw": data}
-        out["phasePowers"] = _extract_phase_powers(out)
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(out, f, indent=4, ensure_ascii=False)
-        print(f"Data stored to {filename}")
-    except Exception as e:
-        print(f"[Warning] Failed to store data: {e}")
-
-def load_data(filename=SOLARMAN_FILE):
-    if os.path.exists(filename):
-        try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"[Warning] Failed to load {filename}: {e}")
-            return {}
-    print(f"File {filename} not found. Returning empty data.")
-    return {}
-
 def load_prev_state():
     global WALLET_ADDRESS, _last_production_start_at, _last_hashrate_restart_at, _last_force_shutdown_at
     if os.path.exists(STATE_FILE):
@@ -2517,6 +1332,7 @@ def save_prev_state(state_val, uptime_val):
         print(f"[Warning] Failed to save prev state: {e}")
 
 def get_current_weather(api_key, location_lat, location_lon):
+    global _weather_daylight
     try:
         # Current
         url = "https://api.openweathermap.org/data/2.5/weather"
@@ -2529,6 +1345,8 @@ def get_current_weather(api_key, location_lat, location_lon):
         clouds = d['clouds']['all']
         sunrise_ts = d['sys']['sunrise']
         sunset_ts = d['sys']['sunset']
+        _weather_daylight = (datetime.fromtimestamp(sunrise_ts, tz=budapest_tz),
+                             datetime.fromtimestamp(sunset_ts, tz=budapest_tz))
 
         sunrise_dt = datetime.fromtimestamp(sunrise_ts, tz=budapest_tz) - timedelta(minutes=10)
         sunset_dt = datetime.fromtimestamp(sunset_ts, tz=budapest_tz) - timedelta(minutes=90)
@@ -2623,12 +1441,13 @@ def _extract_power_sample(data: Dict[str, Any], now: datetime) -> Optional[Power
         return None
 
 
-def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[str, Any]) -> None:
+def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[str, Any], poll_interval_seconds=300) -> None:
     global _latest_power_sample, _last_force_shutdown_at
     _latest_power_sample = _extract_power_sample(data, now)
     with gpio_lock:
         with power_guard_lock:
-            shutdown = _power_guard.observe(_latest_power_sample, now, expected_state)
+            shutdown = _power_guard.observe(_latest_power_sample, now, expected_state,
+                                           poll_interval_seconds=poll_interval_seconds)
             reason = _power_guard.reason
             if _latest_power_sample is None and isinstance(data, dict):
                 timestamps = [k for k in ("collectionTime", "dataTime", "timestamp") if data.get(k) is not None]
@@ -2642,7 +1461,7 @@ def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[st
             if press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS):
                 _last_force_shutdown_at = now
                 save_prev_state(prev_state, uptime)
-                send_telegram_message("⚠️ STOP requested: fresh L2/L3 miner signature persisted for 3 samples and total consumption exceeds 1000 W. One force-shutdown signal sent.")
+                send_telegram_message("⚠️ STOP requested: one fresh measurement matches the identified L2/L3 miner signature and total consumption exceeds 1000 W. One force-shutdown signal sent.")
 
 
 def _update_pool_hashrate(now: datetime) -> None:
@@ -2652,13 +1471,31 @@ def _update_pool_hashrate(now: datetime) -> None:
         _shared_snapshot.update({"hashrate_hs": hs, "hashrate_mhs": hs / 1e6 if hs is not None else None})
 
 
-def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum):
-    """Poll live PV and load every idle cycle, including all night.
+def _solarman_poll_slot(now, sunrise_dt, sunset_dt):
+    """One Solarman attempt per 5-minute daylight / 30-minute night slot.
 
-    This deliberately has no sunset cutoff: it covers at least the requested
-    30 minutes after sunset and cannot stop supervision after a failed OLED.
-    Monitoring never authorizes a new production start outside its window.
+    Use astronomical sunrise/sunset, independently of the earlier production
+    stop and pre-dawn control offsets. If weather is unavailable, use the
+    existing supplied bounds rather than guessing a daylight window.
     """
+    dawn, dusk = _weather_daylight or (sunrise_dt, sunset_dt)
+    daylight = isinstance(dawn, datetime) and isinstance(dusk, datetime) and dawn <= now < dusk
+    interval = 300 if daylight else 1800
+    return interval, int(now.timestamp()) // interval
+
+
+def _solarman_poll_due(now, slot, last_slot, last_attempt):
+    if slot == last_slot:
+        return False
+    # Nightfall or a half-hour wall-clock boundary must not cause two night
+    # requests only five minutes apart. Count time since the last attempt.
+    if slot[0] == 1800 and last_attempt is not None:
+        return int(now.timestamp()) - int(last_attempt.timestamp()) >= 1800
+    return True
+
+
+def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum, poll_interval_seconds=300):
+    """Process one scheduled live read; never reuse cached data for GPIO."""
     global used_quote
     data = {}
     try:
@@ -2669,7 +1506,7 @@ def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum):
             data = fetch_current_data(token) or {}
     except Exception as err:
         print(f"[Safety monitoring] Solarman read unavailable: {type(err).__name__}")
-    supervise_runtime_by_power(now, "stop", data)
+    supervise_runtime_by_power(now, "stop", data, poll_interval_seconds=poll_interval_seconds)
     dl = data.get("dataList", []) if isinstance(data, dict) else []
     dl = [item for item in dl if isinstance(item, dict)] if isinstance(dl, list) else []
     readings = {
@@ -2683,7 +1520,9 @@ def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum):
     with snapshot_lock:
         _shared_snapshot.update(readings)
         _shared_snapshot.update({"state": "stop", "garage_temp": garage_temp,
-                                 "garage_hum": garage_hum, "monitoring_mode": "idle_safety"})
+                                 "garage_hum": garage_hum, "monitoring_mode": "idle_safety",
+                                 "solarman_polled_at": now.isoformat(),
+                                 "solarman_poll_interval_seconds": poll_interval_seconds})
     if is_rpi:
         write_to_display("monitor", readings["battery"], readings["power"], garage_temp, garage_hum)
     return data
@@ -2727,7 +1566,6 @@ def _merge_decision_into_hints(hist: Dict[str, Any], decision: Dict[str, Any], s
 
 def check_crypto_production_conditions(data, weather_api_key, location_lat, location_lon):
     global prev_state, state, used_quote, sunrise, sunset, uptime, _last_production_start_at
-    global _pending_transition_state, _pending_transition_since, _pending_transition_hits
     prev_state, uptime = load_prev_state()
 
     try:
@@ -2739,8 +1577,8 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         temperature = garage_data['temperature']
         humidity = garage_data['humidity']
         dl = data.get("dataList", []) if isinstance(data, dict) else []
-        battery_charge = _find_value(dl, "BMS_SOC", 0)
-        current_power = _find_value(dl, "S_P_T", 0)
+        battery_charge = _find_value(dl, "BMS_SOC", float("nan"))
+        current_power = _find_value(dl, "S_P_T", float("nan"))
         internal_power = _find_value(dl, "GS_T", 0)
         battery_voltage = _find_first_value(dl, ["BMS_B_V1", "B_V1", "BMS_V", "BMS_U", "BAT_V", "BAT_U", "BMS Voltage", "Battery Voltage"], BATTERY_NOMINAL_V)
         battery_ah = _find_first_value(dl, ["BRC", "Battery Rated Capacity", "BMS_B_AH", "B_AH"], BATTERY_CAPACITY_AH)
@@ -2750,47 +1588,20 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         inv_lt = _find_value(dl, "INV_O_P_T", 0.0)
         now = datetime.now(tz=budapest_tz)
 
-        hist = _history_recommendation(now, battery_charge, current_power, sunrise, sunset, weather_outlook)
-        start_guard = _compute_start_bridge_guard(now, battery_charge, current_power, sunrise, sunset, hist, battery_voltage, battery_ah)
-        decision = _make_miner_decision(
-            now, prev_state or "stop", battery_charge, current_power, inv_l1, inv_l2, inv_l3, inv_lt,
-            current_condition, clouds, f1_cond, f1_clouds, f3_cond, f3_clouds, sunrise, sunset,
-            hist, start_guard, battery_voltage, battery_ah, weather_outlook,
-        )
-        hist = _merge_decision_into_hints(hist, decision, start_guard)
-
-        desired_state = str(decision.get("desired_state", "hold"))
-        if desired_state == "hold":
-            desired_state = prev_state or "stop"
-        stable_prev_state = prev_state or "stop"
-        hard_stop = bool(decision.get("hard_stop", False))
-        high_conf_dawn_start = bool(decision.get("zero_pv_bridge_start", False)) and float(decision.get("confidence", 0.0)) >= MIN_DECISION_CONFIDENCE_START
-        if not hard_stop:
-            confirmation_needed = 1 if (desired_state == "production" and high_conf_dawn_start) else (1 if desired_state == "production" else 3)
-            min_hold_minutes = 0 if desired_state == "production" else 12
-            if desired_state == stable_prev_state:
-                _pending_transition_state = None
-                _pending_transition_since = None
-                _pending_transition_hits = 0
-                transition_confirmed = True
-            else:
-                if _pending_transition_state != desired_state:
-                    _pending_transition_state = desired_state
-                    _pending_transition_since = now
-                    _pending_transition_hits = 1
-                else:
-                    _pending_transition_hits += 1
-                pending_age_min = ((now - _pending_transition_since).total_seconds() / 60.0) if isinstance(_pending_transition_since, datetime) else 0.0
-                transition_confirmed = _pending_transition_hits >= confirmation_needed and pending_age_min >= min_hold_minutes
-            effective_state, blocked, gate_reason = _apply_transition_guard(stable_prev_state, desired_state, now, confirmed=transition_confirmed)
-            if high_conf_dawn_start and desired_state == "production":
-                effective_state, blocked, gate_reason = "production", False, "high_confidence_dawn_start"
-            if blocked:
-                hist["decision_summary"] = f"HOLD: transition guard blocked ({gate_reason})"
-                hist["decision_state"] = effective_state
-            state = effective_state
+        live_sample = _extract_power_sample(data,now)
+        decision = _make_miner_decision(now,prev_state or 'stop',battery_charge,current_power,
+            inv_l1,inv_l2,inv_l3,inv_lt,current_condition,clouds,f1_cond,f1_clouds,f3_cond,f3_clouds,
+            sunrise,sunset,{}, {},battery_voltage,battery_ah,weather_outlook,
+            current_load=(live_sample.total if MinerPowerGuard.fresh(live_sample,now) else float("nan")))
+        hist = decision['history_hints']
+        hist = _merge_decision_into_hints(hist,decision,{
+            'allow_start':decision['desired_state']=='production','reason':hist['energy_budget']['reason'],
+            'capacity_wh':_effective_battery_capacity_wh(battery_voltage,battery_ah)})
+        desired_state = decision['desired_state']
+        if decision['hard_stop']:
+            state = 'stop'
         else:
-            state = "stop"
+            state,_,_ = _apply_transition_guard(prev_state or 'stop',desired_state,now,confirmed=True)
 
         print(
             f"[Decision] desired={desired_state} effective={state} summary={hist.get('decision_summary')} "
@@ -2836,6 +1647,7 @@ ________________________________
 
         if state != prev_state:
             prev_state = state
+            uptime = now
             save_prev_state(prev_state, now)
 
         return (battery_charge, current_power, state, current_condition, sunrise, sunset, clouds,
@@ -2853,172 +1665,6 @@ ________________________________
             "unknown", 0, "",
             "unknown", 0, "", {}
         )
-
-
-def _load_telemetry_from_file() -> int:
-    """Load persisted telemetry points into in-memory deque at startup."""
-    candidates = [TELEMETRY_FILE, TELEMETRY_BACKUP_FILE]
-
-    # Backward compatibility: previous versions may have written to cwd/telemetry_history.json
-    legacy_cwd_file = (Path.cwd() / "telemetry_history.json").resolve()
-    if legacy_cwd_file not in candidates:
-        candidates.append(legacy_cwd_file)
-
-    loaded_total = 0
-    seen_ts = set()
-
-    try:
-        telemetry_history.clear()
-
-        for fp in candidates:
-            if not fp.exists():
-                continue
-            try:
-                with fp.open("r", encoding="utf-8") as fh:
-                    payload = json.load(fh)
-            except Exception as err:
-                print(f"[Telemetry] Failed reading {fp}: {err}")
-                continue
-
-            if not isinstance(payload, list):
-                print(f"[Telemetry] Ignoring non-list telemetry payload in {fp}.")
-                continue
-
-            for item in payload:
-                if not isinstance(item, dict):
-                    continue
-                ts = str(item.get("ts", "")).strip()
-                if not ts or ts in seen_ts:
-                    continue
-                telemetry_history.append(item)
-                seen_ts.add(ts)
-                loaded_total += 1
-
-        sorted_hist = sorted(list(telemetry_history), key=lambda x: str(x.get("ts", "")))
-        telemetry_history.clear()
-        telemetry_history.extend(sorted_hist)
-
-        # Heal/seed both telemetry stores so restarts always have a consistent source.
-        _write_full_telemetry_history(telemetry_history)
-
-        print(f"[Telemetry] Loaded {len(telemetry_history)} points (raw read: {loaded_total}) from: {', '.join(str(x) for x in candidates)}")
-        return len(telemetry_history)
-    except Exception as err:
-        print(f"[Telemetry] Failed loading telemetry history: {err}")
-        return 0
-
-
-def _record_telemetry(now: datetime, data: Dict[str, Any], battery: float, power: float,
-                      state_val: str, current_condition: str, clouds: float,
-                      garage_temp: Optional[float], garage_hum: Optional[float],
-                      historical_hints: Optional[Dict[str, Any]] = None,
-                      sunrise_dt: Optional[datetime] = None, sunset_dt: Optional[datetime] = None):
-    if not _is_control_window(now, sunrise_dt, sunset_dt, historical_hints):
-        print("[Telemetry] Skipping idle-period telemetry persist (outside control window).")
-        return
-
-    dl = data.get("dataList", []) if isinstance(data, dict) else []
-    record = {
-        "ts": now.isoformat(),
-        "battery": float(battery or 0),
-        "power": float(power or 0),
-        "state": state_val or "unknown",
-        "condition": current_condition or "unknown",
-        "clouds": float(clouds or 0),
-        "garage_temp": float(garage_temp or 0),
-        "garage_hum": float(garage_hum or 0),
-        "inv_l1": float(_find_value(dl, "INV_O_P_L1", 0.0)),
-        "inv_l2": float(_find_value(dl, "INV_O_P_L2", 0.0)),
-        "inv_l3": float(_find_value(dl, "INV_O_P_L3", 0.0)),
-        "inv_lt": float(_find_value(dl, "INV_O_P_T", 0.0)),
-        "internal_power": float(_find_value(dl, "GS_T", 0.0)),
-        "month_quality": str((historical_hints or {}).get("month_quality", "neutral")),
-        "early_start_soc": float((historical_hints or {}).get("early_start_soc", 55)),
-        "min_stop_soc": float((historical_hints or {}).get("min_stop_soc", 20)),
-        "late_day_reserve_soc": float((historical_hints or {}).get("late_day_reserve_soc", 80)),
-        "should_preserve_battery": bool((historical_hints or {}).get("should_preserve_battery", False)),
-        "headroom_good": bool((historical_hints or {}).get("headroom_good", False)),
-        "weather_risk_5d": str((historical_hints or {}).get("weather_risk_5d", "unknown")),
-        "weather_sunny_ratio_5d": float((historical_hints or {}).get("weather_sunny_ratio_5d", 0.0)),
-        "weather_bad_ratio_5d": float((historical_hints or {}).get("weather_bad_ratio_5d", 0.0)),
-        "dawn_start_allowed": bool((historical_hints or {}).get("dawn_start_allowed", False)),
-        "zero_pv_bridge_start": bool((historical_hints or {}).get("zero_pv_bridge_start", False)),
-        "decision_confidence": float((historical_hints or {}).get("decision_confidence", 0.0)),
-        "start_score": float((historical_hints or {}).get("start_score", 0.0)),
-        "stop_score": float((historical_hints or {}).get("stop_score", 0.0)),
-        "available_bridge_wh": float((historical_hints or {}).get("available_bridge_wh") or 0.0),
-        "required_bridge_wh": float((historical_hints or {}).get("required_bridge_wh") or 0.0),
-        "bridge_safety_factor": float((historical_hints or {}).get("bridge_safety_factor") or 0.0),
-        "startup_energy_penalty_wh": float((historical_hints or {}).get("startup_energy_penalty_wh") or 0.0),
-        "predicted_first_miner_cover_time": str((historical_hints or {}).get("predicted_first_miner_cover_time") or ""),
-        "predicted_full_charge_time": str((historical_hints or {}).get("predicted_full_charge_time") or ""),
-        "predicted_refill_confidence": float((historical_hints or {}).get("predicted_refill_confidence") or 0.0),
-        "active_control_window": bool((historical_hints or {}).get("active_control_window", False)),
-        "control_window_reason": str((historical_hints or {}).get("control_window_reason", "unknown")),
-        "dawn_weather_block": bool((historical_hints or {}).get("dawn_weather_block", False)),
-        "dawn_weather_block_reason": str((historical_hints or {}).get("dawn_weather_block_reason", "")),
-    }
-    telemetry_history.append(record)
-    _append_telemetry_to_file(record)
-
-
-def _is_active_window(now: datetime, sunrise_dt: Optional[datetime], sunset_dt: Optional[datetime]) -> bool:
-    """Return True when current time is within the sunrise/sunset window."""
-    if not isinstance(now, datetime):
-        return False
-    if not isinstance(sunrise_dt, datetime) or not isinstance(sunset_dt, datetime):
-        return False
-
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=budapest_tz)
-    if sunrise_dt.tzinfo is None:
-        sunrise_dt = sunrise_dt.replace(tzinfo=budapest_tz)
-    if sunset_dt.tzinfo is None:
-        sunset_dt = sunset_dt.replace(tzinfo=budapest_tz)
-
-    return (sunrise_dt.hour, sunrise_dt.minute) <= (now.hour, now.minute) <= (sunset_dt.hour, sunset_dt.minute)
-
-
-def _append_telemetry_to_file(record: Dict[str, Any]) -> None:
-    _persist_telemetry_record_to_file(TELEMETRY_FILE, record)
-    if TELEMETRY_BACKUP_FILE != TELEMETRY_FILE:
-        _persist_telemetry_record_to_file(TELEMETRY_BACKUP_FILE, record)
-
-
-def _persist_telemetry_record_to_file(target_file: Path, record: Dict[str, Any]) -> None:
-    try:
-        target_file.parent.mkdir(parents=True, exist_ok=True)
-
-        existing: List[Dict[str, Any]] = []
-        if target_file.exists():
-            try:
-                with target_file.open("r", encoding="utf-8") as fh:
-                    payload = json.load(fh)
-                if isinstance(payload, list):
-                    existing = payload
-            except Exception as err:
-                print(f"[Telemetry] Could not read telemetry file {target_file}, recreating: {err}")
-
-        existing.append(record)
-        tmp_file = target_file.with_suffix(target_file.suffix + ".tmp")
-        with tmp_file.open("w", encoding="utf-8") as fh:
-            json.dump(existing, fh, ensure_ascii=False)
-        tmp_file.replace(target_file)
-    except Exception as err:
-        print(f"[Telemetry] Failed to persist record into {target_file}: {err}")
-
-
-def _write_full_telemetry_history(history: deque) -> None:
-    payload = list(history)
-    for target_file in {TELEMETRY_FILE, TELEMETRY_BACKUP_FILE}:
-        try:
-            target_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_file = target_file.with_suffix(target_file.suffix + ".tmp")
-            with tmp_file.open("w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False)
-            tmp_file.replace(target_file)
-        except Exception as err:
-            print(f"[Telemetry] Failed to sync telemetry history into {target_file}: {err}")
 
 
 def _miner_action(action: str) -> Dict[str, Any]:
@@ -3058,305 +1704,47 @@ def _weather_icon(condition: str) -> str:
     return "fa-sun"
 
 
-DASHBOARD_HTML = """
-<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Solar Mining Control</title>
-<link rel="icon" type="image/png" href="/solarmining_logo.png" />
-<link rel="apple-touch-icon" href="/solarmining_logo.png" />
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css" />
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+DASHBOARD_HTML = r"""
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Solar Mining</title>
+<link rel="icon" href="/favicon.ico"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
 <style>
-:root{--bg:#0b1220;--bg2:#182845;--card:rgba(20,31,56,.72);--txt:#e9eefc;--muted:#9fb0d0;--ok:#47d16c;--warn:#f2b84b;--danger:#ff6b6b;--input:#1f2c48;--border:rgba(255,255,255,.2)}
-[data-theme="light"]{--bg:#eef3ff;--bg2:#d9e8ff;--card:rgba(255,255,255,.85);--txt:#111827;--muted:#4b5563;--input:#ffffff;--border:rgba(17,24,39,.15)}
-*{box-sizing:border-box}
-body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
-.wrap{padding:10px 18px 16px;max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
-.logo-wrap{display:flex;justify-content:center;padding-top:0;margin:-8px 0 -14px;line-height:0}
-.logo{display:block;max-width:min(300px,72vw);height:auto;filter:drop-shadow(0 8px 18px rgba(0,0,0,.28));}
-.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
-.title{display:flex;align-items:center;gap:10px;margin:0;font-size:clamp(1.35rem,2.3vw,2rem)}
-.panel{background:var(--card);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:16px;padding:14px}
-.grid{display:grid;gap:12px}
-.metrics-grid{grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px}
-.metrics-grid .card.metrics-history{grid-column:span 2}
-@media(max-width:1280px){.metrics-grid{grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px}.metrics-grid .card.metrics-history{grid-column:span 1}}
-@media(max-width:760px){.metrics-grid{grid-template-columns:repeat(2,minmax(150px,1fr));gap:10px}}
-.card{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:14px;padding:14px;min-width:0}
-.metrics-grid .card{display:flex;flex-direction:column;justify-content:space-between;min-height:102px}.k{color:var(--muted);font-size:.88rem;margin-bottom:8px;display:flex;align-items:center;gap:8px}.v{font-size:clamp(1.08rem,1.25vw,1.35rem);font-weight:700;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:2.5em}
-.k i{opacity:.95}
-.chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)}
-.chart-title{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8px}
-.chart-sub{font-size:.78rem;color:var(--muted)}
-.toolbar{display:grid;grid-template-columns:2fr 1fr;gap:12px;align-items:end}
-.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
-.field{display:flex;flex-direction:column;gap:6px}
-.field label{font-size:.82rem;color:var(--muted)}
-.field input,.btn{border-radius:10px;border:1px solid var(--border);padding:10px 12px;font-size:.95rem}
-.field input{background:var(--input);color:var(--txt)}
-input[type="date"]{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.04));border:1px solid rgba(148,163,184,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 8px 18px rgba(2,6,23,.22);font-weight:700;letter-spacing:.02em;color:var(--txt);min-height:42px;color-scheme:dark;padding-right:36px}
-[data-theme="light"] input[type="date"]{background:linear-gradient(180deg,#ffffff,#eef4ff);border-color:rgba(71,85,105,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 6px 14px rgba(15,23,42,.08);color-scheme:light}
-input[type="date"]:hover{border-color:rgba(96,165,250,.75)}
-input[type="date"]:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25),0 10px 22px rgba(59,130,246,.2)}
-input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
-.field-date{position:relative}
-.field-date .calendar-icon{position:absolute;right:12px;bottom:12px;color:rgba(226,232,240,.95);font-size:.92rem;pointer-events:none;text-shadow:0 1px 2px rgba(2,6,23,.65)}
-[data-theme="light"] .field-date .calendar-icon{color:#334155;text-shadow:none}
-.actions{display:flex;gap:8px;flex-wrap:wrap}
-.btn{color:#fff;cursor:pointer;background:transparent;padding:7px 11px;font-size:.84rem;min-height:34px;line-height:1.2;transition:transform .15s ease,box-shadow .15s ease,opacity .15s ease}
-.btn:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(2,6,23,.24)}
-.btn:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none}
-.btn.ok{background:var(--ok)}.btn.warn{background:var(--warn)}.btn.danger{background:var(--danger)}.btn.ghost{background:transparent;color:var(--txt)}
-.toolbar-actions{justify-content:flex-end;align-items:center}
-.range-shortcuts{display:flex;gap:6px;flex-wrap:wrap}
-.range-shortcuts .btn{font-size:.8rem;min-height:30px;padding:6px 10px}
-#actionResult{margin-top:8px;min-height:22px;padding:6px 10px;border-radius:10px;border:1px solid transparent;display:none}
-#actionResult.show{display:flex;align-items:center;gap:8px}
-#actionResult.ok{background:rgba(34,197,94,.14);border-color:rgba(34,197,94,.42);color:#86efac}
-#actionResult.warn{background:rgba(245,158,11,.14);border-color:rgba(245,158,11,.42);color:#facc15}
-#actionResult.err{background:rgba(239,68,68,.14);border-color:rgba(239,68,68,.45);color:#fda4af}
-[data-theme="light"] #actionResult.ok{color:#166534}
-[data-theme="light"] #actionResult.warn{color:#92400e}
-[data-theme="light"] #actionResult.err{color:#991b1b}
-.notice-panel{margin-top:8px}
-.notice-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.notice-list{display:grid;gap:8px;max-height:200px;overflow:auto;padding-right:4px}
-.notice-item{border:1px solid var(--border);border-radius:10px;padding:8px 10px;background:rgba(255,255,255,.03)}
-.notice-item.warn{border-color:rgba(245,158,11,.5)}
-.notice-item.error{border-color:rgba(239,68,68,.5)}
-.notice-item.success{border-color:rgba(34,197,94,.48)}
-.notice-meta{font-size:.74rem;color:var(--muted);margin-bottom:4px}
-.notice-empty{font-size:.82rem;color:var(--muted);padding:10px;border:1px dashed var(--border);border-radius:10px}
-.charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.chart-card{height:360px;display:flex;flex-direction:column;overflow:hidden}
-.chart-card canvas{width:100% !important;flex:1 1 auto;min-height:0}
-.hints-panel{padding:16px}
-.hints-wrap{width:min(1280px,100%);margin:0 auto;display:grid;grid-template-columns:repeat(2,minmax(340px,1fr));gap:16px;align-items:start}
-.hints-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.hint-section-title{margin:0 0 10px;font-size:.86rem;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);font-weight:700;text-align:center}
-.hint-card{background:linear-gradient(165deg,rgba(99,102,241,.18),rgba(14,165,233,.12));border:1px solid var(--border);border-radius:16px;padding:14px;box-shadow:0 12px 26px rgba(2,6,23,.2);min-height:112px;display:flex;flex-direction:column;justify-content:center}
-.hint-title{font-size:.8rem;color:var(--muted);margin-bottom:8px;display:flex;align-items:center;gap:8px}
-.hint-value{font-size:1.15rem;font-weight:800;line-height:1.2}
-.hint-sub{margin-top:6px;color:var(--muted);font-size:.8rem}
-.decision-card{margin-top:12px;grid-column:1 / -1;min-height:170px;align-items:flex-start}
-.hint-list{margin:6px 0 8px 16px;padding:0;color:var(--txt);font-size:.84rem;line-height:1.35}
-.hint-list li{margin:2px 0}
-@media(max-width:1100px){.charts{grid-template-columns:1fr}.hints-wrap{grid-template-columns:1fr}}
-@media(max-width:840px){.toolbar{grid-template-columns:1fr}.chart-card{height:320px}.hints-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:560px){.hints-grid{grid-template-columns:1fr}}
-.pool-meta{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:12px}
-.pool-link,.pool-link:visited{display:inline-flex;align-items:center;gap:7px;color:var(--txt);text-decoration:none;border:1px solid var(--border,#46516b);border-radius:999px;padding:5px 10px;font-size:12px;font-weight:600;line-height:1.4}
-.pool-link:hover,.pool-link:focus-visible{color:#e8b957;border-color:#e8b957;outline-offset:3px}
-.pool-note{font-size:11px;opacity:.7}
-</style></head>
-<body data-theme="dark"><div class="wrap">
-<div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
-<div class="top"><h2 id="dashTitle" class="title"><i class="fa-solid fa-solar-panel"></i> Solar Mining Dashboard</h2>
-<div class="actions"><button id="lang" class="btn ghost"><i class="fa-solid fa-earth-europe"></i> HU</button><button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button><button id="downloadTelemetry" class="btn ghost"><i class="fa-solid fa-download"></i> Telemetry JSON</button></div></div>
-<div class="grid metrics-grid" id="metrics"></div>
-<div class="panel hints-panel"><div class="hints-wrap" id="historyHints"></div></div>
-<div class="panel toolbar"><div class="filters">
-<div class="field field-date"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="date" /><i class="fa-solid fa-calendar-days calendar-icon"></i></div>
-<div class="field field-date"><label id="lblTo" for="toDate">To</label><input id="toDate" type="date" /><i class="fa-solid fa-calendar-days calendar-icon"></i></div>
-<div class="actions"><div class="range-shortcuts"><button class="btn ghost" id="shortcutDay"><i class="fa-solid fa-clock"></i> Last Day</button><button class="btn ghost" id="shortcutWeek"><i class="fa-solid fa-calendar-week"></i> Last Week</button><button class="btn ghost" id="shortcutMonth"><i class="fa-solid fa-calendar-days"></i> Last Month</button></div><button class="btn ok" id="applyRange"><i class="fa-solid fa-filter"></i> Apply range</button></div>
-</div><div class="actions toolbar-actions">
-<button id="btnStart" class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
-<button id="btnStop" class="btn warn" onclick="act('stop')"><i class="fa-solid fa-stop"></i> Stop miner</button>
-<button id="btnForce" class="btn danger" onclick="act('force_stop')"><i class="fa-solid fa-power-off"></i> Force stop</button>
-</div></div>
-<div id="actionResult" class="k"></div>
-<div class="panel notice-panel"><div class="notice-head"><div id="notifTitle" class="chart-title"><i class="fa-solid fa-bell"></i> Notifications</div></div><div id="notifList" class="notice-list"></div></div>
-<div class="charts"><div class="card chart-card"><div class="chart-head"><div id="chPower" class="chart-title"><i class="fa-solid fa-solar-panel"></i> PV Production</div><div id="chPowerSub" class="chart-sub">Watt trend</div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chPhase" class="chart-title"><i class="fa-solid fa-bolt"></i> Phase Power</div><div id="chPhaseSub" class="chart-sub">L1 / L2 / L3</div></div><canvas id="phaseChart"></canvas></div>
-<div class="card chart-card"><div class="chart-head"><div id="chBattery" class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> Battery & Mining Rig</div><div id="chBatterySub" class="chart-sub">Charge level and status</div></div><canvas id="batteryChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chEnv" class="chart-title"><i class="fa-solid fa-temperature-half"></i> Garage Environment</div><div id="chEnvSub" class="chart-sub">Temperature / Humidity</div></div><canvas id="envChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chHistSoc" class="chart-title"><i class="fa-solid fa-layer-group"></i> Historical SOC Thresholds</div><div id="chHistSocSub" class="chart-sub">Dynamic SOC logic over time</div></div><canvas id="histSocChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="chHistFlags" class="chart-title"><i class="fa-solid fa-chart-line"></i> Historical Decision Flags</div><div id="chHistFlagsSub" class="chart-sub">Battery preserve / headroom / month quality</div></div><canvas id="histFlagsChart"></canvas></div></div></div>
+:root{--bg:#101625;--panel:#1a2335;--text:#e5edf8;--muted:#a6b4cc;--border:#34425b;--accent:#ebba57}body[data-theme=light]{--bg:#f0f4fa;--panel:white;--text:#18243a;--muted:#52617a;--border:#ccd5e2}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,sans-serif}.wrap{max-width:1440px;margin:auto;padding:28px}header,.tools,.actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}header{justify-content:space-between;margin-bottom:24px}h1{font-size:28px;margin:0}h2{font-size:19px;margin:0 0 10px}p{color:var(--muted);line-height:1.5}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:14px;margin:18px 0}.card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:20px}.label{color:var(--muted);font-size:13px}.value{font-weight:700;font-size:25px;margin:9px 0}.pool-link,.pool-link:visited{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--border);border-radius:999px;padding:5px 9px;color:var(--text);font-size:12px;text-decoration:none}.pool-link:hover{border-color:var(--accent)}small{color:var(--muted)}button,input,.button{border:1px solid var(--border);border-radius:9px;padding:9px 12px;color:var(--text);background:var(--panel);font:inherit}button,.button{cursor:pointer;text-decoration:none}button:hover,.button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:wait}button.danger{border-color:#dd7a7a}.charts{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-top:18px}.chart{height:350px;position:relative}.tools label{display:flex;gap:6px;align-items:center}#message{min-height:24px;margin-top:10px}#budget{white-space:pre-line}.source{margin-top:24px}.controls{margin:18px 0}@media(max-width:800px){.charts{grid-template-columns:1fr}.wrap{padding:16px}.tools label{flex-wrap:wrap}h1{font-size:23px}}
+</style></head><body data-theme="dark"><main class="wrap"><header><h1>☀ Solar Mining</h1><div class="tools"><button id="lang">HU</button><button id="theme">Theme</button></div></header>
+<p id="sourceNote">Historical learning uses the provided solarman_json files only. Live readings are not recorded.</p>
+<section id="metrics" class="metrics"></section><section class="card"><h2 id="budgetTitle">Energy plan</h2><div id="budget">Waiting for live readings…</div><p id="decision"></p></section>
+<section class="controls"><div class="actions"><button data-action="start">Start miner</button><button data-action="stop">Stop miner</button><button class="danger" data-action="force_stop">Force stop</button></div><div id="message" role="status"></div></section>
+<section class="card source"><h2 id="historyTitle">Provided Solarman history</h2><p id="historyNote">Exported PV, household consumption and battery SOC. No historical miner state or phase readings are inferred.</p><div class="tools"><label>From <input id="from" type="date"></label><label>To <input id="to" type="date"></label><button id="apply">Apply</button><a class="button" href="/api/history/download" id="download">Download history</a></div><p id="count"></p><div class="charts"><div class="chart"><canvas id="powerChart"></canvas></div><div class="chart"><canvas id="batteryChart"></canvas></div></div></section></main>
 <script>
-let powerChart,phaseChart,batteryChart,envChart,histSocChart,histFlagsChart;
-const defaultLastDays=7;
-let currentRange={from:null,to:null};
-let currentLang='en';
-const I18N={
-  en:{title:'Solar Mining Dashboard',theme:'Theme',downloadTelemetry:'Telemetry JSON',from:'From',to:'To',lastDay:'Last Day',lastWeek:'Last Week',lastMonth:'Last Month',apply:'Apply range',start:'Start miner',stop:'Stop miner',force:'Force stop',actionInProgress:'Sending command…',actionStartOk:'Miner start command sent successfully.',actionStopOk:'Miner stop command sent successfully.',actionForceOk:'Force stop command sent successfully.',actionError:'Command failed',notifTitle:'Notifications',notifEmpty:'No notifications yet.',
-      state:'State',battery:'Battery',pv:'PV Power',hashrate:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',
-      chPower:'PV Production',chPowerSub:'Watt trend',chPhase:'Phase Power',chPhaseSub:'L1 / L2 / L3',chBattery:'Battery & Mining Rig',chBatterySub:'Charge level and status',chEnv:'Garage Environment',chEnvSub:'Temperature / Humidity',chHistSoc:'Historical SOC Thresholds',chHistSocSub:'Dynamic SOC logic over time',chHistFlags:'Historical Decision Flags',chHistFlagsSub:'Battery preserve / headroom / month quality',monthQuality:'Month quality',earlyStart:'Early start SOC',minStop:'Min stop SOC',lateReserve:'Late day reserve SOC',preserveBattery:'Preserve battery',headroomGood:'Headroom good',yes:'Yes',no:'No',strong:'Strong',weak:'Weak',neutral:'Neutral',langBtn:'HU',dsPv:'PV power (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Charge %',dsMiner:'Mining Rig ON',dsTemp:'Temp °C',dsHum:'Humidity %',dsHistEarly:'Early start SOC %',dsHistMinStop:'Min stop SOC %',dsHistLate:'Late reserve SOC %',dsFlagPreserve:'Preserve battery',dsFlagHeadroom:'Headroom good',dsFlagMonth:'Month quality score',hintHistoryTitle:'Historical tuning',hintDecisionTitle:'Decision trace',decisionState:'State decision',decisionStartRules:'Matched start rules',decisionStopRules:'Matched stop rules',decisionSummary:'Decision summary',decisionNone:'No matched rules',hintStartGuardTitle:'Start guard',startGuardAllow:'Start allowed',startGuardReason:'Reason',startGuardBridge:'Current bridge time',startGuardEta:'LTA (time to full solar supply)',startGuardFullEta:'ETA to 100% battery charge',startGuardCapacity:'Battery capacity',startGuardUsable:'Usable bridge energy (above min stop SOC)',neededBridgeTime:'Needed bridge time (sunrise → full supply)',neededBridgeEnergy:'Needed bridge energy (sunrise → full supply)',usableFormula:'Formula',bmsRange:'BMS range',reasonOk:'OK',reasonSocBelowMinStop:'SOC below minimum stop',reasonInsufficientBridgeEnergy:'Insufficient bridge energy',reasonCannotRefillBeforeSunset:'Likely cannot refill battery before sunset',reasonRefillRelaxation:'Confident refill relaxation',reasonRefillMorningRelaxation:'Confident morning refill relaxation',reasonBridgeEnergySunnyRelaxation:'Bridge-energy confident sunny-day relaxation',reasonAggressiveMorningRefillStart:'Aggressive morning refill start',dawnStartAllowed:'Dawn start allowed',zeroPvBridgeStart:'Zero-PV bridge start',decisionConfidence:'Decision confidence',bridgeEnergyModel:'Bridge energy model',activeControlWindow:'Active control window',firstCoverTime:'First miner-cover time',fullChargeTime:'Predicted full charge',refillConfidence:'Refill confidence',unitMin:'min',unitWh:'Wh',stProduction:'production',stStop:'stop',stUnknown:'unknown'},
-  hu:{title:'Solar Bányászat Dashboard',theme:'Téma',downloadTelemetry:'Telemetry JSON letöltése',from:'Ettől',to:'Eddig',lastDay:'Elmúlt nap',lastWeek:'Elmúlt hét',lastMonth:'Elmúlt hónap',apply:'Szűrés alkalmazása',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',actionInProgress:'Parancs küldése…',actionStartOk:'Indítási parancs elküldve.',actionStopOk:'Leállítási parancs elküldve.',actionForceOk:'Kényszerleállítási parancs elküldve.',actionError:'Parancs hiba',notifTitle:'Értesítések',notifEmpty:'Még nincs értesítés.',
-      state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hashrate:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',
-      chPower:'PV termelés',chPowerSub:'Teljesítménytrend (W)',chPhase:'Fázisteljesítmény',chPhaseSub:'L1 / L2 / L3',chBattery:'Akkumulátor és bányászgép',chBatterySub:'Töltöttségi szint és állapot',chEnv:'Garázskörnyezet',chEnvSub:'Hőmérséklet / páratartalom',chHistSoc:'Történeti SOC-küszöbök',chHistSocSub:'Dinamikus SOC-logika időben',chHistFlags:'Történeti döntési jelzők',chHistFlagsSub:'Akkumulátorkímélés / tartalék / havi minőség',monthQuality:'Havi minőség',earlyStart:'Korai indítás SOC',minStop:'Minimum leállítási SOC',lateReserve:'Késői tartalék SOC',preserveBattery:'Akkumulátorkímélés',headroomGood:'Megfelelő teljesítménytartalék',yes:'Igen',no:'Nem',strong:'Erős',weak:'Gyenge',neutral:'Semleges',langBtn:'EN',dsPv:'PV teljesítmény (W)',dsL1:'L1',dsL2:'L2',dsL3:'L3',dsBatt:'Töltöttség %',dsMiner:'Bányászgép bekapcsolva',dsTemp:'Hőmérséklet °C',dsHum:'Páratartalom %',dsHistEarly:'Korai indítás SOC %',dsHistMinStop:'Minimum leállítási SOC %',dsHistLate:'Késői tartalék SOC %',dsFlagPreserve:'Akkumulátorkímélés',dsFlagHeadroom:'Megfelelő tartalék',dsFlagMonth:'Havi minőség pontszám',hintHistoryTitle:'Történeti finomhangolás',hintDecisionTitle:'Döntési logika',decisionState:'Állapotdöntés',decisionStartRules:'Teljesült indítási szabályok',decisionStopRules:'Teljesült leállítási szabályok',decisionSummary:'Döntés összegzése',decisionNone:'Nincs teljesült szabály',hintStartGuardTitle:'Indítási védelem',startGuardAllow:'Indítás engedélyezve',startGuardReason:'Indok',startGuardBridge:'Aktuális áthidalási idő',startGuardEta:'LTA (idő a teljes napellátásig)',startGuardFullEta:'Várható idő 100% akku töltésig',startGuardCapacity:'Akkumulátor kapacitás',startGuardUsable:'Felhasználható áthidaló energia (min. SOC felett)',neededBridgeTime:'Szükséges áthidalási idő (napkelte → teljes ellátás)',neededBridgeEnergy:'Szükséges áthidalási energia (napkelte → teljes ellátás)',usableFormula:'Képlet',bmsRange:'BMS tartomány',reasonOk:'Rendben',reasonSocBelowMinStop:'SOC minimum alatt',reasonInsufficientBridgeEnergy:'Nincs elég áthidaló energia',reasonCannotRefillBeforeSunset:'Várhatóan nem tölt vissza napnyugtáig',reasonRefillRelaxation:'Magabiztos visszatöltési lazítás',reasonRefillMorningRelaxation:'Magabiztos reggeli visszatöltési lazítás',reasonBridgeEnergySunnyRelaxation:'Bridge energia + napsütés miatti lazítás',reasonAggressiveMorningRefillStart:'Agresszív reggeli indítás (visszatöltés biztos)',dawnStartAllowed:'Hajnali indítás engedélyezve',zeroPvBridgeStart:'Nulla-PV áthidaló indítás',decisionConfidence:'Döntési bizalom',bridgeEnergyModel:'Áthidaló energia modell',activeControlWindow:'Aktív vezérlési ablak',firstCoverTime:'Első PV fedezési idő',fullChargeTime:'Várt teljes töltés',refillConfidence:'Feltöltési bizalom',unitMin:'perc',unitWh:'Wh',stProduction:'termelés',stStop:'leállítva',stUnknown:'ismeretlen'}
-};
-const t=(k)=>I18N[currentLang][k]||k;
-function mapState(v){if(v==='production')return t('stProduction'); if(v==='stop')return t('stStop'); return t('stUnknown');}
-function localizeWeather(cond){
-  const raw=String(cond||'').trim();
-  if(currentLang!=='hu') return raw;
-  const c=raw.toLowerCase();
-  const m=[
-    ['clear sky','tiszta ég'],['few clouds','gyengén felhős'],['scattered clouds','szórványfelhős'],
-    ['broken clouds','erősen felhős'],['overcast clouds','borult'],['shower rain','zápor'],['light rain','enyhe eső'],
-    ['moderate rain','mérsékelt eső'],['heavy intensity rain','erős eső'],['rain','eső'],['thunderstorm','zivatar'],
-    ['snow','havazás'],['mist','pára'],['fog','köd'],['haze','párás']
-  ];
-  for(const [en,hu] of m){ if(c.includes(en)) return hu; }
-  return raw;
+let currentLang='en',range={},powerChart,batteryChart;
+const messages={en:{state:'Controller state',battery:'Battery',pv:'Live PV',hash:'Pool hashrate',load:'Live inverter output',weather:'Weather',note:'Historical learning uses the provided solarman_json files only. Live readings are not recorded.',history:'Provided Solarman history',hint:'Exported PV, household consumption and battery SOC. No historical miner state or phase readings are inferred.',budget:'Energy plan',waiting:'Planning is inactive or live data is unavailable.',lag:'Pool data may lag; display only.',samples:'historical measurements',days:'seasonal days',minimum:'Projected minimum SOC',end:'Projected ending SOC',pvwh:'Expected PV energy',loadwh:'Expected total demand',coverage:'Historical coverage',phase:'Power safety',download:'Download history',apply:'Apply'},hu:{state:'Vezérlőállapot',battery:'Akkumulátor',pv:'Élő PV',hash:'Pool hashráta',load:'Élő inverterkimenet',weather:'Időjárás',note:'A tanulás csak a megadott solarman_json fájlokat használja. Élő mérést nem rögzítünk.',history:'Megadott Solarman előzmények',hint:'Exportált PV, teljes fogyasztás és akkumulátortöltöttség. Korábbi gépállapotot vagy fázisterhelést nem következtetünk ki.',budget:'Energiaterv',waiting:'A tervezés inaktív vagy nincs élő adat.',lag:'A pool adata késhet; csak kijelzés.',samples:'történeti mérés',days:'szezonális nap',minimum:'Becsült minimum SOC',end:'Becsült záró SOC',pvwh:'Várható PV energia',loadwh:'Várható teljes fogyasztás',coverage:'Történeti lefedettség',phase:'Fogyasztási védelem',download:'Előzmények letöltése',apply:'Alkalmaz'}};
+const t=k=>messages[currentLang][k]||k;
+const text=(id,value)=>{document.getElementById(id).textContent=value;};
+const number=(v,unit='')=>v==null||!Number.isFinite(Number(v))?'N/A':Number(v).toFixed(1)+unit;
+function metric(label,value){const card=document.createElement('div');card.className='card';const l=document.createElement('div');l.className='label';l.textContent=label;const v=document.createElement('div');v.className='value';v.textContent=value;card.append(l,v);return card;}
+function render(data){
+ text('sourceNote',t('note'));text('historyTitle',t('history'));text('historyNote',t('hint'));text('budgetTitle',t('budget'));text('download',t('download'));text('apply',t('apply'));
+ const metrics=document.getElementById('metrics');metrics.replaceChildren(metric(t('state'),data.state),metric(t('battery'),number(data.battery,'%')),metric(t('pv'),number(data.power,' W')));
+ const pool=metric(t('hash'),data.hashrate_text||'N/A');const link=document.createElement('a');link.className='pool-link';link.href='https://unmineable.com/address/'+encodeURIComponent(data.wallet_address)+'?coin=USDT';link.target='_blank';link.rel='noopener noreferrer';link.textContent='unMineable · USDT ↗';const note=document.createElement('p');const small=document.createElement('small');small.textContent=t('lag');note.append(small);pool.append(link,note);metrics.append(pool,metric(t('load'),number(data.inv_lt,' W')),metric(t('weather'),data.current_condition||'N/A'));
+ const hints=data.historical_hints||{},budget=hints.energy_budget;
+ text('budget',budget?[t('minimum')+': '+number(budget.minimum_soc,'%'),t('end')+': '+number(budget.end_soc,'%'),t('pvwh')+': '+number(budget.expected_pv_wh,' Wh'),t('loadwh')+': '+number(budget.expected_load_wh,' Wh'),t('coverage')+': '+number((hints.history_coverage||0)*100,'%')+' · '+(hints.history_days||0)+' '+t('days')].join('\n'):t('waiting'));
+ text('decision',(hints.decision_summary||'')+'\n'+t('phase')+': '+(data.power_guard_reason||''));
+ const hist=data.history||[];const step=Math.max(1,Math.ceil(hist.length/2000));const rows=hist.filter((_,i)=>i%step===0);text('count',data.history_count+' '+t('samples')+' · '+data.history_source);
+ if(!powerChart){const options={responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{labels:{color:'#879ab5'}}},scales:{x:{ticks:{maxTicksLimit:8,color:'#879ab5'}},y:{ticks:{color:'#879ab5'}}}};powerChart=new Chart(document.getElementById('powerChart'),{type:'line',data:{datasets:[]},options});batteryChart=new Chart(document.getElementById('batteryChart'),{type:'line',data:{datasets:[]},options:{...options,scales:{...options.scales,y:{min:0,max:100,ticks:{color:'#879ab5'}}}}});}
+ const labels=rows.map(r=>r.ts.slice(0,16).replace('T',' '));const series=(label,key,color)=>({label,data:rows.map(r=>r[key]),borderColor:color,pointRadius:0,borderWidth:1.5});powerChart.data={labels,datasets:[series('PV (W)','power','#e8b957'),series(currentLang==='hu'?'Fogyasztás (W)':'Consumption (W)','consumption','#69b4f0')]};batteryChart.data={labels,datasets:[series('SOC (%)','battery','#72cead')]};powerChart.update();batteryChart.update();
 }
-function applyChartI18n(){
-  if(!powerChart||!phaseChart||!batteryChart||!envChart)return;
-  powerChart.data.datasets[0].label=t('dsPv');
-  phaseChart.data.datasets[0].label=t('dsL1'); phaseChart.data.datasets[1].label=t('dsL2'); phaseChart.data.datasets[2].label=t('dsL3');
-  batteryChart.data.datasets[0].label=t('dsBatt'); batteryChart.data.datasets[1].label=t('dsMiner');
-  envChart.data.datasets[0].label=t('dsTemp'); envChart.data.datasets[1].label=t('dsHum');
-  histSocChart.data.datasets[0].label=t('dsHistEarly'); histSocChart.data.datasets[1].label=t('dsHistMinStop'); histSocChart.data.datasets[2].label=t('dsHistLate');
-  histFlagsChart.data.datasets[0].label=t('dsFlagPreserve'); histFlagsChart.data.datasets[1].label=t('dsFlagHeadroom'); histFlagsChart.data.datasets[2].label=t('dsFlagMonth');
-  powerChart.update('none'); phaseChart.update('none'); batteryChart.update('none'); envChart.update('none'); histSocChart.update('none'); histFlagsChart.update('none');
-}
-function applyI18n(){
-  document.getElementById('dashTitle').innerHTML=`<i class="fa-solid fa-solar-panel"></i> ${t('title')}`;
-  document.getElementById('theme').innerHTML=`<i class="fa-solid fa-circle-half-stroke"></i> ${t('theme')}`;
-  document.getElementById('lang').innerHTML=`<i class="fa-solid fa-earth-europe"></i> ${t('langBtn')}`;
-  document.getElementById('downloadTelemetry').innerHTML=`<i class="fa-solid fa-download"></i> ${t('downloadTelemetry')}`;
-  document.getElementById('lblFrom').textContent=t('from');
-  document.getElementById('lblTo').textContent=t('to');
-  document.getElementById('shortcutDay').innerHTML=`<i class="fa-solid fa-clock"></i> ${t('lastDay')}`;
-  document.getElementById('shortcutWeek').innerHTML=`<i class="fa-solid fa-calendar-week"></i> ${t('lastWeek')}`;
-  document.getElementById('shortcutMonth').innerHTML=`<i class="fa-solid fa-calendar-days"></i> ${t('lastMonth')}`;
-  document.getElementById('applyRange').innerHTML=`<i class="fa-solid fa-filter"></i> ${t('apply')}`;
-  document.getElementById('btnStart').innerHTML=`<i class="fa-solid fa-play"></i> ${t('start')}`;
-  document.getElementById('btnStop').innerHTML=`<i class="fa-solid fa-stop"></i> ${t('stop')}`;
-  document.getElementById('btnForce').innerHTML=`<i class="fa-solid fa-power-off"></i> ${t('force')}`;
-  document.getElementById('notifTitle').innerHTML=`<i class="fa-solid fa-bell"></i> ${t('notifTitle')}`;
-  document.getElementById('chPower').innerHTML=`<i class="fa-solid fa-solar-panel"></i> ${t('chPower')}`;
-  document.getElementById('chPowerSub').textContent=t('chPowerSub');
-  document.getElementById('chPhase').innerHTML=`<i class="fa-solid fa-bolt"></i> ${t('chPhase')}`;
-  document.getElementById('chPhaseSub').textContent=t('chPhaseSub');
-  document.getElementById('chBattery').innerHTML=`<i class="fa-solid fa-battery-three-quarters"></i> ${t('chBattery')}`;
-  document.getElementById('chBatterySub').textContent=t('chBatterySub');
-  document.getElementById('chEnv').innerHTML=`<i class="fa-solid fa-temperature-half"></i> ${t('chEnv')}`;
-  document.getElementById('chEnvSub').textContent=t('chEnvSub');
-  document.getElementById('chHistSoc').innerHTML=`<i class="fa-solid fa-layer-group"></i> ${t('chHistSoc')}`;
-  document.getElementById('chHistSocSub').textContent=t('chHistSocSub');
-  document.getElementById('chHistFlags').innerHTML=`<i class="fa-solid fa-chart-line"></i> ${t('chHistFlags')}`;
-  document.getElementById('chHistFlagsSub').textContent=t('chHistFlagsSub');
-  applyChartI18n();
-}
-const chartOpts={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'nearest',intersect:false,axis:'x'},plugins:{tooltip:{enabled:true,displayColors:false,backgroundColor:'rgba(14,23,41,.92)',titleColor:'#e9eefc',bodyColor:'#e9eefc',padding:12,cornerRadius:12,caretPadding:8,borderColor:'rgba(255,255,255,.2)',borderWidth:1,callbacks:{label:(ctx)=>`${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(2)}`}}},scales:{x:{ticks:{maxRotation:0}},y:{beginAtZero:false}}};
-const styledSet=(label,color,tension=.2)=>({label,borderColor:color,backgroundColor:color,data:[],pointRadius:0,pointHoverRadius:5,pointHoverBorderWidth:2,pointHoverBackgroundColor:'#ffffff',pointHoverBorderColor:color,pointHitRadius:14,borderWidth:2,tension});
-const mk=(id,label,color)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:[styledSet(label,color,.25)]},options:chartOpts});
-const mkMulti=(id,sets)=>new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:sets.map(s=>styledSet(s.label,s.color,s.tension??.2))},options:chartOpts});
-function init(){powerChart=mk('powerChart','PV power (W)','#4ade80');phaseChart=mkMulti('phaseChart',[{label:'L1',color:'#60a5fa'},{label:'L2',color:'#f59e0b'},{label:'L3',color:'#f43f5e'}]);batteryChart=mkMulti('batteryChart',[{label:'Charge %',color:'#a78bfa'},{label:'Mining Rig ON',color:'#22c55e'}]);envChart=mkMulti('envChart',[{label:'Temp °C',color:'#ef4444'},{label:'Humidity %',color:'#38bdf8'}]);histSocChart=mkMulti('histSocChart',[{label:t('dsHistEarly'),color:'#22d3ee'},{label:t('dsHistMinStop'),color:'#f59e0b'},{label:t('dsHistLate'),color:'#a78bfa'}]);histFlagsChart=mkMulti('histFlagsChart',[{label:t('dsFlagPreserve'),color:'#ef4444'},{label:t('dsFlagHeadroom'),color:'#22c55e'},{label:t('dsFlagMonth'),color:'#60a5fa'}]);setDefaultRange();}
-function shortTs(s){return new Date(s).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});} 
-function formatDurationMinutes(mins){
-const m=Number(mins);
-if(!Number.isFinite(m)||m<0)return '--';
-const total=Math.max(0,m);
-let h=Math.floor(total/60);
-let mm=Math.round(total-(h*60));
-if(mm===60){h+=1;mm=0;}
-return `${total.toFixed(1)} ${t('unitMin')} (${h}h ${mm}m)`;
-}
-function formatDate(d){return d.toISOString().slice(0,10)}
-function setRangeDays(days){const to=new Date();const from=new Date();from.setDate(to.getDate()-days);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
-function setDefaultRange(){const to=new Date();const from=new Date();from.setDate(to.getDate()-defaultLastDays);document.getElementById('fromDate').value=formatDate(from);document.getElementById('toDate').value=formatDate(to);currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};}
-function showActionResult(msg,type='warn',details=''){
-  const el=document.getElementById('actionResult');
-  const icon=type==='ok'?'fa-circle-check':(type==='err'?'fa-triangle-exclamation':'fa-circle-info');
-  const extra=details?` <span class='chart-sub'>${details}</span>`:'';
-  el.className=`k show ${type}`;
-  el.innerHTML=`<i class='fa-solid ${icon}'></i> <span>${msg}</span>${extra}`;
-}
-function renderNotifications(items){
-  const box=document.getElementById('notifList');
-  const list=Array.isArray(items)?items:[];
-  if(!list.length){
-    box.innerHTML=`<div class='notice-empty'>${t('notifEmpty')}</div>`;
-    return;
-  }
-  box.innerHTML=list.slice(0,5).map((n)=>{
-    const lvl=String(n.level||'info');
-    const ts=n.ts?new Date(n.ts).toLocaleString():'';
-    const icon=lvl==='success'?'fa-circle-check':(lvl==='warn'?'fa-triangle-exclamation':(lvl==='error'?'fa-circle-xmark':'fa-circle-info'));
-    return `<div class='notice-item ${lvl}'><div class='notice-meta'><i class='fa-solid ${icon}'></i> ${ts}</div><div>${String(n.message||'')}</div></div>`;
-  }).join('');
-}
-async function pull(){const qs=new URLSearchParams(currentRange).toString();const r=await fetch(`/api/snapshot?${qs}`);const d=await r.json();const icon=d.weather_icon||'fa-sun';
-renderNotifications(d.notifications||[]);
-const sunrise=(d.sunrise||'').slice(11,16); const sunset=(d.sunset||'').slice(11,16);
-document.getElementById('metrics').innerHTML=`<div class='card'><div class='k'><i class='fa-solid fa-toggle-on'></i> ${t('state')}</div><div class='v'>${mapState(d.state)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-battery-half'></i> ${t('battery')}</div><div class='v'>${d.battery==null?'N/A':d.battery+'%'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-solar-panel'></i> ${t('pv')}</div><div class='v'>${d.power==null?'N/A':Math.round(d.power)+' W'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-gauge-high'></i> ${t('hashrate')}</div><div class='v'>${d.hashrate_text||'N/A'}</div><div class='pool-meta'><a class='pool-link' href='https://unmineable.com/address/${d.wallet_address}?coin=USDT' target='_blank' rel='noopener noreferrer'>unMineable · USDT <i class='fa-solid fa-arrow-up-right-from-square' aria-hidden='true'></i></a><span class='pool-note'>${currentLang==='hu'?'Pool-adat · késhet':'Pool data · may lag'}</span></div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud-sun'></i> ${t('weather')}</div><div class='v'><i class='fa-solid ${icon}'></i> ${localizeWeather(d.current_condition)}</div></div><div class='card'><div class='k'><i class='fa-solid fa-sun'></i> ${t('sunrise')}</div><div class='v'>${sunrise||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-moon'></i> ${t('sunset')}</div><div class='v'>${sunset||'--:--'}</div></div><div class='card'><div class='k'><i class='fa-solid fa-cloud'></i> ${t('clouds')}</div><div class='v'>${d.clouds}%</div></div><div class='card metrics-history'><div class='k'><i class='fa-solid fa-clock-rotate-left'></i> ${t('history')}</div><div class='v'>${d.history_count}</div></div>`;
-const h=d.history||[]; const labels=h.map(x=>shortTs(x.ts));
-const hints=d.historical_hints||{};
-const monthQ=String(hints.month_quality||'neutral');
-const qText=t(monthQ==='strong'?'strong':(monthQ==='weak'?'weak':'neutral'));
-const boolTxt=(v)=>v?t('yes'):t('no');
-const reasonRaw=String(hints.start_guard_reason||'unknown');
-const reasonMap={ok:'reasonOk',soc_below_min_stop:'reasonSocBelowMinStop',insufficient_bridge_energy:'reasonInsufficientBridgeEnergy',cannot_refill_before_sunset_guard:'reasonCannotRefillBeforeSunset',refill_confident_relaxation:'reasonRefillRelaxation',refill_confident_morning_relaxation:'reasonRefillMorningRelaxation',bridge_energy_confident_sunny_day_relaxation:'reasonBridgeEnergySunnyRelaxation',aggressive_morning_refill_start:'reasonAggressiveMorningRefillStart'};
-const reasonTxt=t(reasonMap[reasonRaw]||reasonRaw);
-const startGuardAllow=boolTxt(!!hints.start_guard_allow);
-const bridgeMinutes=Number(hints.start_guard_bridge_minutes||0);
-const etaMinutes=Number(hints.start_guard_eta_minutes||0);
-const startGuardBridge=`${bridgeMinutes.toFixed(1)} ${t('unitMin')}`;
-const startGuardEta=`${etaMinutes.toFixed(1)} ${t('unitMin')}`;
-const predictedMinutesToFull=Number(hints.predicted_minutes_to_full);
-const startGuardFullEta=formatDurationMinutes(predictedMinutesToFull);
-const startGuardCapacity=`${Number(hints.start_guard_capacity_wh||0).toFixed(1)} ${t('unitWh')} (${Number(hints.start_guard_battery_ah||0).toFixed(1)}Ah @ ${Number(hints.start_guard_battery_voltage||0).toFixed(2)}V)`;
-const startGuardUsable=`${Number(hints.start_guard_usable_wh||0).toFixed(1)} ${t('unitWh')}`;
-const startGuardUsableFormula=`${Number(hints.start_guard_soc_window_pct||0).toFixed(0)}% = ${Number(d.battery||0).toFixed(0)}% - ${Number(hints.start_guard_min_stop_soc||0).toFixed(0)}%`;
-const neededBridgeTime=`${Number(hints.start_guard_needed_bridge_minutes||0).toFixed(1)} ${t('unitMin')}`;
-const neededBridgeEnergy=`${Number(hints.start_guard_needed_bridge_wh||0).toFixed(1)} ${t('unitWh')}`;
-const neededBridgeBmsRange=`20-100% (${Number(hints.start_guard_bms_window_wh||0).toFixed(1)} ${t('unitWh')})`;
-const decisionState=mapState(String(hints.decision_state||d.state||'unknown'));
-const decisionSummary=String(hints.decision_summary||'').trim()||t('decisionNone');
-const startRules=Array.isArray(hints.decision_start_rules)?hints.decision_start_rules:[];
-const stopRules=Array.isArray(hints.decision_stop_rules)?hints.decision_stop_rules:[];
-const renderRuleList=(arr)=>arr.length?`<ul class='hint-list'>${arr.map(x=>`<li>${String(x)}</li>`).join('')}</ul>`:`<div class='hint-sub'>${t('decisionNone')}</div>`;
-const decisionConfidence=Number(hints.decision_confidence||0);
-const startScore=Number(hints.start_score||0);
-const stopScore=Number(hints.stop_score||0);
-const bridgeModel=`${Number(hints.available_bridge_wh||0).toFixed(0)} / ${Number(hints.required_bridge_wh||0).toFixed(0)} ${t('unitWh')} × ${Number(hints.bridge_safety_factor||0).toFixed(2)} + ${Number(hints.startup_energy_penalty_wh||0).toFixed(0)} ${t('unitWh')}`;
-const controlWindow=`${boolTxt(!!hints.active_control_window)} (${String(hints.control_window_reason||'unknown')})`;
-const firstCover=String(hints.predicted_first_miner_cover_time||'N/A');
-const fullCharge=String(hints.predicted_full_charge_time||'N/A');
-const refillConf=Number(hints.predicted_refill_confidence||0);
-const startGuardBridgeView=startGuardBridge;
-const startGuardEtaView=startGuardEta;
-document.getElementById('historyHints').innerHTML=`<div class='hint-section'><div class='hint-section-title'>${t('hintHistoryTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-calendar-days'></i> ${t('monthQuality')}</div><div class='hint-value'>${qText}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt'></i> ${t('earlyStart')}</div><div class='hint-value'>${Number(hints.early_start_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-stop'></i> ${t('minStop')}</div><div class='hint-value'>${Number(hints.min_stop_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-end'></i> ${t('lateReserve')}</div><div class='hint-value'>${Number(hints.late_day_reserve_soc||0).toFixed(0)}%</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-shield-heart'></i> ${t('preserveBattery')}</div><div class='hint-value'>${boolTxt(!!hints.should_preserve_battery)}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-gauge-high'></i> ${t('headroomGood')}</div><div class='hint-value'>${boolTxt(!!hints.headroom_good)}</div></div></div><div class='hint-card decision-card'><div class='hint-title'><i class='fa-solid fa-list-check'></i> ${t('hintDecisionTitle')}</div><div class='hint-sub'><strong>${t('decisionState')}:</strong> ${decisionState}</div><div class='hint-sub'><strong>${t('decisionSummary')}:</strong> ${decisionSummary}</div><div class='hint-sub'><strong>${t('decisionConfidence')}:</strong> ${decisionConfidence.toFixed(2)} (${startScore.toFixed(2)} / ${stopScore.toFixed(2)})</div><div class='hint-sub'><strong>${t('dawnStartAllowed')}:</strong> ${boolTxt(!!hints.dawn_start_allowed)} | <strong>${t('zeroPvBridgeStart')}:</strong> ${boolTxt(!!hints.zero_pv_bridge_start)}</div><div class='hint-sub'><strong>${t('activeControlWindow')}:</strong> ${controlWindow}</div><div class='hint-sub'><strong>${t('bridgeEnergyModel')}:</strong> ${bridgeModel}</div><div class='hint-sub'><strong>${t('firstCoverTime')}:</strong> ${firstCover}</div><div class='hint-sub'><strong>${t('fullChargeTime')}:</strong> ${fullCharge} (${t('refillConfidence')} ${refillConf.toFixed(2)})</div><div class='hint-sub'><strong>${t('decisionStartRules')}:</strong></div>${renderRuleList(startRules)}<div class='hint-sub'><strong>${t('decisionStopRules')}:</strong></div>${renderRuleList(stopRules)}</div></div><div class='hint-section'><div class='hint-section-title'>${t('hintStartGuardTitle')}</div><div class='hints-grid'><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-play-circle'></i> ${t('startGuardAllow')}</div><div class='hint-value'>${startGuardAllow}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-circle-info'></i> ${t('startGuardReason')}</div><div class='hint-value'>${reasonTxt}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-start'></i> ${t('startGuardBridge')}</div><div class='hint-value'>${startGuardBridgeView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-hourglass-half'></i> ${t('startGuardEta')}</div><div class='hint-value'>${startGuardEtaView}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-full'></i> ${t('startGuardFullEta')}</div><div class='hint-value'>${startGuardFullEta}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-car-battery'></i> ${t('startGuardCapacity')}</div><div class='hint-value'>${startGuardCapacity}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-battery-three-quarters'></i> ${t('startGuardUsable')}</div><div class='hint-value'>${startGuardUsable}</div><div class='hint-sub'><strong>${t('usableFormula')}:</strong> ${startGuardUsableFormula}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-business-time'></i> ${t('neededBridgeTime')}</div><div class='hint-value'>${neededBridgeTime}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div><div class='hint-card'><div class='hint-title'><i class='fa-solid fa-bolt-lightning'></i> ${t('neededBridgeEnergy')}</div><div class='hint-value'>${neededBridgeEnergy}</div><div class='hint-sub'><strong>${t('bmsRange')}:</strong> ${neededBridgeBmsRange}</div></div></div></div>`;
-powerChart.data.labels=labels; powerChart.data.datasets[0].data=h.map(x=>x.power); powerChart.update();
-phaseChart.data.labels=labels; phaseChart.data.datasets[0].data=h.map(x=>x.inv_l1); phaseChart.data.datasets[1].data=h.map(x=>x.inv_l2); phaseChart.data.datasets[2].data=h.map(x=>x.inv_l3); phaseChart.update();
-batteryChart.data.labels=labels; batteryChart.data.datasets[0].data=h.map(x=>x.battery); batteryChart.data.datasets[1].data=h.map(x=>x.state==='production'?100:0); batteryChart.update();
-envChart.data.labels=labels; envChart.data.datasets[0].data=h.map(x=>x.garage_temp); envChart.data.datasets[1].data=h.map(x=>x.garage_hum); envChart.update();
-histSocChart.data.labels=labels; histSocChart.data.datasets[0].data=h.map(x=>Number(x.early_start_soc||0)); histSocChart.data.datasets[1].data=h.map(x=>Number(x.min_stop_soc||0)); histSocChart.data.datasets[2].data=h.map(x=>Number(x.late_day_reserve_soc||0)); histSocChart.update();
-const mq=(m)=>m==='strong'?100:(m==='weak'?0:50);
-histFlagsChart.data.labels=labels; histFlagsChart.data.datasets[0].data=h.map(x=>x.should_preserve_battery?100:0); histFlagsChart.data.datasets[1].data=h.map(x=>x.headroom_good?100:0); histFlagsChart.data.datasets[2].data=h.map(x=>mq(String(x.month_quality||'neutral'))); histFlagsChart.update();}
-async function act(a){
-  const buttons=['btnStart','btnStop','btnForce'].map(id=>document.getElementById(id));
-  buttons.forEach(b=>b.disabled=true);
-  showActionResult(t('actionInProgress'),'warn');
-  try{
-    const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});
-    const d=await r.json();
-    const msgKey=a==='start'?'actionStartOk':(a==='stop'?'actionStopOk':'actionForceOk');
-    const stamp=d.ts?new Date(d.ts).toLocaleString():'';
-    if(d.ok){
-      showActionResult(t(msgKey),'ok',`${d.message}${stamp?` · ${stamp}`:''}`);
-    }else{
-      showActionResult(`${t('actionError')}: ${d.message}`,'err',stamp);
-    }
-  }catch(err){
-    showActionResult(`${t('actionError')}: ${String(err)}`,'err');
-  }finally{
-    buttons.forEach(b=>b.disabled=false);
-  }
-}
-document.getElementById('applyRange').onclick=()=>{currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};pull();};
-document.getElementById('shortcutDay').onclick=()=>{setRangeDays(1);pull();};
-document.getElementById('shortcutWeek').onclick=()=>{setRangeDays(7);pull();};
-document.getElementById('shortcutMonth').onclick=()=>{setRangeDays(30);pull();};
-document.getElementById('downloadTelemetry').onclick=()=>{window.location.href='/api/telemetry/download';};
-init();applyI18n();pull();setInterval(pull,10000);document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};document.getElementById('lang').onclick=()=>{currentLang=currentLang==='en'?'hu':'en';applyI18n();pull();};
+async function pull(){try{const r=await fetch('/api/snapshot?'+new URLSearchParams(range));if(!r.ok)throw Error('HTTP '+r.status);render(await r.json());}catch(e){text('message',e.message);}}
+document.getElementById('apply').onclick=()=>{range={from:document.getElementById('from').value,to:document.getElementById('to').value};pull();};document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';};document.getElementById('lang').onclick=()=>{currentLang=currentLang==='en'?'hu':'en';text('lang',currentLang==='en'?'HU':'EN');pull();};
+for(const button of document.querySelectorAll('[data-action]'))button.onclick=async()=>{button.disabled=true;try{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:button.dataset.action})});const d=await r.json();text('message',d.message);}catch(e){text('message',e.message);}finally{button.disabled=false;}};
+pull();setInterval(pull,10000);
 </script></body></html>
+
 """
 
 
 def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[str] = None) -> Dict[str, Any]:
     with snapshot_lock:
         snap = dict(_shared_snapshot)
-        hist = list(telemetry_history)
+        hist = list((historical_profile or {}).get("rows",[]))
     notices = list(web_notifications)[:5]
 
     now = datetime.now(tz=budapest_tz)
@@ -3374,8 +1762,9 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         end_ts = None
 
     if start_ts is None or end_ts is None:
-        end_ts = now + timedelta(seconds=1)
-        start_ts = now - timedelta(days=30)
+        latest = datetime.fromisoformat(hist[-1]['ts']) if hist else now
+        end_ts = latest + timedelta(seconds=1)
+        start_ts = latest - timedelta(days=30)
 
     filtered_hist = []
     for item in hist:
@@ -3392,7 +1781,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
 
     return {
         "battery": snap.get("battery", 0),
-        "power": snap.get("power", 0),
+        "power": snap.get("power"),
+        "inv_lt": snap.get("inv_lt"),
         "state": snap.get("state", "unknown"),
         "current_condition": snap.get("current_condition", "unknown"),
         "weather_icon": _weather_icon(snap.get("current_condition", "")),
@@ -3402,6 +1792,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "hashrate_text": _format_hashrate(snap.get("hashrate_hs")),
         "power_guard_reason": _power_guard.reason,
         "monitoring_mode": snap.get("monitoring_mode", "production_window"),
+        "solarman_polled_at": snap.get("solarman_polled_at"),
+        "solarman_poll_interval_seconds": snap.get("solarman_poll_interval_seconds"),
         "mining_pool": "unMineable",
         "mining_coin": MINING_COIN,
         "mining_algorithm": MINING_ALGORITHM,
@@ -3409,6 +1801,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "wallet_address": _effective_wallet_address(),
         "sunrise": snap.get("sunrise").isoformat() if snap.get("sunrise") else "",
         "sunset": snap.get("sunset").isoformat() if snap.get("sunset") else "",
+        "history_source": "solarman_json",
         "history_count": len(filtered_hist),
         "history": filtered_hist,
         "historical_hints": snap.get("historical_hints", {}),
@@ -3475,20 +1868,9 @@ class WebHandler(BaseHTTPRequestHandler):
             ).encode("utf-8")
             self._write(200, payload, "application/json")
             return
-        if parsed.path == "/api/telemetry/download":
-            try:
-                with snapshot_lock:
-                    payload_data = list(telemetry_history)
-                body = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
-                filename = f"telemetry_history_{datetime.now(tz=budapest_tz).strftime('%Y%m%d_%H%M%S')}.json"
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception as err:
-                self._write(500, json.dumps({"error": f"telemetry export failed: {err}"}).encode("utf-8"), "application/json")
+        if parsed.path == "/api/history/download":
+            rows = (historical_profile or {}).get('rows',[])
+            self._write(200,json.dumps(rows,ensure_ascii=False).encode('utf-8'),'application/json; charset=utf-8')
             return
         self._write(404, b'{"error":"not found"}', "application/json")
 
@@ -3551,7 +1933,6 @@ def main_loop():
     if historical_profile is None:
         historical_profile = build_historical_profile(HISTORY_DIR)
 
-    _load_telemetry_from_file()
 
     used_quote = load_quote_usage()
     (current_condition, sunrise, sunset, clouds,
@@ -3575,14 +1956,23 @@ def main_loop():
 
     # ThreadPool for concurrent I/O (token, weather, DHT)
     executor = ThreadPoolExecutor(max_workers=4)
+    last_solar_slot = None
+    last_solar_attempt = None
 
     while True:
         now = datetime.now(tz=budapest_tz)
+        solar_slot = _solarman_poll_slot(now, sunrise, sunset)
+        solar_due = _solarman_poll_due(now, solar_slot, last_solar_slot, last_solar_attempt)
+        solar_interval = solar_slot[0]
 
         # Concurrently read DHT and prefetch next weather + token
         fut_dht = executor.submit(read_dht11, prev_garage_temp, prev_garage_hum)
         fut_weather = executor.submit(get_current_weather, WEATHER_API, LOCATION_LAT, LOCATION_LON)
-        fut_token = executor.submit(get_access_token)
+        fut_token = None
+        if solar_due:
+            last_solar_slot = solar_slot
+            last_solar_attempt = now
+            fut_token = executor.submit(get_access_token)
 
         # Use DHT reading immediately for local decisions
         try:
@@ -3644,11 +2034,15 @@ def main_loop():
         print(f"Control window: {within_active} ({control_details.get('reason')})")
 
         _update_pool_hashrate(now)
+        with snapshot_lock:
+            _shared_snapshot.update({"garage_temp": garage_temp, "garage_hum": garage_hum,
+                                     "solarman_poll_interval_seconds": solar_interval})
+        if within_active and not solar_due:
+            print(f"[Solarman] Waiting for next {solar_interval // 60}-minute polling slot.")
+            sleep_until_next_5min(offset_seconds=60)
+            continue
         if within_active:
             try:
-                used_quote += 1
-                save_quote_usage(used_quote)
-
                 print("\n\nStarting new cycle...")
                 print(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
@@ -3667,30 +2061,32 @@ def main_loop():
                      f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
                 # Fetch device data (depends on token)
-                raw_data = fetch_current_data(token) if token else {}
-                data, used_previous_payload = _with_daytime_data_fallback(raw_data or {}, now, sunrise, sunset)
-                store_data(data)  # attaches phasePowers
+                raw_data = {}
+                if token:
+                    used_quote += 1
+                    save_quote_usage(used_quote)
+                    raw_data = fetch_current_data(token)
+                data = raw_data or {}
+                if not _has_solarman_payload(data):
+                    supervise_runtime_by_power(now,state or 'unknown',{},poll_interval_seconds=solar_interval)
+                    print('[History model] Live data unavailable; keeping controller state without new GPIO decisions.')
+                    sleep_until_next_5min(offset_seconds=60)
+                    continue
 
                 _latest_power_sample = _extract_power_sample(raw_data or {}, now)
                 (battery, power, state, current_condition, sunrise, sunset, clouds,
                 f1_cond, f1_clouds, f1_ts, f3_cond, f3_clouds, f3_ts, hist_hints) = check_crypto_production_conditions(
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
-                # Cached daytime fallbacks may be displayed, never used for GPIO.
-                supervise_runtime_by_power(now, state or "unknown", raw_data or {})
-
-                has_usable_solarman_data = _has_solarman_payload(data)
-                if not has_usable_solarman_data:
-                    print("[Telemetry] Solarman dataList is empty for this cycle; saving fallback telemetry row.")
-                elif used_previous_payload:
-                    print("[Telemetry] API payload empty during daytime; telemetry uses previous valid Solarman snapshot.")
-                _record_telemetry(now, data or {}, battery or 0, power or 0, state or "unknown",
-                                  current_condition or "unknown", clouds or 0, garage_temp, garage_hum, hist_hints, sunrise, sunset)
+                # Hardware supervision uses only this fresh API response.
+                supervise_runtime_by_power(now, state or "unknown", raw_data or {}, poll_interval_seconds=solar_interval)
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
                     _shared_snapshot.update({
                         "monitoring_mode": "production_window",
+                        "solarman_polled_at": now.isoformat(),
+                        "solarman_poll_interval_seconds": solar_interval,
                         "battery": battery or 0,
                         "power": power or 0,
                         "state": state or "unknown",
@@ -3727,7 +2123,7 @@ def main_loop():
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
-            print(f"[Safety monitoring] Outside production window: PV/load polling continues every 5 minutes, at least 30 minutes after sunset and throughout the night. (Sunset stop: {sunset.strftime('%H:%M')})")
+            print(f"[Safety monitoring] Outside production window: Solarman every {solar_interval // 60} minutes. (Sunset stop: {sunset.strftime('%H:%M')})")
             print(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
             (current_condition, sunrise, sunset, clouds,
@@ -3739,7 +2135,8 @@ def main_loop():
                 prev_state = state
                 uptime = now
                 save_prev_state(prev_state, uptime)
-            _idle_monitor_cycle(now, fut_token, garage_temp, garage_hum)
+            if solar_due:
+                _idle_monitor_cycle(now, fut_token, garage_temp, garage_hum, poll_interval_seconds=solar_interval)
 
             # update snapshot for telegram thread even during idle
             with snapshot_lock:

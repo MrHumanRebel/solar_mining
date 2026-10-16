@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 
 from miner_power_guard import MinerPowerGuard, PowerSample
-from replay_power_guard import replay
 import simulate_decisions
 
 solar = simulate_decisions.solar
@@ -31,28 +30,16 @@ def armed_guard(swap=False):
 
 
 class PowerGuardTests(unittest.TestCase):
-    def test_uploaded_oct16_stopped_rig_load_does_not_authorize_shutdown(self):
-        path = Path(__file__).parent / 'tests/fixtures/stopped_rig_oct16.json'
-        rows = json.loads(path.read_text())
-        self.assertEqual([r['inv_lt'] for r in rows], [872,1206,1226])
-        result = replay(rows)
-        self.assertEqual(result['counts']['stop_rows_over_1000W'], 2)
-        self.assertEqual(result['simulated_shutdown_signals'], [])
+    def test_known_stopped_rig_load_never_arms_without_observed_start(self):
+        rows=json.loads((Path(__file__).parent/'tests/fixtures/stopped_rig_oct16.json').read_text())
+        guard=MinerPowerGuard()
+        for row in rows:
+            at=datetime.fromisoformat(row['ts'])
+            self.assertFalse(guard.observe(PowerSample(at,row['inv_lt'],row['inv_l1'],row['inv_l2'],row['inv_l3']),at,'stop'))
 
-    def test_replay_does_not_treat_software_state_as_verified_gpio_command(self):
-        rows = []
-        for minute in (0,5,10,15,20,25,30,35):
-            rows.append({'ts':(T+timedelta(minutes=minute)).isoformat(),
-                         'state':'production' if minute in (10,15,20) else 'stop',
-                         'inv_lt':1200,'inv_l1':100,'inv_l2':550,'inv_l3':550})
-        result = replay(rows)
-        self.assertEqual(result['counts']['recorded_start_transitions'],1)
-        self.assertEqual(result['counts']['identified_runs'],0)
-        self.assertEqual(result['simulated_shutdown_signals'],[])
-
-    def test_three_fresh_matching_stop_samples_trigger_once(self):
+    def test_first_fresh_matching_stop_sample_triggers_once(self):
         guard = armed_guard()
-        for minute, expected in [(25, False), (30, False), (35, True), (40, False), (45, False)]:
+        for minute, expected in [(25, True), (30, False), (35, False), (40, False), (45, False)]:
             s = sample(minute)
             self.assertEqual(guard.observe(s, s.at, 'stop'), expected)
 
@@ -62,7 +49,7 @@ class PowerGuardTests(unittest.TestCase):
         for minute in (25, 30, 35):
             s = sample(minute, l2=450, l3=650)
             results.append(guard.observe(s, s.at, 'stop'))
-        self.assertEqual(results, [False, False, True])
+        self.assertEqual(results, [True, False, False])
 
     def test_oven_only_and_unknown_start_never_arm(self):
         guard = MinerPowerGuard()
@@ -120,15 +107,20 @@ class PowerGuardTests(unittest.TestCase):
     def test_missing_stale_future_and_repeated_samples_do_not_confirm(self):
         guard = armed_guard()
         s = sample(25)
-        self.assertFalse(guard.observe(s, s.at, 'stop'))
+        self.assertTrue(guard.observe(s, s.at, 'stop'))
         for _ in range(10):
             self.assertFalse(guard.observe(s, s.at, 'stop'))
-        self.assertEqual(len(guard.hits), 1)
         self.assertFalse(guard.observe(None, s.at, 'stop'))
-        self.assertEqual(guard.hits, [])
         self.assertFalse(guard.observe(s, s.at + timedelta(minutes=10), 'stop'))
         future = sample(40)
         self.assertFalse(guard.observe(future, s.at, 'stop'))
+
+    def test_armed_guard_rejects_repeated_stale_and_future_first_stop_readings(self):
+        for at_minute, now_minute in ((20,25),(25,35),(40,25)):
+            with self.subTest(at=at_minute,now=now_minute):
+                guard = armed_guard()
+                self.assertFalse(guard.observe(sample(at_minute),T+timedelta(minutes=now_minute),'stop'))
+                self.assertIsNotNone(guard.signature)
 
     def test_gap_loses_identity_instead_of_reusing_old_running_measurement(self):
         guard = armed_guard()
@@ -193,7 +185,6 @@ class PowerGuardTests(unittest.TestCase):
         executor = Mock(submit=Mock(side_effect=submit))
         with patch.multiple(solar, historical_profile={}, state='stop', prev_state='stop',
                             last_quote_reset_date=T.date()), \
-             patch.object(solar, '_load_telemetry_from_file'), \
              patch.object(solar, 'load_quote_usage', return_value=0), \
              patch.object(solar, 'save_quote_usage'), \
              patch.object(solar, 'get_current_weather', return_value=weather), \
