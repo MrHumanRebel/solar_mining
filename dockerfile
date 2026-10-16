@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bullseye
+FROM python:3.11-slim-bookworm
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -7,23 +7,17 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies for GPIO, OLED, and ping support
-RUN apt-get update && apt-get install -y \
+# Build native GPIO extensions; retain the hardware libraries used at runtime.
+# Pillow publishes ARM64 wheels, so image/BLAS/OpenGL development packages are
+# unnecessary. Bookworm provides libgpiod2 for adafruit-circuitpython-dht.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 update --error-on=any \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     build-essential \
-    libjpeg-dev \
-    zlib1g-dev \
-    libfreetype6-dev \
-    libtiff5-dev \
-    libopenjp2-7 \
-    libatlas-base-dev \
     i2c-tools \
     iputils-ping \
     tzdata \
-    libgl1-mesa-dev \
-    libffi-dev \
-    libusb-1.0-0-dev \
-    python3-dev \
-    libc6-dev \
+    libusb-1.0-0 \
     libgpiod2 \
     && rm -rf /var/lib/apt/lists/*
 
