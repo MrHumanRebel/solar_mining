@@ -56,6 +56,27 @@ class MiningPoolTests(unittest.TestCase):
         self.assertEqual(solar._extract_hashrate_from_wallet_payload(workers_payload()), 70.06e12)
         self.assertEqual(solar._format_hashrate(70.06e12), '70.06 TH/s')
 
+    def test_recorded_v5_response_returns_real_pearlpow_rate(self):
+        fixture = Path(__file__).parent / 'tests/fixtures/unmineable_v5_workers.json'
+        payload = json.loads(fixture.read_text())
+        account = Mock(json=Mock(return_value={'success': True, 'data': {'uuid': 'test-account'}}))
+        workers = Mock(json=Mock(return_value=payload))
+        with patch.object(solar.requests, 'get', side_effect=[account, workers]) as get:
+            rate = solar._wallet_hashrate_hs(ADDRESS)
+            self.assertEqual(rate, 235187980540458)
+            self.assertEqual(solar._format_hashrate(rate), '235.19 TH/s')
+            self.assertEqual(get.call_count, 2)
+            self.assertTrue(all(call.args[0].startswith('https://api.unmineable.com/v5/')
+                                for call in get.call_args_list))
+        with patch.dict(solar._shared_snapshot, {'hashrate_hs': rate}):
+            self.assertEqual(solar._build_snapshot_payload()['hashrate_text'], '235.19 TH/s')
+
+    def test_recorded_response_without_pearlpow_is_unknown_not_zero(self):
+        fixture = Path(__file__).parent / 'tests/fixtures/unmineable_v5_workers.json'
+        payload = json.loads(fixture.read_text())
+        del payload['data']['pearlpow']
+        self.assertIsNone(solar._extract_hashrate_from_wallet_payload(payload))
+
     def test_other_workers_and_algorithms_are_not_this_rig(self):
         payload = workers_payload()
         payload['data']['pearlpow']['workers'].append(
@@ -83,21 +104,21 @@ class MiningPoolTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertIsNone(solar._extract_hashrate_from_wallet_payload(payload))
 
-    def test_v4_address_resolution_and_worker_request(self):
+    def test_v5_address_resolution_and_worker_request(self):
         account = Mock(json=Mock(return_value={'success': True, 'data': {'uuid': 'test-uuid'}}))
         workers = Mock(json=Mock(return_value=workers_payload()))
         with patch.object(solar.requests, 'get', side_effect=[account, workers]) as get:
             self.assertEqual(solar._wallet_hashrate_hs(ADDRESS), 70.06e12)
-            self.assertEqual(get.call_args_list[0].args[0], f'https://api.unminable.com/v4/address/{ADDRESS}')
+            self.assertEqual(get.call_args_list[0].args[0], f'https://api.unmineable.com/v5/address/{ADDRESS}')
             self.assertEqual(get.call_args_list[0].kwargs['params'], {'coin': 'USDT'})
-            self.assertEqual(get.call_args_list[1].args[0], 'https://api.unminable.com/v4/account/test-uuid/workers')
+            self.assertEqual(get.call_args_list[1].args[0], 'https://api.unmineable.com/v5/account/test-uuid/workers')
 
     def test_api_failure_does_not_scrape_or_query_old_pool(self):
         with patch.object(solar.requests, 'get', side_effect=solar.requests.HTTPError('403')) as get, \
              patch.object(solar.time, 'sleep'):
             self.assertIsNone(solar._wallet_hashrate_hs(ADDRESS))
             self.assertEqual(get.call_count, 3)
-            self.assertTrue(all(call.args[0].startswith('https://api.unminable.com/') for call in get.call_args_list))
+            self.assertTrue(all(call.args[0].startswith('https://api.unmineable.com/') for call in get.call_args_list))
 
     def test_cache_is_partitioned_by_wallet_and_worker(self):
         now = solar.datetime.now(tz=solar.budapest_tz)
@@ -123,6 +144,18 @@ class MiningPoolTests(unittest.TestCase):
             solar.check_hashrate_guard(now, 'production')
             self.assertEqual(solar._hashrate_low_streak, 0)
             button.assert_not_called()
+
+    def test_unavailable_readings_are_cached_and_retried_after_expiry(self):
+        now = solar.datetime.now(tz=solar.budapest_tz)
+        with patch.object(solar, '_last_wallet_hashrate_key', None), \
+             patch.object(solar, '_last_wallet_hashrate_hs', None), \
+             patch.object(solar, '_last_wallet_hashrate_at', None), \
+             patch.object(solar, '_wallet_hashrate_hs', side_effect=[None, 70.06e12]) as fetch:
+            self.assertIsNone(solar._wallet_hashrate_hs_cached(ADDRESS, now))
+            self.assertIsNone(solar._wallet_hashrate_hs_cached(ADDRESS, now + timedelta(seconds=60)))
+            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(solar._wallet_hashrate_hs_cached(ADDRESS, now + timedelta(seconds=121)), 70.06e12)
+            self.assertEqual(fetch.call_count, 2)
 
     def test_confirmed_zero_still_restarts_after_required_streak(self):
         now = solar.datetime.now(tz=solar.budapest_tz)

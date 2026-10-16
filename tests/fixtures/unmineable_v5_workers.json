@@ -1,0 +1,396 @@
+{
+  "success": true,
+  "msg": "Ok",
+  "data": {
+    "ethash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "etchash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "randomx": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "kawpow": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "autolykos": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "beamhash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "zelhash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "firopow": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "zhash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "scrypt": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "sha256": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "equihash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "kheavyhash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "blake3": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "ironfish": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "octopus": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "nexapow": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "karlsenhash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "dynexsolve": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "pyrinhash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "ethashb3": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "sha512256d": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "fishhash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "ghostrider": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "xelishash": {
+      "workers": [],
+      "chart": {
+        "reported": {
+          "data": [],
+          "timestamps": []
+        },
+        "calculated": {
+          "data": [],
+          "timestamps": []
+        }
+      }
+    },
+    "pearlpow": {
+      "workers": [
+        {
+          "online": true,
+          "name": "solarminer",
+          "last": 1792159800000,
+          "rhr": "235187980540458",
+          "chr": "235187980540458"
+        }
+      ],
+      "chart": {
+        "reported": {
+          "data": [
+            "15011998757901.6",
+            "30023997515803.2",
+            "30023997515803.2",
+            "30023997515803.2",
+            "70055994203540.8",
+            "100079991719344",
+            "125099989649180",
+            "160127986750950.4",
+            "175139985508852",
+            "235187980540458.4"
+          ],
+          "timestamps": [
+            1792157100000,
+            1792157400000,
+            1792157700000,
+            1792158000000,
+            1792158300000,
+            1792158600000,
+            1792158900000,
+            1792159200000,
+            1792159500000,
+            1792159800000
+          ]
+        },
+        "calculated": {
+          "data": [
+            "15011998757901.6",
+            "30023997515803.2",
+            "30023997515803.2",
+            "30023997515803.2",
+            "70055994203540.8",
+            "100079991719344",
+            "125099989649180",
+            "160127986750950.4",
+            "175139985508852",
+            "235187980540458.4"
+          ],
+          "timestamps": [
+            1792157100000,
+            1792157400000,
+            1792157700000,
+            1792158000000,
+            1792158300000,
+            1792158600000,
+            1792158900000,
+            1792159200000,
+            1792159500000,
+            1792159800000
+          ]
+        }
+      }
+    }
+  }
+}
