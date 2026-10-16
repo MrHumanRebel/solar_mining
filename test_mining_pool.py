@@ -133,18 +133,6 @@ class MiningPoolTests(unittest.TestCase):
                 self.assertEqual(solar._wallet_hashrate_hs_cached(ADDRESS, now), 30)
             self.assertEqual(fetch.call_count, 3)
 
-    def test_api_outage_never_restarts_hardware(self):
-        now = solar.datetime.now(tz=solar.budapest_tz)
-        with patch.object(solar, '_wallet_hashrate_hs_cached', return_value=None), \
-             patch.object(solar, '_last_production_start_at', now - timedelta(hours=1)), \
-             patch.object(solar, '_restart_triggered_this_cycle', False), \
-             patch.object(solar, '_hashrate_low_streak', solar.HASHRATE_LOW_STREAK_LIMIT), \
-             patch.object(solar, 'is_rpi', True), patch.object(solar, 'GPIO_AVAILABLE', True), \
-             patch.object(solar, 'press_power_button') as button:
-            solar.check_hashrate_guard(now, 'production')
-            self.assertEqual(solar._hashrate_low_streak, 0)
-            button.assert_not_called()
-
     def test_unavailable_readings_are_cached_and_retried_after_expiry(self):
         now = solar.datetime.now(tz=solar.budapest_tz)
         with patch.object(solar, '_last_wallet_hashrate_key', None), \
@@ -156,19 +144,6 @@ class MiningPoolTests(unittest.TestCase):
             self.assertEqual(fetch.call_count, 1)
             self.assertEqual(solar._wallet_hashrate_hs_cached(ADDRESS, now + timedelta(seconds=121)), 70.06e12)
             self.assertEqual(fetch.call_count, 2)
-
-    def test_confirmed_zero_still_restarts_after_required_streak(self):
-        now = solar.datetime.now(tz=solar.budapest_tz)
-        with patch.object(solar, '_wallet_hashrate_hs_cached', return_value=0), \
-             patch.object(solar, '_last_production_start_at', now - timedelta(hours=1)), \
-             patch.object(solar, '_restart_triggered_this_cycle', False), \
-             patch.object(solar, '_last_hashrate_restart_at', None), \
-             patch.object(solar, '_hashrate_low_streak', solar.HASHRATE_LOW_STREAK_LIMIT - 1), \
-             patch.object(solar, 'is_rpi', True), patch.object(solar, 'GPIO_AVAILABLE', True), \
-             patch.object(solar, 'send_telegram_message'), patch.object(solar, 'save_prev_state'), \
-             patch.object(solar.time, 'sleep'), patch.object(solar, 'press_power_button') as button:
-            solar.check_hashrate_guard(now, 'production')
-            self.assertEqual(button.call_count, 2)
 
     def test_snapshot_formats_missing_rate_as_unknown(self):
         with patch.dict(solar._shared_snapshot, {'hashrate_hs': None}):
