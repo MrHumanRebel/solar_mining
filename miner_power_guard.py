@@ -29,12 +29,15 @@ class MinerPowerGuard:
         self.signature = None
         self.candidates = deque(maxlen=2)
         self.hits = []
+        self.poll_interval_seconds = 300
+        self.learning_timeout_seconds = 900
         self.reason = "No witnessed miner start"
 
     def disarm(self, reason):
         self.started = self.baseline = self.signature = None
         self.candidates.clear()
         self.hits.clear()
+        self.learning_timeout_seconds = 900
         self.reason = reason
 
     @staticmethod
@@ -47,25 +50,30 @@ class MinerPowerGuard:
             return
         if not self.off or sample.at > self.off[-1].at:
             self.off.append(sample)
-        if len(self.off) != 3 or (sample.at - self.off[0].at).total_seconds() > 900:
+        slack = 120 if self.poll_interval_seconds == 300 else 360
+        baseline_span = max(900, 2 * self.poll_interval_seconds + slack)
+        if len(self.off) != 3 or (sample.at - self.off[0].at).total_seconds() > baseline_span:
             return
         if any(max(getattr(s, k) for s in self.off) - min(getattr(s, k) for s in self.off) > 80
                for k in ("l1", "l2", "l3")):
             return
         self.baseline = tuple(median(getattr(s, k) for s in self.off) for k in ("l1", "l2", "l3"))
         self.started = now
+        self.learning_timeout_seconds = baseline_span
         self.off.clear()
         self.reason = "Waiting for stable L2/L3 rise after start"
 
-    def observe(self, sample, now, expected_state):
+    def observe(self, sample, now, expected_state, poll_interval_seconds=300):
         """Return True only for a newly confirmed automatic shutdown."""
+        self.poll_interval_seconds = max(300, poll_interval_seconds)
         if not self.fresh(sample, now):
             self.hits.clear()
             self.reason = "Missing or stale consumption measurement"
             return False
         if self.last_at is not None and sample.at <= self.last_at:
             return False
-        if self.last_at and (sample.at - self.last_at).total_seconds() > 420:
+        slack = 120 if self.poll_interval_seconds == 300 else 360
+        if self.last_at and (sample.at - self.last_at).total_seconds() > self.poll_interval_seconds + slack:
             self.disarm("Measurement gap; start identification lost")
             self.off.clear()
         self.last_at = sample.at
@@ -78,7 +86,8 @@ class MinerPowerGuard:
             return False
         delta = tuple(getattr(sample, k) - b for k, b in zip(("l1", "l2", "l3"), self.baseline))
         if self.signature is None:
-            if now - self.started > timedelta(minutes=15):
+            self.learning_timeout_seconds = max(self.learning_timeout_seconds, 2*self.poll_interval_seconds + slack)
+            if (now - self.started).total_seconds() > self.learning_timeout_seconds:
                 self.disarm("No identifiable two-phase mining load after start")
                 return False
             # 3x <=150 W GPUs on one phase; 2x GPUs + CPU on the other.

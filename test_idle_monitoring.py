@@ -75,7 +75,7 @@ class IdleMonitoringTests(unittest.TestCase):
              patch.object(solar, 'is_rpi', False), patch.dict(solar._shared_snapshot), \
              redirect_stdout(io.StringIO()):
             solar._idle_monitor_cycle(SUNSET, future, None, None)
-            guard.assert_called_once_with(SUNSET,'stop',{})
+            guard.assert_called_once_with(SUNSET,'stop',{},poll_interval_seconds=300)
             self.assertIsNone(solar._shared_snapshot['power'])
 
     def test_missing_or_malformed_measurements_do_not_crash_idle_monitoring(self):
@@ -138,14 +138,16 @@ class IdleMonitoringTests(unittest.TestCase):
         executor = Mock(submit=Mock(side_effect=submit))
         oled = Mock(width=128, height=32)
         oled.show.side_effect = OSError('OLED offline')
+        slots = [(1800, i // 6) for i in range(13)]
         with patch.multiple(solar, historical_profile={}, state='stop', prev_state='stop',
-                            last_quote_reset_date=SUNSET.date()), \
+                            last_quote_reset_date=SUNSET.date(), _solarman_poll_slot=Mock(side_effect=slots),
+                            _solarman_poll_due=Mock(side_effect=[i%6==0 for i in range(13)])), \
              patch.object(solar, '_load_telemetry_from_file'), \
              patch.object(solar, 'load_quote_usage',return_value=0), \
              patch.object(solar, 'save_quote_usage'), \
              patch.object(solar, 'get_current_weather',return_value=weather), \
              patch.object(solar, 'read_dht11',return_value={'temperature':None,'humidity':None}), \
-             patch.object(solar, 'get_access_token',return_value='test-token'), \
+             patch.object(solar, 'get_access_token',return_value='test-token') as auth, \
              patch.object(solar, 'fetch_current_data',return_value={'dataList':[]}) as fetch, \
              patch.object(solar.threading,'Thread'), \
              patch.object(solar,'ThreadPoolExecutor',return_value=executor), \
@@ -158,8 +160,9 @@ class IdleMonitoringTests(unittest.TestCase):
              redirect_stdout(io.StringIO()):
             with self.assertRaises(StopIteration):
                 solar.main_loop()
-            self.assertEqual(fetch.call_count,13)
-            self.assertEqual(guard.call_count,13)
+            self.assertEqual(fetch.call_count,3)
+            self.assertEqual(auth.call_count,3)
+            self.assertEqual(guard.call_count,3)
             self.assertEqual(solar._shared_snapshot['hashrate_hs'],200e12)
 
 

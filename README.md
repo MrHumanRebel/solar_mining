@@ -42,14 +42,15 @@ mindkét fáziskiosztása támogatott. A pool API nem vesz részt a vezérlésbe
   500–1000 W, a 3 GPU-s ág 250–550 W, a másik 200–650 W lehet.
 - STOP-kérés után **1000 W feletti teljes fogyasztás ÉS a megtanult L2/L3
   terhelés** szükséges három egymást követő, legalább két percenkénti mérésben.
-  Az alapértelmezett ötperces ciklussal ez körülbelül tíz perc megerősítés.
+  Nappal ez körülbelül tíz perc, a félórás éjszakai mintavételezéssel
+  körülbelül egy óra megerősítés.
 - Futásonként legfeljebb egy automatikus hosszú gombnyomás engedélyezett.
   Bármelyik azonosított ág eltűnése visszavonja a felismerést: későbbi
   sütő/főzőlap-terhelés nem élesíti újra ugyanazt a futást.
 - A sima állapotváltás sem küld többé vakon hosszú gombnyomást. A kézi
   Telegram/GUI-parancsok továbbra is közvetlen parancsok.
-- Hiányzó adatok, hat percnél régebbi vagy ismételt mérés, hét percnél
-  hosszabb mérési rés, bizonytalan terhelés vagy alkalmazás-újraindítás után
+- Hiányzó adatok, hat percnél régebbi vagy ismételt mérés, nappal hét,
+  éjjel 36 percnél hosszabb mérési rés, bizonytalan terhelés vagy alkalmazás-újraindítás után
   nincs automatikus gombnyomás. Újraindítás után új, megfigyelt indítás kell.
 - Friss `collectionTime` (másodperc/milliszekundum), `dataTime` vagy
   `timestamp`, explicit teljes fogyasztási mező és mindhárom fázis szükséges.
@@ -63,8 +64,16 @@ A felismerés oka a `[Power guard]` naplóban és a snapshot API
 összesített fázismérésből nem bizonyítható egy fogyasztó azonossága. A két
 bányásztáp külön fogyasztásmérője szükséges a biztos elkülönítéshez.
 
-Napnyugta után az ötpercenkénti PV- és fogyasztáslekérés nem áll le: legalább
-30 percig, majd egész éjjel folytatódik STOP állapotban. A dashboard és az
+Napkelte és napnyugta között ötpercenként, éjjel félóránként egyszer kérünk
+Solarman-adatot és hozzáférési tokent. A tényleges időjárási napkelte/napnyugta
+határozza meg az ütemet, a bányászati vezérlőablak korábbi időeltolásaitól
+függetlenül. Éjjel az előző lekérési kísérlet óta legalább 30 percnek kell
+eltelnie; napnyugta vagy egy félórás órahatár nem okoz extra lekérést.
+Sikertelen kísérlet után is megvárjuk a következő engedélyezett időpontot.
+A fő ciklus, a szenzorok és a pool-kijelzés éjjel is ötpercenként frissülnek.
+A kihagyott slotokban tárolt Solarman-adat nem jut a leállítási védelemhez.
+A nappali/éjszakai ütemhez az alapfogyasztás tanulási ideje is igazodik;
+egy mérés maximális megengedett kora továbbra is hat perc. A dashboard és az
 OLED a ténylegesen lekért PV-/akkuértéket mutatja; hiányzó adat `N/A`, illetve
 `--`, nem mesterséges nulla. OLED/I2C-hiba és hiányzó DHT-adat nem állíthatja
 le ezt a felügyeletet. Az éjszakai lekérések beleszámítanak az API-kvótába.
@@ -103,7 +112,7 @@ A dashboard Chart.js 4.5.1 és Font Awesome 7.3.1 verziót használ.
 ```bash
 python -m pip install -r requirements.txt
 python -m pip check
-python -m unittest -v test_mining_pool test_miner_power_guard test_idle_monitoring
+python -m unittest -v test_mining_pool test_miner_power_guard test_idle_monitoring test_solar_polling
 python simulate_decisions.py --telemetry telemetry_history_20260524_161647.json --history-dir solarman_json
 ```
 

@@ -114,6 +114,7 @@ gpio_lock = threading.RLock()
 power_guard_lock = threading.RLock()
 _power_guard = MinerPowerGuard()
 _latest_power_sample = None
+_weather_daylight = None
 snapshot_lock = threading.Lock()
 
 # Shared snapshot for Telegram thread
@@ -2517,6 +2518,7 @@ def save_prev_state(state_val, uptime_val):
         print(f"[Warning] Failed to save prev state: {e}")
 
 def get_current_weather(api_key, location_lat, location_lon):
+    global _weather_daylight
     try:
         # Current
         url = "https://api.openweathermap.org/data/2.5/weather"
@@ -2529,6 +2531,8 @@ def get_current_weather(api_key, location_lat, location_lon):
         clouds = d['clouds']['all']
         sunrise_ts = d['sys']['sunrise']
         sunset_ts = d['sys']['sunset']
+        _weather_daylight = (datetime.fromtimestamp(sunrise_ts, tz=budapest_tz),
+                             datetime.fromtimestamp(sunset_ts, tz=budapest_tz))
 
         sunrise_dt = datetime.fromtimestamp(sunrise_ts, tz=budapest_tz) - timedelta(minutes=10)
         sunset_dt = datetime.fromtimestamp(sunset_ts, tz=budapest_tz) - timedelta(minutes=90)
@@ -2623,12 +2627,13 @@ def _extract_power_sample(data: Dict[str, Any], now: datetime) -> Optional[Power
         return None
 
 
-def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[str, Any]) -> None:
+def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[str, Any], poll_interval_seconds=300) -> None:
     global _latest_power_sample, _last_force_shutdown_at
     _latest_power_sample = _extract_power_sample(data, now)
     with gpio_lock:
         with power_guard_lock:
-            shutdown = _power_guard.observe(_latest_power_sample, now, expected_state)
+            shutdown = _power_guard.observe(_latest_power_sample, now, expected_state,
+                                           poll_interval_seconds=poll_interval_seconds)
             reason = _power_guard.reason
             if _latest_power_sample is None and isinstance(data, dict):
                 timestamps = [k for k in ("collectionTime", "dataTime", "timestamp") if data.get(k) is not None]
@@ -2652,13 +2657,31 @@ def _update_pool_hashrate(now: datetime) -> None:
         _shared_snapshot.update({"hashrate_hs": hs, "hashrate_mhs": hs / 1e6 if hs is not None else None})
 
 
-def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum):
-    """Poll live PV and load every idle cycle, including all night.
+def _solarman_poll_slot(now, sunrise_dt, sunset_dt):
+    """One Solarman attempt per 5-minute daylight / 30-minute night slot.
 
-    This deliberately has no sunset cutoff: it covers at least the requested
-    30 minutes after sunset and cannot stop supervision after a failed OLED.
-    Monitoring never authorizes a new production start outside its window.
+    Use astronomical sunrise/sunset, independently of the earlier production
+    stop and pre-dawn control offsets. If weather is unavailable, use the
+    existing supplied bounds rather than guessing a daylight window.
     """
+    dawn, dusk = _weather_daylight or (sunrise_dt, sunset_dt)
+    daylight = isinstance(dawn, datetime) and isinstance(dusk, datetime) and dawn <= now < dusk
+    interval = 300 if daylight else 1800
+    return interval, int(now.timestamp()) // interval
+
+
+def _solarman_poll_due(now, slot, last_slot, last_attempt):
+    if slot == last_slot:
+        return False
+    # Nightfall or a half-hour wall-clock boundary must not cause two night
+    # requests only five minutes apart. Count time since the last attempt.
+    if slot[0] == 1800 and last_attempt is not None:
+        return int(now.timestamp()) - int(last_attempt.timestamp()) >= 1800
+    return True
+
+
+def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum, poll_interval_seconds=300):
+    """Process one scheduled live read; never reuse cached data for GPIO."""
     global used_quote
     data = {}
     try:
@@ -2669,7 +2692,7 @@ def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum):
             data = fetch_current_data(token) or {}
     except Exception as err:
         print(f"[Safety monitoring] Solarman read unavailable: {type(err).__name__}")
-    supervise_runtime_by_power(now, "stop", data)
+    supervise_runtime_by_power(now, "stop", data, poll_interval_seconds=poll_interval_seconds)
     dl = data.get("dataList", []) if isinstance(data, dict) else []
     dl = [item for item in dl if isinstance(item, dict)] if isinstance(dl, list) else []
     readings = {
@@ -2683,7 +2706,9 @@ def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum):
     with snapshot_lock:
         _shared_snapshot.update(readings)
         _shared_snapshot.update({"state": "stop", "garage_temp": garage_temp,
-                                 "garage_hum": garage_hum, "monitoring_mode": "idle_safety"})
+                                 "garage_hum": garage_hum, "monitoring_mode": "idle_safety",
+                                 "solarman_polled_at": now.isoformat(),
+                                 "solarman_poll_interval_seconds": poll_interval_seconds})
     if is_rpi:
         write_to_display("monitor", readings["battery"], readings["power"], garage_temp, garage_hum)
     return data
@@ -3402,6 +3427,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "hashrate_text": _format_hashrate(snap.get("hashrate_hs")),
         "power_guard_reason": _power_guard.reason,
         "monitoring_mode": snap.get("monitoring_mode", "production_window"),
+        "solarman_polled_at": snap.get("solarman_polled_at"),
+        "solarman_poll_interval_seconds": snap.get("solarman_poll_interval_seconds"),
         "mining_pool": "unMineable",
         "mining_coin": MINING_COIN,
         "mining_algorithm": MINING_ALGORITHM,
@@ -3575,14 +3602,23 @@ def main_loop():
 
     # ThreadPool for concurrent I/O (token, weather, DHT)
     executor = ThreadPoolExecutor(max_workers=4)
+    last_solar_slot = None
+    last_solar_attempt = None
 
     while True:
         now = datetime.now(tz=budapest_tz)
+        solar_slot = _solarman_poll_slot(now, sunrise, sunset)
+        solar_due = _solarman_poll_due(now, solar_slot, last_solar_slot, last_solar_attempt)
+        solar_interval = solar_slot[0]
 
         # Concurrently read DHT and prefetch next weather + token
         fut_dht = executor.submit(read_dht11, prev_garage_temp, prev_garage_hum)
         fut_weather = executor.submit(get_current_weather, WEATHER_API, LOCATION_LAT, LOCATION_LON)
-        fut_token = executor.submit(get_access_token)
+        fut_token = None
+        if solar_due:
+            last_solar_slot = solar_slot
+            last_solar_attempt = now
+            fut_token = executor.submit(get_access_token)
 
         # Use DHT reading immediately for local decisions
         try:
@@ -3644,11 +3680,15 @@ def main_loop():
         print(f"Control window: {within_active} ({control_details.get('reason')})")
 
         _update_pool_hashrate(now)
+        with snapshot_lock:
+            _shared_snapshot.update({"garage_temp": garage_temp, "garage_hum": garage_hum,
+                                     "solarman_poll_interval_seconds": solar_interval})
+        if within_active and not solar_due:
+            print(f"[Solarman] Waiting for next {solar_interval // 60}-minute polling slot.")
+            sleep_until_next_5min(offset_seconds=60)
+            continue
         if within_active:
             try:
-                used_quote += 1
-                save_quote_usage(used_quote)
-
                 print("\n\nStarting new cycle...")
                 print(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
@@ -3667,7 +3707,11 @@ def main_loop():
                      f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
                 # Fetch device data (depends on token)
-                raw_data = fetch_current_data(token) if token else {}
+                raw_data = {}
+                if token:
+                    used_quote += 1
+                    save_quote_usage(used_quote)
+                    raw_data = fetch_current_data(token)
                 data, used_previous_payload = _with_daytime_data_fallback(raw_data or {}, now, sunrise, sunset)
                 store_data(data)  # attaches phasePowers
 
@@ -3677,7 +3721,7 @@ def main_loop():
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
                 # Cached daytime fallbacks may be displayed, never used for GPIO.
-                supervise_runtime_by_power(now, state or "unknown", raw_data or {})
+                supervise_runtime_by_power(now, state or "unknown", raw_data or {}, poll_interval_seconds=solar_interval)
 
                 has_usable_solarman_data = _has_solarman_payload(data)
                 if not has_usable_solarman_data:
@@ -3691,6 +3735,8 @@ def main_loop():
                 with snapshot_lock:
                     _shared_snapshot.update({
                         "monitoring_mode": "production_window",
+                        "solarman_polled_at": now.isoformat(),
+                        "solarman_poll_interval_seconds": solar_interval,
                         "battery": battery or 0,
                         "power": power or 0,
                         "state": state or "unknown",
@@ -3727,7 +3773,7 @@ def main_loop():
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
-            print(f"[Safety monitoring] Outside production window: PV/load polling continues every 5 minutes, at least 30 minutes after sunset and throughout the night. (Sunset stop: {sunset.strftime('%H:%M')})")
+            print(f"[Safety monitoring] Outside production window: Solarman every {solar_interval // 60} minutes. (Sunset stop: {sunset.strftime('%H:%M')})")
             print(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
             (current_condition, sunrise, sunset, clouds,
@@ -3739,7 +3785,8 @@ def main_loop():
                 prev_state = state
                 uptime = now
                 save_prev_state(prev_state, uptime)
-            _idle_monitor_cycle(now, fut_token, garage_temp, garage_hum)
+            if solar_due:
+                _idle_monitor_cycle(now, fut_token, garage_temp, garage_hum, poll_interval_seconds=solar_interval)
 
             # update snapshot for telegram thread even during idle
             with snapshot_lock:
