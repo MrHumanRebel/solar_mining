@@ -114,6 +114,7 @@ gpio_lock = threading.RLock()
 power_guard_lock = threading.RLock()
 _power_guard = MinerPowerGuard()
 _latest_power_sample = None
+_power_measurement_error = None
 _weather_daylight = None
 snapshot_lock = threading.Lock()
 
@@ -1415,11 +1416,15 @@ def press_power_button(gpio_pin, press_time):
         return False
 
 
-def _extract_power_sample(data: Dict[str, Any], now: datetime) -> Optional[PowerSample]:
-    """Only timestamped live consumption data can authorize a GPIO action."""
+def _parse_power_measurement(data, now):
+    """Return a measurement and a specific rejection reason, without side effects."""
     if not isinstance(data, dict) or data.get("success") is False:
-        return None
-    raw_time = next((data.get(k) for k in ("collectionTime", "dataTime", "timestamp") if data.get(k) is not None), None)
+        return None, "Solarman returned no successful device measurement"
+    time_key = next((k for k in ("collectionTime", "dataTime", "timestamp")
+                     if data.get(k) is not None), None)
+    if time_key is None:
+        return None, "Missing device collection timestamp"
+    raw_time = data[time_key]
     try:
         if isinstance(raw_time, (int, float)) or str(raw_time).replace(".", "", 1).isdigit():
             epoch = float(raw_time)
@@ -1428,65 +1433,100 @@ def _extract_power_sample(data: Dict[str, Any], now: datetime) -> Optional[Power
             at = datetime.fromisoformat(str(raw_time))
             if at.tzinfo is None:
                 at = at.replace(tzinfo=budapest_tz)
-        dl = data.get("dataList", [])
-        if not isinstance(dl, list):
-            return None
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None, f"Invalid device timestamp ({time_key})"
+    items = data.get("dataList")
+    if not isinstance(items, list):
+        return None, "Missing Solarman dataList"
+    fields = {item.get("key"): item for item in items
+              if isinstance(item, dict) and isinstance(item.get("key"), str)}
 
-        def watts(keys, names=()):
-            # Explicit keys take precedence; never reinterpret an energy counter.
-            for key in keys:
-                item = next((i for i in dl if isinstance(i, dict) and i.get("key") == key), None)
-                if item is not None:
-                    break
-            else:
-                item = next((i for i in dl if isinstance(i, dict) and
-                             str(i.get("name", "")).strip().lower() in names), None)
+    def watts(keys):
+        for key in keys:
+            item = fields.get(key)
             if item is None:
-                return None
+                continue
+            if key == "E_Puse_t1" and not item.get("unit"):
+                raise ValueError("E_Puse_t1 requires explicit W or kW units")
             unit = str(item.get("unit") or "W").strip().lower()
             if unit not in {"w", "kw"}:
-                raise ValueError("Power field has non-power units")
-            return float(item["value"]) * (1000 if unit == "kw" else 1)
-
-        total = watts(["LOAD_P_T", "C_P_T", "P_LOAD"],
-                      {"total consumption power", "consumption power", "total load power", "load power"})
-        source = "consumption"
-        if total is None:
-            # This inverter exposes output power instead of a dedicated load
-            # register. Keep the total and all phases in the same meter domain.
-            total = watts(["INV_O_P_T"])
-            phases = [watts([f"INV_O_P_L{i}"]) for i in (1, 2, 3)]
-            source = "inverter_output"
-        else:
-            phases = [watts([f"LOAD_P_L{i}", f"C_P_L{i}", f"INV_O_P_L{i}"]) for i in (1, 2, 3)]
-        if any(v is None for v in [total] + phases):
-            return None
-        if not all(math.isfinite(v) and v >= 0 for v in [total] + phases):
-            return None
-        # Inverter outputs are a usable proxy only when they account for the
-        # measured load. Do not classify unrelated grid-side house loads.
-        if abs(total - sum(phases)) > max(100, total * 0.1):
-            return None
-        return PowerSample(at, total, *phases, source=source)
-    except (ValueError, TypeError, OverflowError, OSError, AttributeError):
+                raise ValueError(f"Non-power unit in {key}: expected W or kW")
+            try:
+                value = float(item["value"]) * (1000 if unit == "kw" else 1)
+            except (TypeError, ValueError, KeyError):
+                raise ValueError(f"Invalid numeric power in {key}")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"Negative or non-finite power in {key}")
+            return value
         return None
+
+    def check_sum(total, phases, label):
+        if abs(total - sum(phases)) > max(100, total * .1):
+            raise ValueError(f"{label} total/phase mismatch: total={total:.1f} W, phases={sum(phases):.1f} W")
+
+    try:
+        total = watts(["LOAD_P_T", "C_P_T", "P_LOAD", "E_Puse_t1"])
+        # E_Puse_t1 is instantaneous power on the supplied Deye schema (W),
+        # despite its name. Energy counters with kWh units remain invalid.
+        if total is None and "INV_O_P_T" not in fields:
+            for item in items:
+                if (isinstance(item, dict) and str(item.get("name", "")).strip().lower()
+                    in {"total consumption power", "consumption power", "total load power", "load power"}
+                    and str(item.get("unit") or "W").strip().lower() in {"w", "kw"}):
+                    total = watts([item.get("key")])
+                    if total is not None:
+                        break
+        if total is not None:
+            # LPP is whole-house phase consumption on this inverter. C_P_L*
+            # measures a different load port; never combine the two families.
+            families = [("LPP_A", "LPP_B", "LPP_C"),
+                        ("LOAD_P_L1", "LOAD_P_L2", "LOAD_P_L3"),
+                        ("C_P_L1", "C_P_L2", "C_P_L3"),
+                        ("INV_O_P_L1", "INV_O_P_L2", "INV_O_P_L3")]
+            family = next((keys for keys in families if any(k in fields for k in keys)), None)
+            if family is None or not all(k in fields for k in family):
+                raise ValueError("Incomplete consumption phases: one complete L1/L2/L3 family required")
+            phases = [watts([key]) for key in family]
+            check_sum(total, phases, "Consumption")
+            source = "consumption:" + family[0].rsplit("_", 1)[0]
+        else:
+            total = watts(["INV_O_P_T"])
+            phases = [watts([f"INV_O_P_L{i}"]) for i in (1,2,3)]
+            if total is None or any(v is None for v in phases):
+                raise ValueError("Incomplete inverter power: INV_O_P_T and L1/L2/L3 required")
+            check_sum(total, phases, "Inverter")
+            source = "inverter_output"
+        return PowerSample(at, total, *phases, source=source), None
+    except ValueError as err:
+        return None, str(err)
+
+
+def _extract_power_sample(data: Dict[str, Any], now: datetime) -> Optional[PowerSample]:
+    return _parse_power_measurement(data, now)[0]
+
+
+def _power_measurement_reason(data, sample, now):
+    if sample is None:
+        return _parse_power_measurement(data, now)[1] or "Missing power measurement"
+    age = (now - sample.at).total_seconds()
+    if age < 0:
+        return f"Device timestamp is {-age:.0f} seconds in the future"
+    if age > 360:
+        return f"Device power measurement is {age:.0f} seconds old (maximum 360 seconds)"
+    return None
 
 
 def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[str, Any], poll_interval_seconds=300) -> None:
-    global _latest_power_sample, _last_force_shutdown_at
+    global _latest_power_sample, _last_force_shutdown_at, _power_measurement_error
     _latest_power_sample = _extract_power_sample(data, now)
+    _power_measurement_error = _power_measurement_reason(data, _latest_power_sample, now)
     with gpio_lock:
         with power_guard_lock:
             shutdown = _power_guard.observe(_latest_power_sample, now, expected_state,
                                            poll_interval_seconds=poll_interval_seconds)
             reason = _power_guard.reason
-            if _latest_power_sample is None and isinstance(data, dict):
-                timestamps = [k for k in ("collectionTime", "dataTime", "timestamp") if data.get(k) is not None]
-                items = data.get("dataList")
-                fields = [str(item.get("key", "")) for item in items if isinstance(item, dict)] if isinstance(items, list) else []
-                power_fields = [key for key in fields if re.search(r'P_|load|consum', key, re.IGNORECASE)]
-                reason += f" | device_time_fields={timestamps}; power_fields={power_fields[:16]}"
-                # Field diagnostics belong in logs, not in the dashboard status.
+            if _power_measurement_error:
+                reason = _power_measurement_error
         print(f"[Power guard] {reason}")
         if shutdown and is_rpi and GPIO_AVAILABLE:
             if press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS):
@@ -1847,7 +1887,7 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
 <div class="panel notice-panel"><div class="notice-head"><div id="notifTitle" class="chart-title"><i class="fa-solid fa-bell"></i> Notifications</div></div><div id="notifList" class="notice-list"></div></div>
 <div class="charts"><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-solar-panel"></i> <span id="powerChartTitle"></span></div><div id="powerChartSub" class="chart-sub"></div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-bolt"></i> <span id="consumptionChartTitle"></span></div><div id="consumptionChartSub" class="chart-sub"></div></div><canvas id="consumptionChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> <span id="batteryChartTitle"></span></div><div id="batteryChartSub" class="chart-sub"></div></div><canvas id="batteryChart"></canvas></div></div></div><script>
 let currentLang=localStorage.getItem('solar-lang')||'en',currentRange={},lastData,charts={};
-const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Power safety',decision:'Decision',minimum:'Projected minimum SOC',end:'Projected ending SOC',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Seasonal coverage',floor:'Protected SOC floor',reserve:'Evening reserve',source:'Provided solarman_json history · live readings are not recorded',load:'Consumption',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Fogyasztási védelem',decision:'Döntés',minimum:'Becsült minimum SOC',end:'Becsült záró SOC',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Szezonális lefedettség',floor:'Védett SOC minimum',reserve:'Esti tartalék',source:'Megadott solarman_json előzmények · élő mérést nem rögzítünk',load:'Fogyasztás',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
+const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Power safety',decision:'Decision',minimum:'Projected minimum SOC',end:'Projected ending SOC',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Seasonal coverage',floor:'Protected SOC floor',reserve:'Evening reserve',source:'Provided solarman_json history · live readings are not recorded',load:'Consumption',measured:'Selected power measurement',collected:'Device collection time',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Fogyasztási védelem',decision:'Döntés',minimum:'Becsült minimum SOC',end:'Becsült záró SOC',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Szezonális lefedettség',floor:'Védett SOC minimum',reserve:'Esti tartalék',source:'Megadott solarman_json előzmények · élő mérést nem rögzítünk',load:'Fogyasztás',measured:'Kiválasztott teljesítménymérés',collected:'Eszköz mérési ideje',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
 const t=k=>words[currentLang][k]||k;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,u='',digits=0)=>v==null||!Number.isFinite(Number(v))?'—':Number(v).toFixed(digits)+u;
@@ -1866,10 +1906,10 @@ function render(d){lastData=d;
  metrics+=`<div class="card"><div class="k">${icon('fa-gauge-high')} ${t('hash')}</div><div class="v">${esc(d.hashrate_text||'N/A')}</div><div class="pool-meta"><a class="pool-link" href="https://unmineable.com/address/${encodeURIComponent(d.wallet_address)}?coin=USDT" target="_blank" rel="noopener noreferrer">unMineable · USDT ${icon('fa-arrow-up-right-from-square')}</a><span class="pool-note">${t('lag')}</span></div></div>`;
  metrics+=card(t('weather'),d.current_condition||t('unknown'),'fa-cloud-sun')+card(t('sunrise'),(d.sunrise||'').slice(11,16)||'—','fa-sun')+card(t('sunset'),(d.sunset||'').slice(11,16)||'—','fa-moon')+card(t('clouds'),num(d.clouds,'%'),'fa-cloud')+card(t('history'),num(d.history_count),'fa-clock-rotate-left');
  document.getElementById('metrics').innerHTML=metrics;
- const hints=d.historical_hints||{},b=hints.energy_budget;
+ const hints=d.historical_hints||{},b=hints.energy_budget,meter=d.power_measurement;
  const budget=b?card(t('minimum'),num(b.minimum_soc,'%'),'fa-battery-quarter','hint-card')+card(t('end'),num(b.end_soc,'%'),'fa-battery-full','hint-card')+card(t('pvwh'),num(b.expected_pv_wh,' Wh'),'fa-solar-panel','hint-card')+card(t('loadwh'),num(b.expected_load_wh,' Wh'),'fa-bolt','hint-card')+card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card'):card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+`<div class="hint-card decision-card">${esc(d.monitoring_mode==='idle_safety'?t('idle'):t('waiting'))}</div>`;
- const phase=[1,2,3].map(i=>card('L'+i,num(d['inv_l'+i],' W'),'fa-bolt','hint-card')).join('')+card(t('inverter'),num(d.inv_lt,' W'),'fa-gauge-high','hint-card')+card(t('temp'),num(d.garage_temp,' °C',1),'fa-temperature-half','hint-card')+card(t('hum'),num(d.garage_hum,'%'),'fa-droplet','hint-card');
- document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${t('plan')}</h3><div class="hints-grid">${budget}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div><div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):d.power_measurement_source==='consumption'?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
+ const phase=[1,2,3].map(i=>card('INV L'+i,num(d['inv_l'+i],' W'),'fa-bolt','hint-card')).join('')+card(t('inverter'),num(d.inv_lt,' W'),'fa-gauge-high','hint-card')+card(t('temp'),num(d.garage_temp,' °C',1),'fa-temperature-half','hint-card')+card(t('hum'),num(d.garage_hum,'%'),'fa-droplet','hint-card');
+ document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${t('plan')}</h3><div class="hints-grid">${budget}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div>${meter?`<div class="hint-sub">${t('measured')}: ${num(meter.total,' W')} · L1 ${num(meter.l1,' W')} / L2 ${num(meter.l2,' W')} / L3 ${num(meter.l3,' W')}</div><div class="hint-sub">${t('collected')}: ${esc(dateText(meter.at))}</div>`:''}<div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):String(d.power_measurement_source||'').startsWith('consumption')?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
  const notices=Array.isArray(d.notifications)?d.notifications:[];
  document.getElementById('notifList').innerHTML=notices.length?notices.slice(0,5).map(n=>`<div class="notice-item ${['info','warn','error','success'].includes(n.level)?n.level:'info'}"><div class="notice-meta">${esc(dateText(n.ts))}</div><div>${esc(n.message)}</div></div>`).join(''):`<div class="notice-empty">${t('empty')}</div>`;
  const h=d.history||[],step=Math.max(1,Math.ceil(h.length/2000)),rows=h.filter((_,i)=>i%step===0);
@@ -1947,8 +1987,15 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "hashrate_hs": snap.get("hashrate_hs"),
         "hashrate_mhs": snap.get("hashrate_mhs"),
         "hashrate_text": _format_hashrate(snap.get("hashrate_hs")),
-        "power_guard_reason": _power_guard.reason,
+        "power_guard_reason": _power_measurement_error or _power_guard.reason,
         "power_measurement_source": _latest_power_sample.source if _latest_power_sample else None,
+        "power_measurement": ({"total": _latest_power_sample.total,
+                               "l1": _latest_power_sample.l1,
+                               "l2": _latest_power_sample.l2,
+                               "l3": _latest_power_sample.l3,
+                               "at": _latest_power_sample.at.isoformat(),
+                               "fresh": MinerPowerGuard.fresh(_latest_power_sample, now)}
+                              if _latest_power_sample else None),
         "monitoring_mode": snap.get("monitoring_mode", "production_window"),
         "solarman_polled_at": snap.get("solarman_polled_at"),
         "solarman_poll_interval_seconds": snap.get("solarman_poll_interval_seconds"),
@@ -2274,8 +2321,8 @@ def main_loop():
 
             pct = (used_quote / QUOTE_LIMIT) * 100 if QUOTE_LIMIT else 0
             print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({pct:.2f}%)")
-            print(f"Garage temperature: {garage_temp}C")
-            print(f"Garage humidity: {garage_hum}%")
+            print("Garage temperature: " + (f"{garage_temp} °C" if garage_temp is not None else "unavailable"))
+            print("Garage humidity: " + (f"{garage_hum}%" if garage_hum is not None else "unavailable"))
 
             # Telegram polling is already running in its own thread.
             sleep_until_next_5min(offset_seconds=60)
@@ -2307,8 +2354,8 @@ def main_loop():
                 })
 
             pct = (used_quote / QUOTE_LIMIT) * 100 if QUOTE_LIMIT else 0
-            print(f"Garage temperature: {garage_temp}C")
-            print(f"Garage humidity: {garage_hum}%")
+            print("Garage temperature: " + (f"{garage_temp} °C" if garage_temp is not None else "unavailable"))
+            print("Garage humidity: " + (f"{garage_hum}%" if garage_hum is not None else "unavailable"))
             print(f"Quote usage: {used_quote} / {QUOTE_LIMIT} ({pct:.2f}%)")
 
             sleep_until_next_5min(offset_seconds=60)

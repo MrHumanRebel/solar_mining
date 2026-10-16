@@ -72,6 +72,10 @@ class MinerPowerGuard:
         if not self.fresh(sample, now):
             self.reason = "Missing or stale consumption measurement"
             return False
+        if self.reason == "Missing or stale consumption measurement":
+            self.reason = ("Miner L2/L3 rise identified" if self.signature is not None else
+                           "Waiting for stable L2/L3 rise after start" if self.started is not None else
+                           "No witnessed miner start")
         if self.last_at is not None and sample.at <= self.last_at:
             return False
         if self.source is not None and self.source != sample.source:

@@ -1,0 +1,19 @@
+{
+  "collectionTime": 1792160400,
+  "success": true,
+  "dataList": [
+    {"key":"INV_O_P_L1","name":"Inverter Output Power L1","value":"23","unit":"W"},
+    {"key":"INV_O_P_L2","name":"Inverter Output Power L2","value":"797","unit":"W"},
+    {"key":"INV_O_P_L3","name":"Inverter Output Power L3","value":"406","unit":"W"},
+    {"key":"INV_O_P_T","name":"Total Inverter Output Power","value":"1226","unit":"W"},
+    {"key":"C_P_L1","name":"Load Power L1","value":"14","unit":"W"},
+    {"key":"C_P_L2","name":"Load Power L2","value":"21","unit":"W"},
+    {"key":"C_P_L3","name":"Load Power L3","value":"15","unit":"W"},
+    {"key":"E_Puse_t1","name":"Total Consumption Power","value":"1241","unit":"W"},
+    {"key":"LPP_A","name":"Load phase power A","value":"25","unit":"W"},
+    {"key":"LPP_B","name":"Load phase power B","value":"808","unit":"W"},
+    {"key":"LPP_C","name":"Load phase power C","value":"408","unit":"W"},
+    {"key":"S_P_T","name":"Total Solar Power","value":"325.00","unit":"W"},
+    {"key":"BMS_SOC","name":"BMS_SOC","value":"97","unit":"%"}
+  ]
+}
