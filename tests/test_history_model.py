@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from history_model import LOCAL, load_exports, plan, build_weekly_profiles
-from simulate_decisions import solar
+from solar_mining.history_model import LOCAL, load_exports, plan, build_weekly_profiles
+from tools.simulate_decisions import solar
 
 
 class HistoryModelTests(unittest.TestCase):

@@ -6,7 +6,7 @@ services:
     container_name: solar_monitor
     hostname: solarminer
     restart: unless-stopped
-    entrypoint: ["/app/wait-for-dns.sh", "python", "solar.py"]
+    entrypoint: ["/app/scripts/wait-for-dns.sh", "python", "solar.py"]
     environment:
       - MY_BOT_TOKEN=${MY_BOT_TOKEN}
       - MY_CHAT_ID=${MY_CHAT_ID}
@@ -40,7 +40,7 @@ services:
     ports:
       - "9000:9000"
     volumes:
-      - ./wait-for-dns.sh:/app/wait-for-dns.sh
+      - ./scripts/wait-for-dns.sh:/app/scripts/wait-for-dns.sh
       - ./state.json:/app/state.json
       - ./quote_usage.json:/app/quote_usage.json
       - ./solarman_json:/app/solarman_json:ro

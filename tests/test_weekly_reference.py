@@ -8,10 +8,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from history_model import LOCAL, _clean_day, build_weekly_profiles, curve_value, load_exports, plan, week_metrics
-from simulate_decisions import solar
-from status_messages import status, phases
-from test_solarman_power_fields import payload, T
+from solar_mining.history_model import LOCAL, _clean_day, build_weekly_profiles, curve_value, load_exports, plan, week_metrics
+from tools.simulate_decisions import solar
+from solar_mining.status_messages import status, phases
+from tests.test_solarman_power_fields import payload, T
 
 
 def row(at,pv=3000,soc=80):

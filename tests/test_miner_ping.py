@@ -2,8 +2,8 @@ from datetime import datetime,timedelta,timezone
 import subprocess
 import unittest
 from unittest.mock import Mock,patch
-from miner_ping_guard import MinerPingGuard,ping_host
-from simulate_decisions import solar
+from solar_mining.miner_ping_guard import MinerPingGuard,ping_host
+from tools.simulate_decisions import solar
 
 T=datetime(2026,10,17,14,0,tzinfo=timezone.utc)
 
@@ -82,15 +82,15 @@ class PingStateTests(unittest.TestCase):
 class ProbeTests(unittest.TestCase):
     def test_linux_ping_return_codes_and_timeouts_are_distinguished(self):
         for code,expected in ((0,True),(1,False),(2,None)):
-            with patch('miner_ping_guard.subprocess.run',return_value=Mock(returncode=code)) as run:
+            with patch('solar_mining.miner_ping_guard.subprocess.run',return_value=Mock(returncode=code)) as run:
                 self.assertIs(ping_host('192.168.0.185'),expected)
                 self.assertEqual(run.call_args.args[0][-1],'192.168.0.185')
                 self.assertNotIn('shell',run.call_args.kwargs)
         for error in (FileNotFoundError(),PermissionError(),subprocess.TimeoutExpired('ping',6)):
-            with patch('miner_ping_guard.subprocess.run',side_effect=error):self.assertIsNone(ping_host('192.168.0.185'))
+            with patch('solar_mining.miner_ping_guard.subprocess.run',side_effect=error):self.assertIsNone(ping_host('192.168.0.185'))
 
     def test_address_is_validated_without_shell_execution(self):
-        with patch('miner_ping_guard.subprocess.run') as run:
+        with patch('solar_mining.miner_ping_guard.subprocess.run') as run:
             with self.assertRaises(ValueError):ping_host('192.168.0.185; false')
             run.assert_not_called()
 

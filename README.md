@@ -3,6 +3,29 @@
 Raspberry Pi controller for a solar-powered mining rig, with a web dashboard,
 OLED/DHT sensors, Telegram controls and unMineable USDT monitoring.
 
+## Repository layout
+
+```text
+solar_mining/        Application package: controller, planning, ping and messages
+assets/             Dashboard logo and favicon files
+scripts/            Container startup helpers
+tools/              Offline replay and Solarman download utilities
+tests/              Tests, shared helpers and fixtures
+docs/               Additional usage commands
+solarman_json/      Original read-only historical exports (unchanged)
+solar.py            Compatible application launcher
+```
+
+Run deployment commands from the repository root. `docker-compose.yml`,
+`dockerfile` and `requirements.txt` stay here so existing Compose commands keep
+working. `python solar.py` remains supported; `python -m solar_mining` is also
+available. Container paths for historical exports, state and quota files stay
+unchanged. Dashboard asset URLs also stay unchanged.
+
+Download utilities are run from the repository root with
+`python -m tools.solarman_copyasfetch_tojson` (see
+[download commands](docs/data_download_command.txt)).
+
 ## Historical data and decisions
 
 `solarman_json/*.json` is the **only historical measurement source**. Use the
@@ -285,9 +308,9 @@ skipped off the Pi. The tests use simulation defaults and mock external services
 do not launch the live main loop with production credentials for a replay.
 
 ```sh
-python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference test_physical_bridge test_near_full_buffer test_miner_ping
-python simulate_decisions.py --history-dir solarman_json
-python simulate_decisions.py --history-dir solarman_json --date 2026-10-16
+python -m unittest -q tests.test_history_model tests.test_solar_polling tests.test_idle_monitoring tests.test_mining_pool tests.test_solarman_power_fields tests.test_bridge_planning tests.test_web_disconnect tests.test_weekly_reference tests.test_physical_bridge tests.test_near_full_buffer tests.test_miner_ping
+python -m tools.simulate_decisions --history-dir solarman_json
+python -m tools.simulate_decisions --history-dir solarman_json --date 2026-10-16
 ```
 
 The replay trains only on exports strictly before the selected local day and

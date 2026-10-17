@@ -2,11 +2,11 @@
 from datetime import datetime, timedelta
 import unittest
 from unittest.mock import patch
-from history_model import LOCAL, plan
-from simulate_decisions import solar
-from power_measurement import PowerSample
-from power_test_helpers import sample
-from status_messages import status
+from solar_mining.history_model import LOCAL, plan
+from tools.simulate_decisions import solar
+from solar_mining.power_measurement import PowerSample
+from tests.power_test_helpers import sample
+from solar_mining.status_messages import status
 
 
 class NearFullBufferTests(unittest.TestCase):
