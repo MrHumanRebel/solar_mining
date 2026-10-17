@@ -153,15 +153,47 @@ Missing or stale API data never substitutes a saved JSON measurement.
 
 Pool hashrate is display-only. The separate power guard uses fresh total
 consumption and L2/L3 readings, a stable off baseline, and a witnessed load rise
-after the controller's own start command. It supports either mapping of three
+after the controller's own start command. A first start can use a fresh
+pre-command anchor plus two stable post-start paired rises, without needing
+three earlier off polls. Any already observed unstable baseline still rejects
+identification; a restart or household load alone never proves the miner is on. It supports either mapping of three
 RTX3070 GPUs on one phase and two GPUs plus CPU on the other.
 
-When STOP is required, one matching fresh reading above 1000 W total may authorize
-a long press. No three-reading STOP delay is required. A lost phase signature,
-ambiguous load, missing baseline or restart prevents automatic long presses;
-there is at most one automatic shutdown press per witnessed run. Aggregate
-meters cannot uniquely distinguish every oven/hob combination from a miner.
-The guard retains only bounded working samples in memory, never a JSON history.
+STOP is always a **long power-button press**: at least 10 seconds (default 10).
+The start pulse is separate, limited to 0.1–1.0 seconds (default 0.55). GUI,
+Telegram, force-stop and automatic safety paths use the same long STOP primitive.
+GPIO releases the line and cleans up even when an operation raises an error.
+
+A logical STOP request is not physical proof. One fresh, matching learned L2/L3
+sample above 1000 W total authorizes the first long press. The guard **retains**
+its identity and waits for a device measurement collected *after* the press
+finished. Cached/repeated/pre-command samples cannot confirm anything. Both
+identified phase contributions disappearing confirms that the mining load is
+absent; a single missing phase is ambiguous and disables automatic retries.
+
+If the same identified paired load persists, the next fresh post-command sample
+may authorize **one additional long press**, after at least two minutes. There
+are at most two attempts per owned run. A still-present load after attempt two,
+GPIO failure, ambiguous load or lost identity is reported as unconfirmed/failed,
+with a Telegram/dashboard warning; no endless button loop is allowed. The >1000 W
+threshold, meter-source checks, freshness/gap limits and witnessed-start checks
+remain required for automatic retries. L1 is not a miner phase: an L1-only
+household load change does not veto stopping an already identified L2/L3 miner.
+L2/L3 appliance changes that obscure the signature continue to withhold presses.
+Once the paired load disappears, later cooking loads cannot re-arm that run.
+
+The dashboard State shows physical evidence (`running detected`, `shutdown
+pending`, `shutdown unconfirmed`, `mining load absent`, or `unknown`), while the
+requested control state is separate. API `runtime` and Telegram expose attempts,
+last command time and confirmation time. Unknown/restarted identity never
+becomes “stopped” merely because the planner requested STOP. Automatic starts
+are withheld while a prior shutdown is pending/unconfirmed, and an already
+identified running rig does not receive another start pulse. Planning continues
+to account for a known still-running rig even if the requested state is STOP.
+
+The guard retains only bounded working evidence in RAM, never a JSON history.
+Aggregate meters cannot uniquely distinguish every oven/hob combination from a
+miner, so missing identity requires manual inspection rather than blind presses.
 
 On the supplied Deye schema, `E_Puse_t1` with explicit W/kW units is total
 instantaneous consumption. Pair it with `LPP_A/B/C` (whole-house phases), not
@@ -263,7 +295,7 @@ skipped off the Pi. The tests use simulation defaults and mock external services
 do not launch the live main loop with production credentials for a replay.
 
 ```sh
-python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference test_physical_bridge test_near_full_buffer
+python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference test_physical_bridge test_near_full_buffer test_shutdown_verification
 python simulate_decisions.py --history-dir solarman_json
 python simulate_decisions.py --history-dir solarman_json --date 2026-10-16
 ```

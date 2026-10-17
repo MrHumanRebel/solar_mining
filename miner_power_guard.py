@@ -20,10 +20,11 @@ class MinerPowerGuard:
 
     Aggregate house meters cannot uniquely identify an appliance. Ambiguous
     changes, old samples, missing baselines and process restarts fail closed.
-    One run permits at most one automatic long press, never a retry loop.
+    A STOP keeps its identity until verified; at most two long-press attempts.
     """
     # Five-minute device uploads + the controller's one-minute offset + jitter.
     MAX_SAMPLE_AGE_SECONDS = 420
+    MAX_SHUTDOWN_ATTEMPTS = 2
 
     def __init__(self):
         self.off = deque(maxlen=3)
@@ -36,19 +37,31 @@ class MinerPowerGuard:
         self.poll_interval_seconds = 300
         self.learning_timeout_seconds = 900
         self.reason = "No witnessed miner start"
+        self.runtime_state = 'unknown'
+        self.shutdown_attempts = 0
+        self.shutdown_after = None
+        self.shutdown_reserved = False
+        self.confirmed_off_at = None
+        self.off_reference = None
 
     def disarm(self, reason):
         self.started = self.baseline = self.signature = None
         self.candidates.clear()
         self.learning_timeout_seconds = 900
         self.reason = reason
+        self.runtime_state = 'stop_failed' if self.shutdown_after else 'unknown'
 
     @staticmethod
     def fresh(sample, now):
         return sample is not None and 0 <= (now - sample.at).total_seconds() <= MinerPowerGuard.MAX_SAMPLE_AGE_SECONDS
 
     def command_start(self, sample, now):
-        self.disarm("Start has no stable off baseline")
+        self.shutdown_after = None
+        self.shutdown_attempts = 0
+        self.shutdown_reserved = False
+        self.confirmed_off_at = None
+        self.off_reference = None
+        self.disarm("Start has no fresh pre-command baseline")
         if not self.fresh(sample, now):
             return
         if any(s.source != sample.source for s in self.off):
@@ -58,7 +71,7 @@ class MinerPowerGuard:
             self.off.append(sample)
         slack = 120 if self.poll_interval_seconds == 300 else 360
         baseline_span = max(900, 2 * self.poll_interval_seconds + slack)
-        if len(self.off) != 3 or (sample.at - self.off[0].at).total_seconds() > baseline_span:
+        if (sample.at - self.off[0].at).total_seconds() > baseline_span:
             return
         if any(max(getattr(s, k) for s in self.off) - min(getattr(s, k) for s in self.off) > 80
                for k in ("l1", "l2", "l3")):
@@ -68,79 +81,134 @@ class MinerPowerGuard:
         self.learning_timeout_seconds = baseline_span
         self.off.clear()
         self.reason = "Waiting for stable L2/L3 rise after start"
+        self.runtime_state = 'starting'
+
+    def command_stop_finished(self, now, success=True):
+        """Record completion, not proof of shutdown; keep learned identity."""
+        if not self.shutdown_reserved:
+            self.shutdown_attempts += 1  # Explicit manual STOP also counts.
+        self.shutdown_reserved = False
+        self.shutdown_after = now
+        self.confirmed_off_at = None
+        self.runtime_state = 'stop_pending' if success else 'stop_failed'
+        self.reason = (f"Long press sent ({self.shutdown_attempts}/{self.MAX_SHUTDOWN_ATTEMPTS}); waiting for newer device measurement"
+                       if success else 'Long-press GPIO failed; shutdown not confirmed')
+
+    def status(self, now):
+        runtime = self.runtime_state
+        if not self.fresh_at(now):
+            runtime = 'stop_unverified' if self.shutdown_after else 'unknown'
+        return {'state':runtime,'attempts':self.shutdown_attempts,
+                'max_attempts':self.MAX_SHUTDOWN_ATTEMPTS,
+                'last_command_at':self.shutdown_after.isoformat() if self.shutdown_after else None,
+                'confirmed_off_at':self.confirmed_off_at.isoformat() if self.confirmed_off_at else None,
+                'reason':self.reason}
+
+    def fresh_at(self, now):
+        return self.last_at is not None and 0 <= (now-self.last_at).total_seconds() <= self.MAX_SAMPLE_AGE_SECONDS
 
     def observe(self, sample, now, expected_state, poll_interval_seconds=300):
-        """Return True only for a newly confirmed automatic shutdown."""
+        """Authorize a long press only from a fresh, owned two-phase signature."""
         self.poll_interval_seconds = max(300, poll_interval_seconds)
         if not self.fresh(sample, now):
-            self.reason = "Missing or stale consumption measurement"
+            self.reason = 'Missing or stale consumption measurement'
             return False
-        if self.reason == "Missing or stale consumption measurement":
-            self.reason = ("Miner L2/L3 rise identified" if self.signature is not None else
-                           "Waiting for stable L2/L3 rise after start" if self.started is not None else
-                           "No witnessed miner start")
+        if self.reason == 'Missing or stale consumption measurement':
+            self.reason = ('Waiting for post-STOP measurement' if self.shutdown_after else
+                           'Miner L2/L3 rise identified' if self.signature is not None else
+                           'Waiting for stable L2/L3 rise after start' if self.started is not None else
+                           'No witnessed miner start')
         if self.last_at is not None and sample.at <= self.last_at:
             return False
         if self.source is not None and self.source != sample.source:
-            self.disarm("Power meter source changed; start identification lost")
+            self.disarm('Power meter source changed; start identification lost')
             self.off.clear()
         self.source = sample.source
         slack = 120 if self.poll_interval_seconds == 300 else 360
-        # One unchanged/cached device upload may create a ten-minute device
-        # timestamp gap while HTTP polls still run every five minutes.
         allowed_gap = 720 if self.poll_interval_seconds == 300 else self.poll_interval_seconds + slack
-        if self.last_at and (sample.at - self.last_at).total_seconds() > allowed_gap:
-            self.disarm("Measurement gap; start identification lost")
+        if self.last_at and (sample.at-self.last_at).total_seconds() > allowed_gap:
+            self.disarm('Measurement gap; start identification lost')
             self.off.clear()
         self.last_at = sample.at
         if self.started is None:
-            if expected_state == "stop":
+            if self.runtime_state=='off' and self.off_reference and any(
+                    value-base>150 for value,base in zip((sample.l2,sample.l3),self.off_reference)):
+                self.runtime_state='unknown'
+                self.reason='Load changed after off confirmation; no new owned start, automatic presses withheld'
+            if expected_state == 'stop':
                 self.off.append(sample)
             return False
-        if now - self.started > timedelta(hours=12):
-            self.disarm("Start identification expired")
+        if now-self.started > timedelta(hours=12):
+            self.disarm('Start identification expired')
             return False
-        delta = tuple(getattr(sample, k) - b for k, b in zip(("l1", "l2", "l3"), self.baseline))
+        delta = tuple(getattr(sample,k)-b for k,b in zip(('l1','l2','l3'),self.baseline))
         if self.signature is None:
-            self.learning_timeout_seconds = max(self.learning_timeout_seconds, 2*self.poll_interval_seconds + slack)
-            if (now - self.started).total_seconds() > self.learning_timeout_seconds:
-                self.disarm("No identifiable two-phase mining load after start")
+            self.learning_timeout_seconds = max(self.learning_timeout_seconds,2*self.poll_interval_seconds+slack)
+            if (now-self.started).total_seconds() > self.learning_timeout_seconds:
+                self.disarm('No identifiable two-phase mining load after start')
                 return False
-            # OC samples report ~546–548 W for all five GPUs (~98–125 W each).
-            # The existing split bounds include ~350–380 W AC per phase for
-            # 3 GPUs versus 2 GPUs + Ryzen/board/fans, with PSU losses.
-            # Retain headroom for variation; learn the actual per-run rise.
-            # Either L2/L3 assignment is accepted; only a bounded paired rise
-            # after our start can arm the guard (not a sustained oven load).
-            valid_split = ((250 <= delta[1] <= 550 and 200 <= delta[2] <= 650)
-                           or (250 <= delta[2] <= 550 and 200 <= delta[1] <= 650))
-            if expected_state != "production" or sample.at <= self.started or abs(delta[0]) > 100 or not valid_split or not 500 <= sum(delta[1:]) <= 1000:
+            # Either 3-GPU / 2-GPU+host assignment. An own start and stable
+            # paired rise are essential; a single oven-phase increase cannot arm.
+            valid_split = ((250<=delta[1]<=550 and 200<=delta[2]<=650)
+                           or (250<=delta[2]<=550 and 200<=delta[1]<=650))
+            if sample.at<=self.started or abs(delta[0])>100 or not valid_split or not 500<=sum(delta[1:])<=1000:
                 self.candidates.clear()
                 return False
-            if self.candidates and (sample.at - self.candidates[-1][0]).total_seconds() < 120:
+            if self.candidates and (sample.at-self.candidates[-1][0]).total_seconds()<120:
                 return False
-            self.candidates.append((sample.at, delta[1:]))
-            if len(self.candidates) == 2:
-                if all(abs(self.candidates[0][1][i] - delta[i+1]) <= 80 for i in (0, 1)):
-                    self.signature = tuple(median(c[1][i] for c in self.candidates) for i in (0, 1))
-                    self.reason = "Miner L2/L3 rise identified"
+            self.candidates.append((sample.at,delta[1:]))
+            if len(self.candidates)!=2 or not all(abs(self.candidates[0][1][i]-delta[i+1])<=80 for i in (0,1)):
+                return False
+            self.signature = tuple(median(c[1][i] for c in self.candidates) for i in (0,1))
+            self.runtime_state = 'running'
+            self.reason = 'Miner L2/L3 rise identified'
+        # A cached pre-command measurement cannot confirm success or failure.
+        if self.shutdown_after and sample.at<=self.shutdown_after:
+            self.reason = 'Waiting for device measurement collected after long press'
             return False
-        # Once either phase contribution disappears, later cooking loads must
-        # never re-arm this run, even when household consumption exceeds 1 kW.
-        if any(delta[i+1] < self.signature[i] * 0.4 for i in (0, 1)):
-            self.disarm("Miner load disappeared; no more automatic presses this run")
+        absent = all(delta[i+1]<=max(80,self.signature[i]*.25) for i in (0,1))
+        if absent:
+            was_pending = self.shutdown_after is not None
+            self.disarm('Shutdown confirmed: identified L2/L3 mining load disappeared' if was_pending else
+                        'Miner load disappeared; no more automatic presses this run')
             self.off.clear()
             self.off.append(sample)
+            self.runtime_state = 'off'
+            self.confirmed_off_at = sample.at
+            self.off_reference = (sample.l2,sample.l3)
             return False
-        if expected_state != "stop":
+        if any(delta[i+1]<self.signature[i]*.4 for i in (0,1)):
+            self.disarm('One mining phase disappeared; shutdown unverified, retries disabled')
+            self.off.clear()
             return False
-        matches = (abs(delta[0]) <= 100 and all(
-            abs(delta[i+1] - self.signature[i]) <= max(80, self.signature[i] * 0.2)
-            for i in (0, 1)))
-        if sample.total <= 1000 or not matches:
-            self.reason = "No unambiguous mining load above 1000 W total"
+        # L1 is household-only. A new L1 appliance must not veto stopping an
+        # already identified, still-matching L2/L3 miner; learning still checks L1.
+        matches = all(abs(delta[i+1]-self.signature[i])<=max(80,self.signature[i]*.2) for i in (0,1))
+        if expected_state!='stop':
+            if not self.shutdown_after:
+                self.runtime_state = 'running'
             return False
-        # Identification was learned while the rig ran. One newly collected
-        # matching STOP sample is enough; do not wait for more polling cycles.
-        self.disarm("Automatic shutdown issued; re-press disabled for this run")
+        if self.shutdown_after:
+            if not matches:
+                self.runtime_state = 'stop_failed'
+                self.reason = 'Post-STOP phase load ambiguous; automatic retry withheld'
+                return False
+            self.runtime_state = 'stop_failed'
+            self.reason = 'STOP failed: fresh identified mining load still present'
+            if self.shutdown_attempts>=self.MAX_SHUTDOWN_ATTEMPTS:
+                self.reason += '; retry limit reached, manual inspection required'
+                return False
+        if sample.total<=1000 or not matches:
+            self.reason = ('STOP failed: mining load persists, but >1000 W retry condition not met'
+                           if self.shutdown_after else 'No unambiguous mining load above 1000 W total')
+            return False
+        if self.shutdown_after and (now-self.shutdown_after).total_seconds()<120:
+            self.reason = 'Waiting for long-press retry cooldown'
+            return False
+        # Reserve one attempt before GPIO; no endless retries if the actuator fails.
+        self.shutdown_attempts += 1
+        self.shutdown_after = now
+        self.shutdown_reserved = True
+        self.runtime_state = 'stop_pending'
+        self.reason = f'Long-press STOP authorized ({self.shutdown_attempts}/{self.MAX_SHUTDOWN_ATTEMPTS}); awaiting verification'
         return True

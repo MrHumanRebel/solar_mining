@@ -68,7 +68,7 @@ class SolarPollingTests(unittest.TestCase):
         for minute in (150,180,210):
             at=SUNSET+timedelta(minutes=minute)
             results.append(guard.observe(PowerSample(at,1200,100,550,550),at,'stop',poll_interval_seconds=1800))
-        self.assertEqual(results,[True,False,False])
+        self.assertEqual(results,[True,True,False])
 
     def test_half_hour_cadence_does_not_make_half_hour_old_samples_fresh(self):
         guard=MinerPowerGuard()

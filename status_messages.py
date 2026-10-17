@@ -39,8 +39,13 @@ def status(snapshot,now,quote_used=None,quote_limit=None):
     metrics=week.get('metrics') or {}
     cutoff=snapshot.get('afternoon_cutoff') or {}
     buffered=budget.get('projection_mode')=='surplus_buffer_run'
+    physical=(snapshot.get('runtime') or {}).get('state','unknown')
+    physical_label={'unknown':'ismeretlen','starting':'indítás ellenőrzésre vár','running':'futás észlelve',
+                    'stop_pending':'leállítás ellenőrzésre vár','stop_failed':'leállítás nincs igazolva',
+                    'stop_unverified':'leállítás nem ellenőrizhető','off':'minerterhelés eltűnt'}.get(physical,physical)
     lines=[f"☀ Solar Mining · {stamp(now)}",
-           f"Állapot: {snapshot.get('state','ismeretlen')} · PV: {number(snapshot.get('power'),' W')} · Akku: {number(snapshot.get('battery'),'%')}",
+           f"Kívánt állapot: {snapshot.get('state','ismeretlen')} · PV: {number(snapshot.get('power'),' W')} · Akku: {number(snapshot.get('battery'),'%')}",
+           f"Fizikai állapot: {physical_label} · STOP kísérletek: {(snapshot.get('runtime') or {}).get('attempts',0)}/2",
            f"Időjárás: {snapshot.get('current_condition','—')}",
            f"Teljes miner tervezési fogyasztása: {number(snapshot.get('miner_power_w'),' W')} (becslés, nem konnektoros mérés)",
            f"Pool hashráta: {snapshot.get('hashrate_text') or '—'} (késhet; csak kijelzés)",
