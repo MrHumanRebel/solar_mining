@@ -107,6 +107,42 @@ inputs are unavailable rather than artificial zeros. A zero can still mean an
 unsafe candidate would actually exhaust the battery. STOP reasons identify the
 failed bridge, solar cover, missing coverage or night-reserve condition.
 
+### Zero export and near-full batteries
+
+This installation cannot export to the grid. Once the battery is full, measured
+PV can fall to match current consumption; it is **delivered power**, not a
+measurement of all available panel potential. Neither low PV at full SOC nor
+low historical PV during curtailment proves that the miner cannot be supplied.
+The controller does not invent an extra kW figure for that unmeasured potential.
+
+If the full-day model rejects a run, a sunny afternoon with a near-full battery
+can instead qualify for a **bounded surplus run**. New starts require at least
+95% SOC (and sufficient energy); running miners can continue using only the
+energy above the evening reserve, at least 90%. This start/continue band avoids
+restarting at the reserve. The proposed window is at least the required minimum
+run, at most 30 minutes, inside the existing production window. Directly
+forecast adverse weather inside that window blocks it. Each scheduled live poll
+re-evaluates the plan; no additional Solarman requests are made.
+
+The energy test assumes **zero PV for the entire short window**, paying startup
+plus household and miner load, discharge losses and the existing 25% margin
+solely from Wh already above the 90% reserve. Thus it can cautiously start even
+when the zero-export meter shows little/no PV, then see whether actual PV rises
+with the new load. Insufficient battery capacity, high household load, stale or
+invalid data, poor current weather and insufficient production time still block
+this mode. It does not bypass phase limits, shutdown cooldown or the physical
+power guard. The separate >1000 W total/identified-phase rule still determines
+whether an automatic STOP decision may press the power button.
+
+GUI and Telegram label this as a bounded surplus run, showing the zero-PV
+worst-case SOC **at the planned mining stop**, required/available surplus Wh and
+the scheduled stop. The raw delivered-PV sunset scenario remains in the API
+with `sunset_projection_uncertain: true`; GUI/Telegram show the sunset and
+household-only SOC as not estimable from curtailed PV, rather than presenting
+an artificial low SOC as a reliable forecast. This mode does not claim a guaranteed 90% sunset
+or a measured amount of extra solar potential. The normal bridge/refill model
+continues to apply when feasible, including for low-SOC early starts.
+
 The energy model includes battery capacity from Ah × V, battery saturation,
 startup cost and charge/discharge losses. It remains an estimate: future clouds
 and household demand can differ. It is recalculated at each live sample, while
@@ -139,6 +175,14 @@ consumption of grid-side appliances. Changes in source or phase family discard
 the learned identity. kWh/VA counters are rejected. The dashboard shows the
 selected safety meter and device collection time separately from HTTP polling
 time, with specific missing-field, timestamp, unit or total/phase errors.
+
+All control, display and guard freshness checks use a shared **420-second**
+maximum device age: five-minute Solarman uploads plus the controller's one-minute
+offset and request jitter. Future timestamps and older data remain rejected;
+duplicate device timestamps cannot confirm a new hardware action. One cached
+upload may produce a ten-minute device timestamp gap, so daylight identity is
+retained for gaps up to 12 minutes. Longer gaps, changed sources and lost phase
+signatures still disarm it. Overnight gap tolerance remains cadence + six minutes.
 
 Solarman authentication and device polling run every five minutes between
 astronomical sunrise and sunset, and once every 30 minutes overnight. Failed
@@ -219,7 +263,7 @@ skipped off the Pi. The tests use simulation defaults and mock external services
 do not launch the live main loop with production credentials for a replay.
 
 ```sh
-python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference test_physical_bridge
+python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference test_physical_bridge test_near_full_buffer
 python simulate_decisions.py --history-dir solarman_json
 python simulate_decisions.py --history-dir solarman_json --date 2026-10-16
 ```

@@ -22,6 +22,9 @@ class MinerPowerGuard:
     changes, old samples, missing baselines and process restarts fail closed.
     One run permits at most one automatic long press, never a retry loop.
     """
+    # Five-minute device uploads + the controller's one-minute offset + jitter.
+    MAX_SAMPLE_AGE_SECONDS = 420
+
     def __init__(self):
         self.off = deque(maxlen=3)
         self.last_at = None
@@ -42,7 +45,7 @@ class MinerPowerGuard:
 
     @staticmethod
     def fresh(sample, now):
-        return sample is not None and 0 <= (now - sample.at).total_seconds() <= 360
+        return sample is not None and 0 <= (now - sample.at).total_seconds() <= MinerPowerGuard.MAX_SAMPLE_AGE_SECONDS
 
     def command_start(self, sample, now):
         self.disarm("Start has no stable off baseline")
@@ -83,7 +86,10 @@ class MinerPowerGuard:
             self.off.clear()
         self.source = sample.source
         slack = 120 if self.poll_interval_seconds == 300 else 360
-        if self.last_at and (sample.at - self.last_at).total_seconds() > self.poll_interval_seconds + slack:
+        # One unchanged/cached device upload may create a ten-minute device
+        # timestamp gap while HTTP polls still run every five minutes.
+        allowed_gap = 720 if self.poll_interval_seconds == 300 else self.poll_interval_seconds + slack
+        if self.last_at and (sample.at - self.last_at).total_seconds() > allowed_gap:
             self.disarm("Measurement gap; start identification lost")
             self.off.clear()
         self.last_at = sample.at
