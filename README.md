@@ -229,8 +229,10 @@ Solarman planning/display freshness remains 420 seconds, matching five-minute
 uploads plus the controller offset and request jitter. Stale/future readings are
 unavailable for energy planning; they do not stop the independent ping monitor.
 
-Solarman authentication and device polling run every five minutes between
-astronomical sunrise and sunset, and once every 30 minutes overnight. Failed
+Solarman authentication and device polling run every five minutes inside the
+configured sunrise-start / sunset-stop window shown by the dashboard and logs,
+and once every 30 minutes outside it. These bounds include the existing control
+offsets; the later astronomical sunset does not extend five-minute polling. Failed
 attempts also consume a polling slot. Dashboard refresh, sensors and pool
 updates do not trigger extra Solarman polling.
 
