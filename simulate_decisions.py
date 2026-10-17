@@ -26,7 +26,8 @@ def replay(history_dir, day=None):
     day=day or exports['rows'][-1]['ts'][:10]
     cutoff=datetime.fromisoformat(day).replace(tzinfo=LOCAL)
     solar.historical_profile=solar.build_historical_profile(str(history_dir),before=cutoff)
-    rows=[r for r in exports['rows'] if datetime.fromisoformat(r['ts']).date()==cutoff.date()]
+    rows=[r for r in exports['rows'] if datetime.fromisoformat(r['ts']).date()==cutoff.date()
+          and all(r.get(k) is not None for k in ('power','battery','consumption'))]
     if not rows:
         raise ValueError('Selected date has no exported measurements')
     state='stop'

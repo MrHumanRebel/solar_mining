@@ -108,7 +108,7 @@ class BridgePlanningTests(unittest.TestCase):
     def test_unaffordable_night_reserve_is_not_hidden_by_clamping_it_to_100_percent(self):
         for h in range(19,24):
             self.profile['hours'][h]['load_p50']=3000
-        result=self.budget(soc=100)
+        result=self.budget(soc=100,load=3000)
         self.assertFalse(result['safe'])
         self.assertGreater(result['reserve_soc'],100)
         self.assertEqual(result['reason'],'overnight_reserve_exceeds_battery_capacity')
@@ -120,7 +120,7 @@ class BridgePlanningTests(unittest.TestCase):
 
     def test_yesterdays_weather_clock_does_not_remove_tonights_reserve(self):
         yesterday=self.now-timedelta(days=1)
-        with patch.object(solar,'historical_profile',{'months':{7:self.profile}}), \
+        with patch.object(solar,'historical_profile',{'weeks':{self.now.isocalendar().week:self.profile}}), \
              patch.object(solar,'_weather_daylight',(yesterday,yesterday.replace(hour=19))):
             hints=solar._history_recommendation(self.now,80,0,self.now,self.now.replace(hour=17,minute=30),
                 {'summary_5d':'solar_friendly'},300,False,55,200,'clear sky',0)
@@ -159,7 +159,7 @@ class HistoryRangeTests(unittest.TestCase):
 
     def test_real_october_profile_does_not_force_zero_soc_on_a_sunny_bridge(self):
         now=datetime(2026,10,17,8,tzinfo=LOCAL)
-        result=plan(self.dataset['months'][10],now,now.replace(hour=18),80,400,400,False,
+        result=plan(self.dataset['weeks'][42],now,now.replace(hour=18),80,400,400,False,
                     10580,1050,26,None,'solar_friendly',120,
                     production_stop=now.replace(hour=16,minute=30),
                     next_sunrise=now.replace(day=18,hour=7),reserve_floor_soc=20)
