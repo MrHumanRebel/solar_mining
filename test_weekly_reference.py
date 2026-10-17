@@ -21,6 +21,7 @@ def row(at,pv=3000,soc=80):
 class WeeklyReferenceTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(solar,'send_telegram_message'))
+        self.enterContext(patch.object(solar,'send_telegram_message_async'))
         self.enterContext(patch.object(solar,'_last_power_notice_key',None))
         self.now=datetime(2026,10,12,10,tzinfo=LOCAL)
 

@@ -13,6 +13,9 @@ SUNSET = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
 
 
 class IdleMonitoringTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(solar,'send_telegram_message_async'))
+
     def test_missing_and_invalid_display_values_are_unknown(self):
         for value in (None, '', '--', 'error', float('nan'), float('inf'), True):
             self.assertIsNone(solar.clean_value(value))

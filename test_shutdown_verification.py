@@ -159,10 +159,12 @@ class ShutdownVerificationTests(unittest.TestCase):
              patch.object(solar,'_latest_power_sample',None),patch.object(solar,'_power_measurement_error',None), \
              patch.object(solar,'_extract_power_sample') as extract, \
              patch.object(solar,'press_power_button',return_value=True) as press, \
-             patch.object(solar,'send_telegram_message') as send:
+             patch.object(solar,'send_telegram_message_async') as send, \
+             patch.object(solar,'send_telegram_message') as sync_send:
             for minute in (25,30,35,40,45,50,55,60,65,70,75):
                 current=sample(minute);extract.return_value=current
                 solar.supervise_runtime_by_power(current.at,'stop',{})
+            sync_send.assert_not_called()
             self.assertEqual(press.call_count,2)
             self.assertTrue(all(c.args==(16,solar.POWER_BUTTON_LONG_PRESS_SECONDS) for c in press.call_args_list))
             self.assertGreaterEqual(solar.POWER_BUTTON_LONG_PRESS_SECONDS,10)
@@ -178,10 +180,12 @@ class ShutdownVerificationTests(unittest.TestCase):
              patch.object(solar,'_latest_power_sample',None),patch.object(solar,'_power_measurement_error',None), \
              patch.object(solar,'_extract_power_sample') as extract, \
              patch.object(solar,'press_power_button',return_value=True) as press, \
-             patch.object(solar,'send_telegram_message') as send:
+             patch.object(solar,'send_telegram_message_async') as send, \
+             patch.object(solar,'send_telegram_message') as sync_send:
             for current in (sample(25),sample(30,400,100,100,200),sample(35,400,100,100,200)):
                 extract.return_value=current
                 solar.supervise_runtime_by_power(current.at,'stop',{})
+            sync_send.assert_not_called()
             press.assert_called_once_with(16,solar.POWER_BUTTON_LONG_PRESS_SECONDS)
             self.assertIn('eltűnt',send.call_args.args[0])
             self.assertEqual(guard.runtime_state,'off')

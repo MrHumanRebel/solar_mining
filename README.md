@@ -175,7 +175,9 @@ If the same identified paired load persists, the next fresh post-command sample
 may authorize **one additional long press**, after at least two minutes. There
 are at most two attempts per owned run. A still-present load after attempt two,
 GPIO failure, ambiguous load or lost identity is reported as unconfirmed/failed,
-with a Telegram/dashboard warning; no endless button loop is allowed. The >1000 W
+with a Telegram/dashboard warning; no endless button loop is allowed. Automatic
+notifications are sent asynchronously, so Telegram retries cannot block GPIO
+supervision or the next Solarman cycle. The >1000 W
 threshold, meter-source checks, freshness/gap limits and witnessed-start checks
 remain required for automatic retries. L1 is not a miner phase: an L1-only
 household load change does not veto stopping an already identified L2/L3 miner.

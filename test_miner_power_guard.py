@@ -30,6 +30,9 @@ def armed_guard(swap=False):
 
 
 class PowerGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(solar,'send_telegram_message_async'))
+
     def test_oc_rig_720w_paired_rise_is_identified_in_both_phase_assignments(self):
         for swap in (False,True):
             with self.subTest(swap=swap):

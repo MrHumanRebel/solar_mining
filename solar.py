@@ -1483,9 +1483,9 @@ def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[st
                        'off':'✅ Az azonosított L2/L3 minerterhelés eltűnt'}[physical['state']]
                 if physical['state']=='stop_pending' and physical['attempts']==2:
                     label='⚠ Az első STOP után a miner terhelése megmaradt; második hosszú STOP elküldve, ellenőrzésre vár'
-                send_telegram_message(f"{label}. Kísérlet: {physical['attempts']}/{physical['max_attempts']}. {physical['reason']}")
+                send_telegram_message_async(f"{label}. Kísérlet: {physical['attempts']}/{physical['max_attempts']}. {physical['reason']}",mirror_web=True)
             elif unknown_stop:
-                send_telegram_message('⚠ STOP kérve, de a fizikai állapot ismeretlen. Nincs azonosított saját indítás: a házfogyasztásból önmagában nem nyomunk gombot. Kézi ellenőrzés szükséges.')
+                send_telegram_message_async('⚠ STOP kérve, de a fizikai állapot ismeretlen. Nincs azonosított saját indítás: a házfogyasztásból önmagában nem nyomunk gombot. Kézi ellenőrzés szükséges.',mirror_web=True)
 
 
 def _update_pool_hashrate(now: datetime) -> None:
@@ -1644,12 +1644,12 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             live=_build_snapshot_payload()
             live.update(state=state,battery=battery_charge,power=current_power,historical_hints=hist,
                         inv_l1=inv_l1,inv_l2=inv_l2,inv_l3=inv_l3,inv_lt=inv_lt)
-            send_telegram_message('▶ Bányagép indítási jel elküldve.\n'+telegram_status(live,now))
+            send_telegram_message_async('▶ Bányagép indítási jel elküldve.\n'+telegram_status(live,now),mirror_web=True)
         elif state == "stop" and prev_state != "stop":
             _last_production_start_at = None
             live=_build_snapshot_payload()
             live.update(state=state,battery=battery_charge,power=current_power,historical_hints=hist)
-            send_telegram_message('⏹ Leállítás kérve; azonosított minerterhelésnél hosszú gombnyomás és fogyasztási visszaellenőrzés következik. A gép még nincs leálltnak igazolva.\n'+telegram_status(live,now))
+            send_telegram_message_async('⏹ Leállítás kérve; azonosított minerterhelésnél hosszú gombnyomás és fogyasztási visszaellenőrzés következik. A gép még nincs leálltnak igazolva.\n'+telegram_status(live,now),mirror_web=True)
 
         if state != prev_state:
             prev_state = state
