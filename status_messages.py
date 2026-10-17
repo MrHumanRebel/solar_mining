@@ -25,7 +25,7 @@ def stamp(value):
 def phases(snapshot):
     meter=snapshot.get('power_measurement')
     if not meter:
-        return 'Fogyasztás: nincs érvényes fázismérés.\n'+str(snapshot.get('power_guard_reason') or '')
+        return 'Fogyasztás: nincs érvényes fázismérés.\n'+str(snapshot.get('power_measurement_error') or '')
     source='Fogyasztás' if str(snapshot.get('power_measurement_source','')).startswith('consumption') else 'Inverterkimenet'
     return (f"{source}: L1 {number(meter.get('l1'),' W')} | L2 {number(meter.get('l2'),' W')} | "
             f"L3 {number(meter.get('l3'),' W')} | SUM {number(meter.get('total'),' W')}\n"
@@ -40,12 +40,13 @@ def status(snapshot,now,quote_used=None,quote_limit=None):
     cutoff=snapshot.get('afternoon_cutoff') or {}
     buffered=budget.get('projection_mode')=='surplus_buffer_run'
     physical=(snapshot.get('runtime') or {}).get('state','unknown')
-    physical_label={'unknown':'ismeretlen','starting':'indítás ellenőrzésre vár','running':'futás észlelve',
+    physical_label={'unknown':'ismeretlen','starting':'indítás ellenőrzésre vár','running':'ping elérhető',
                     'stop_pending':'leállítás ellenőrzésre vár','stop_failed':'leállítás nincs igazolva',
-                    'stop_unverified':'leállítás nem ellenőrizhető','off':'minerterhelés eltűnt'}.get(physical,physical)
+                    'stop_unverified':'leállítás nem ellenőrizhető','off':'ping nem elérhető'}.get(physical,physical)
     lines=[f"☀ Solar Mining · {stamp(now)}",
-           f"Kívánt állapot: {snapshot.get('state','ismeretlen')} · PV: {number(snapshot.get('power'),' W')} · Akku: {number(snapshot.get('battery'),'%')}",
+           f"Kívánt állapot: {((snapshot.get('runtime') or {}).get('desired_state') if (snapshot.get('runtime') or {}).get('desired_state') in ('stop','production') else snapshot.get('state','ismeretlen'))} · PV: {number(snapshot.get('power'),' W')} · Akku: {number(snapshot.get('battery'),'%')}",
            f"Fizikai állapot: {physical_label} · STOP kísérletek: {(snapshot.get('runtime') or {}).get('attempts',0)}/2",
+           f"Ping cél: {(snapshot.get('runtime') or {}).get('target_ip','192.168.0.185')} · ellenőrzés: {stamp((snapshot.get('runtime') or {}).get('checked_at'))}",
            f"Időjárás: {snapshot.get('current_condition','—')}",
            f"Teljes miner tervezési fogyasztása: {number(snapshot.get('miner_power_w'),' W')} (becslés, nem konnektoros mérés)",
            f"Pool hashráta: {snapshot.get('hashrate_text') or '—'} (késhet; csak kijelzés)",
@@ -75,7 +76,7 @@ def status(snapshot,now,quote_used=None,quote_limit=None):
     if budget and not budget.get('safe'):
         lines.append('Az előrejelzés elutasított futási forgatókönyv, nem jóváhagyott indítás.')
     lines += [f"Délutáni STOP: {cutoff.get('hour',14):02}:00 után, PV ≤ {number(cutoff.get('pv_w',50),' W')} és akku < {number(cutoff.get('soc',90),'%')}",
-              'Power safety: '+str(snapshot.get('power_guard_reason') or '—')]
+              'Ping ellenőrzés: '+str(snapshot.get('power_guard_reason') or '—')]
     if quote_used is not None:
         lines.append(f'API keret: {quote_used} / {quote_limit}')
     return '\n'.join(lines)

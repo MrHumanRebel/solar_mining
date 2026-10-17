@@ -128,22 +128,22 @@ class WeeklyReferenceTests(unittest.TestCase):
     def test_phase_buffer_only_fresh_real_points_no_json_and_source_change_clears(self):
         buffer=deque(maxlen=288)
         with patch.object(solar,'_live_power_points',buffer), \
-             patch.object(solar,'_power_guard',solar.MinerPowerGuard()),patch.object(solar,'is_rpi',False), \
+             patch.object(solar,'_runtime_guard',solar.MinerPingGuard()),patch.object(solar,'is_rpi',False), \
              patch.object(solar,'press_power_button') as press:
-            solar.supervise_runtime_by_power(T,'stop',payload())
-            solar.supervise_runtime_by_power(T,'stop',payload())
+            solar.record_live_power(T,'stop',payload())
+            solar.record_live_power(T,'stop',payload())
             self.assertEqual(len(buffer),1)
             self.assertEqual([buffer[0][k] for k in ('l1','l2','l3','sum')],[100,550,550,1200])
-            solar.supervise_runtime_by_power(T+timedelta(hours=1),'stop',payload())
+            solar.record_live_power(T+timedelta(hours=1),'stop',payload())
             self.assertEqual(len(buffer),1)  # stale poll cannot add a fresh point
             later=T+timedelta(days=1,minutes=1)
             new=payload();new['collectionTime']=later.timestamp()
-            solar.supervise_runtime_by_power(later,'stop',new)
+            solar.record_live_power(later,'stop',new)
             self.assertEqual(len(buffer),1)
             new['collectionTime']=(later+timedelta(minutes=5)).timestamp()
             new['dataList'] += [{'key':'E_Puse_t1','value':1200,'unit':'W'},
                  *[{'key':k,'value':v,'unit':'W'} for k,v in zip(('LPP_A','LPP_B','LPP_C'),(100,550,550))]]
-            solar.supervise_runtime_by_power(later+timedelta(minutes=5),'stop',new)
+            solar.record_live_power(later+timedelta(minutes=5),'stop',new)
             self.assertEqual(len(buffer),1)
             self.assertEqual(buffer[0]['source'],'consumption:LPP')
             press.assert_not_called()

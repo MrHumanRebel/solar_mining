@@ -73,9 +73,8 @@ The planner evaluates three stages every live control cycle:
 Independently, from 14:00 onward, if PV disappears (default ≤50 W) and measured
 SOC is **below 90%**, immediately request STOP. Defaults are exposed as
 `MY_HARD_AFTERNOON_STOP_HOUR`, `MY_AFTERNOON_PV_STOP_W` and
-`MY_HARD_AFTERNOON_STOP_SOC`. The physical power guard must still identify the
-running miner before pressing its button; the rule does not authorize blind
-presses based on household load.
+`MY_HARD_AFTERNOON_STOP_SOC`. The ping-online fixed-IP miner receives a long
+STOP; neither household watts nor remembered phase rises gate this action.
 
 Daytime demand comes from the current measured consumption and the configured
 rig allowance, counted once. `MY_MINER_POWER_W` is the whole-rig power
@@ -87,8 +86,7 @@ means about 695–742 W AC; 750 W is a conservative planning estimate, not a
 measured wall load. Set `MY_MINER_POWER_W` to a measured whole-rig AC value when
 available; an existing explicit `.env` override takes precedence over this default.
 This same allowance drives bridge/refill, cover times and running-load subtraction.
-It does not change the physical guard's >1000 W total threshold or replace its
-witnessed L2/L3 signature. Historical daytime consumption may already include
+It is not a shutdown threshold: actuation is verified by ping. Historical daytime consumption may already include
 the miner and is never added to it again. While running, subtracting the rig
 allowance to estimate the household-only refill period is an explicit load
 estimate, not evidence about historical appliance states.
@@ -130,9 +128,8 @@ solely from Wh already above the 90% reserve. Thus it can cautiously start even
 when the zero-export meter shows little/no PV, then see whether actual PV rises
 with the new load. Insufficient battery capacity, high household load, stale or
 invalid data, poor current weather and insufficient production time still block
-this mode. It does not bypass phase limits, shutdown cooldown or the physical
-power guard. The separate >1000 W total/identified-phase rule still determines
-whether an automatic STOP decision may press the power button.
+this mode. It does not bypass inverter phase limits, shutdown cooldown or the
+fixed-IP runtime check. STOP actuation has no power threshold.
 
 GUI and Telegram label this as a bounded surplus run, showing the zero-PV
 worst-case SOC **at the planned mining stop**, required/available surplus Wh and
@@ -146,77 +143,68 @@ continues to apply when feasible, including for low-SOC early starts.
 The energy model includes battery capacity from Ah × V, battery saturation,
 startup cost and charge/discharge losses. It remains an estimate: future clouds
 and household demand can differ. It is recalculated at each live sample, while
-the separate power guard controls whether a physical shutdown is authorized.
+the separate fixed-IP ping monitor verifies runtime and supervises shutdown.
 Missing or stale API data never substitutes a saved JSON measurement.
 
-## Hardware shutdown and API cadence
+## Miner runtime and shutdown: fixed-IP ping
 
-Pool hashrate is display-only. The separate power guard uses fresh total
-consumption and L2/L3 readings, a stable off baseline, and a witnessed load rise
-after the controller's own start command. A first start can use a fresh
-pre-command anchor plus two stable post-start paired rises, without needing
-three earlier off polls. Any already observed unstable baseline still rejects
-identification; a restart or household load alone never proves the miner is on. It supports either mapping of three
-RTX3070 GPUs on one phase and two GPUs plus CPU on the other.
+The old consumption-signature guard, off baselines, witnessed starts and
+>1000 W actuation threshold have been **removed**. Solarman watts/phases remain
+energy-planning and chart inputs; they cannot authorize or block a GPIO command.
+Pool hashrate remains display-only.
 
-STOP is always a **long power-button press**: at least 10 seconds (default 10).
-The start pulse is separate, limited to 0.1–1.0 seconds (default 0.55). GUI,
-Telegram, force-stop and automatic safety paths use the same long STOP primitive.
-GPIO releases the line and cleans up even when an operation raises an error.
+The miner is the DHCP-reserved **192.168.0.185**, expected MAC
+**90:DE:80:BD:AD:BF**. Compose/Python use `MY_MINER_IP` and `MY_MINER_MAC` defaults.
+The MAC is descriptive reservation metadata, not verified by ICMP. Keep this IP
+reserved for SolarMiner and allow ICMP echo requests on its OS/firewall. The Pi
+container needs a LAN route to that address; the image already installs
+`iputils-ping`. Ping cannot prove physical power-off or distinguish a disconnected
+host from one that is powered down: the GUI explicitly says ping-unreachable.
 
-A logical STOP request is not physical proof. One fresh, matching learned L2/L3
-sample above 1000 W total authorizes the first long press. The guard **retains**
-its identity and waits for a device measurement collected *after* the press
-finished. Cached/repeated/pre-command samples cannot confirm anything. Both
-identified phase contributions disappearing confirms that the mining load is
-absent; a single missing phase is ambiguous and disables automatic retries.
+A dedicated daemon checks the IP every **15 seconds**, including overnight and
+when Solarman is unavailable. Each bounded probe sends two ICMP packets. Linux
+`ping` exit 0 is reachable, exit 1 is unanswered; missing executables, permission
+errors, timeouts and other exit codes are unknown, never OFF. The thread starts
+with the persisted requested state, so a restarted controller with STOP requested
+can stop a ping-online miner without remembering a previous start.
 
-If the same identified paired load persists, the next fresh post-command sample
-may authorize **one additional long press**, after at least two minutes. There
-are at most two attempts per owned run. A still-present load after attempt two,
-GPIO failure, ambiguous load or lost identity is reported as unconfirmed/failed,
-with a Telegram/dashboard warning; no endless button loop is allowed. Automatic
-notifications are sent asynchronously, so Telegram retries cannot block GPIO
-supervision or the next Solarman cycle. The >1000 W
-threshold, meter-source checks, freshness/gap limits and witnessed-start checks
-remain required for automatic retries. L1 is not a miner phase: an L1-only
-household load change does not veto stopping an already identified L2/L3 miner.
-L2/L3 appliance changes that obscure the signature continue to withhold presses.
-Once the paired load disappears, later cooking loads cannot re-arm that run.
+When STOP is requested and ping replies, issue a **long press, at least 10 s**.
+Wait at least 30 s after completion before retrying a still-reachable target.
+At most two long-press attempts are allowed for a continuous online STOP episode;
+continued replies after the second produce a visible failure/manual-check alert.
+Two consecutive unanswered post-command checks confirm network unreachability;
+one lost check or a probe error cannot confirm shutdown. No press is sent into
+an already unreachable target. A target returning online under a standing STOP
+is detected again. No Solarman API request is made by this monitoring loop.
 
-The dashboard State shows physical evidence (`running detected`, `shutdown
-pending`, `shutdown unconfirmed`, `mining load absent`, or `unknown`), while the
-requested control state is separate. API `runtime` and Telegram expose attempts,
-last command time and confirmation time. Unknown/restarted identity never
-becomes “stopped” merely because the planner requested STOP. Automatic starts
-are withheld while a prior shutdown is pending/unconfirmed, and an already
-identified running rig does not receive another start pulse. Planning continues
-to account for a known still-running rig even if the requested state is STOP.
+Before any start pulse, ping the target: reachable means already online and no
+pulse; unknown means withhold; two unanswered probe batches allow the short
+0.1–1.0 s start pulse (default 0.55 s). Allow 90 s for boot before another start
+can be considered. GUI, Telegram and automatic start/stop paths use these same
+checks. GPIO always releases/cleans up, even on an error. Automatic notifications
+are asynchronous and cannot hold up the ping loop.
 
-The guard retains only bounded working evidence in RAM, never a JSON history.
-Aggregate meters cannot uniquely distinguish every oven/hob combination from a
-miner, so missing identity requires manual inspection rather than blind presses.
+GUI/API/Telegram distinguish requested state, ping reachability, command pending,
+failed/unverified stop and unknown, and show the target, last check, attempts and
+confirmation time. Solar energy decisions are still evaluated on the existing
+schedule; runtime reachability supervises an outstanding STOP independently.
+There is no JSON measurement recorder or persisted power signature.
 
-On the supplied Deye schema, `E_Puse_t1` with explicit W/kW units is total
+For energy planning/display, on the supplied Deye schema, `E_Puse_t1` with explicit W/kW units is total
 instantaneous consumption. Pair it with `LPP_A/B/C` (whole-house phases), not
 `C_P_L1/L2/L3` (a different load port). The supplied example is 1241 W =
 25 + 808 + 408 W; the C_P readings sum to only 50 W. Each phase family is
 selected as a complete group and checked against its total, never mixed.
 
-When no consumption register exists, the guard accepts `INV_O_P_T` with
+When no consumption register exists, the measurement parser accepts `INV_O_P_T` with
 `INV_O_P_L1/L2/L3`, labelled as inverter output. It does not establish
-consumption of grid-side appliances. Changes in source or phase family discard
-the learned identity. kWh/VA counters are rejected. The dashboard shows the
-selected safety meter and device collection time separately from HTTP polling
+consumption of grid-side appliances. Phase families remain separate and are never mixed. kWh/VA counters are rejected. The dashboard shows the
+selected planning meter and device collection time separately from HTTP polling
 time, with specific missing-field, timestamp, unit or total/phase errors.
 
-All control, display and guard freshness checks use a shared **420-second**
-maximum device age: five-minute Solarman uploads plus the controller's one-minute
-offset and request jitter. Future timestamps and older data remain rejected;
-duplicate device timestamps cannot confirm a new hardware action. One cached
-upload may produce a ten-minute device timestamp gap, so daylight identity is
-retained for gaps up to 12 minutes. Longer gaps, changed sources and lost phase
-signatures still disarm it. Overnight gap tolerance remains cadence + six minutes.
+Solarman planning/display freshness remains 420 seconds, matching five-minute
+uploads plus the controller offset and request jitter. Stale/future readings are
+unavailable for energy planning; they do not stop the independent ping monitor.
 
 Solarman authentication and device polling run every five minutes between
 astronomical sunrise and sunset, and once every 30 minutes overnight. Failed
@@ -297,7 +285,7 @@ skipped off the Pi. The tests use simulation defaults and mock external services
 do not launch the live main loop with production credentials for a replay.
 
 ```sh
-python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference test_physical_bridge test_near_full_buffer test_shutdown_verification
+python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference test_physical_bridge test_near_full_buffer test_miner_ping
 python simulate_decisions.py --history-dir solarman_json
 python simulate_decisions.py --history-dir solarman_json --date 2026-10-16
 ```

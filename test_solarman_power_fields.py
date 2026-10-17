@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
 from simulate_decisions import solar
-from test_miner_power_guard import armed_guard, sample
+from power_test_helpers import sample
 
 T = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
 
@@ -41,7 +41,7 @@ class SolarmanPowerFieldTests(unittest.TestCase):
     def test_reported_schema_flows_through_idle_monitor_and_dashboard(self):
         data=json.loads((Path(__file__).parent/'tests/fixtures/solarman_deye_power.json').read_text())
         now=datetime.fromtimestamp(data['collectionTime'],timezone.utc)+timedelta(seconds=60)
-        with patch.object(solar,'_power_guard',solar.MinerPowerGuard()), \
+        with patch.object(solar,'_runtime_guard',solar.MinerPingGuard()), \
              patch.object(solar,'_latest_power_sample',None), \
              patch.object(solar,'fetch_current_data',return_value=data), \
              patch.object(solar,'save_quote_usage'), patch.object(solar,'used_quote',0), \
@@ -61,15 +61,14 @@ class SolarmanPowerFieldTests(unittest.TestCase):
 
     def test_successful_read_clears_previous_measurement_error_without_rearming(self):
         data=payload()
-        with patch.object(solar,'_power_guard',solar.MinerPowerGuard()), \
+        with patch.object(solar,'_runtime_guard',solar.MinerPingGuard()), \
              patch.object(solar,'_power_measurement_error',None), \
              patch.object(solar,'_latest_power_sample',None), \
              patch.object(solar,'is_rpi',False):
-            solar.supervise_runtime_by_power(T,'stop',{})
-            self.assertIn('timestamp',solar._build_snapshot_payload()['power_guard_reason'])
-            solar.supervise_runtime_by_power(T,'stop',data)
-            self.assertEqual(solar._build_snapshot_payload()['power_guard_reason'],'No witnessed miner start')
-            self.assertIsNone(solar._power_guard.signature)
+            solar.record_live_power(T,'stop',{})
+            self.assertIn('timestamp',solar._build_snapshot_payload()['power_measurement_error'])
+            solar.record_live_power(T,'stop',data)
+            self.assertEqual(solar._build_snapshot_payload()['power_measurement_error'],None)
 
     def test_e_puse_requires_explicit_power_units(self):
         data=payload()
@@ -139,36 +138,18 @@ class SolarmanPowerFieldTests(unittest.TestCase):
         for delta in (-600,60):
             data=payload()
             data['collectionTime']=(T+timedelta(seconds=delta)).timestamp()
-            with patch.object(solar,'_power_guard',solar.MinerPowerGuard()), \
+            with patch.object(solar,'_runtime_guard',solar.MinerPingGuard()), \
                  patch.object(solar,'is_rpi',True), patch.object(solar,'GPIO_AVAILABLE',True), \
                  patch.object(solar,'press_power_button') as press:
-                solar.supervise_runtime_by_power(T,'stop',data)
+                solar.record_live_power(T,'stop',data)
                 press.assert_not_called()
 
-    def test_switching_meter_domains_disarms_existing_identity(self):
-        guard=armed_guard()
-        reading=replace(sample(25),source='inverter_output')
-        self.assertFalse(guard.observe(reading,reading.at,'stop'))
-        self.assertIsNone(guard.signature)
 
-    def test_same_domain_inverter_signature_retains_one_reading_stop(self):
-        guard=solar.MinerPowerGuard()
-        for minute in (0,5,10):
-            reading=replace(sample(minute,400,100,100,200),source='inverter_output')
-            guard.observe(reading,reading.at,'stop')
-        guard.command_start(reading,reading.at+timedelta(seconds=1))
-        for minute in (15,20):
-            reading=replace(sample(minute,1200,100,550,550),source='inverter_output')
-            guard.observe(reading,reading.at,'production')
-        reading=replace(sample(25),source='inverter_output')
-        self.assertTrue(guard.observe(reading,reading.at,'stop'))
-        reading=replace(sample(30),source='inverter_output')
-        self.assertTrue(guard.observe(reading,reading.at,'stop'))
 
     def test_field_diagnostics_stay_out_of_dashboard_status(self):
-        with patch.object(solar,'_power_guard',solar.MinerPowerGuard()):
-            solar.supervise_runtime_by_power(T,'stop',{'collectionTime':T.timestamp(),'dataList':payload()['dataList'][:2]})
-            reason=solar._build_snapshot_payload()['power_guard_reason']
+        with patch.object(solar,'_runtime_guard',solar.MinerPingGuard()):
+            solar.record_live_power(T,'stop',{'collectionTime':T.timestamp(),'dataList':payload()['dataList'][:2]})
+            reason=solar._build_snapshot_payload()['power_measurement_error']
             self.assertNotIn('power_fields',reason)
             self.assertNotIn('ESP_VER',reason)
 
