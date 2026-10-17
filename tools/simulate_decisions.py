@@ -5,7 +5,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from history_model import load_exports, LOCAL
+from solar_mining.history_model import load_exports, LOCAL
 
 _DEFAULT_ENV = {
     'MY_BOT_TOKEN':'simulate','MY_CHAT_ID':'simulate','MY_WEATHER_API':'simulate',
@@ -16,7 +16,7 @@ _DEFAULT_ENV = {
 }
 for key,value in _DEFAULT_ENV.items():
     os.environ.setdefault(key,value)
-import solar
+from solar_mining import controller as solar
 
 
 def replay(history_dir, day=None):

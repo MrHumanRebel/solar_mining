@@ -26,10 +26,10 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
    
 # Copy the app code and bundled historical tuning data
-COPY solar.py power_measurement.py miner_ping_guard.py history_model.py status_messages.py ./
-COPY solarmining_logo.png ./
-COPY favicon ./favicon
-COPY wait-for-dns.sh ./
+COPY solar.py ./
+COPY solar_mining ./solar_mining
+COPY assets ./assets
+COPY scripts ./scripts
 # Keep bundled exports visible even when an older host directory is mounted.
 COPY solarman_json ./bundled_solarman_json
 

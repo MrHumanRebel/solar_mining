@@ -5,8 +5,8 @@ import json
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
-from simulate_decisions import solar
-from power_test_helpers import sample
+from tools.simulate_decisions import solar
+from tests.power_test_helpers import sample
 
 T = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
 
@@ -29,7 +29,7 @@ class SolarmanPowerFieldTests(unittest.TestCase):
         self.enterContext(patch.object(solar,'_last_power_notice_key',None))
 
     def test_reported_deye_schema_pairs_consumption_with_lpp_not_backup_load(self):
-        data=json.loads((Path(__file__).parent/'tests/fixtures/solarman_deye_power.json').read_text())
+        data=json.loads((Path(__file__).parent/'fixtures/solarman_deye_power.json').read_text())
         now=datetime.fromtimestamp(data['collectionTime'],timezone.utc)+timedelta(seconds=60)
         result,error=solar._parse_power_measurement(data,now)
         self.assertIsNone(error)
@@ -39,7 +39,7 @@ class SolarmanPowerFieldTests(unittest.TestCase):
         self.assertIn('old',solar._power_measurement_reason(data,result,now+timedelta(hours=5)))
 
     def test_reported_schema_flows_through_idle_monitor_and_dashboard(self):
-        data=json.loads((Path(__file__).parent/'tests/fixtures/solarman_deye_power.json').read_text())
+        data=json.loads((Path(__file__).parent/'fixtures/solarman_deye_power.json').read_text())
         now=datetime.fromtimestamp(data['collectionTime'],timezone.utc)+timedelta(seconds=60)
         with patch.object(solar,'_runtime_guard',solar.MinerPingGuard()), \
              patch.object(solar,'_latest_power_sample',None), \
@@ -78,7 +78,7 @@ class SolarmanPowerFieldTests(unittest.TestCase):
         self.assertIn('requires explicit',error)
 
     def test_partial_lpp_never_mixes_with_backup_port_or_inverter_phases(self):
-        data=json.loads((Path(__file__).parent/'tests/fixtures/solarman_deye_power.json').read_text())
+        data=json.loads((Path(__file__).parent/'fixtures/solarman_deye_power.json').read_text())
         data['dataList']=[i for i in data['dataList'] if i['key']!='LPP_C']
         result,error=solar._parse_power_measurement(data,T)
         self.assertIsNone(result)

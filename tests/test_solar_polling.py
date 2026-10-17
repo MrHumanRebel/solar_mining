@@ -2,9 +2,9 @@ from datetime import timedelta
 import unittest
 from unittest.mock import patch
 
-from test_idle_monitoring import solar, SUNSET
-from power_measurement import PowerSample
-from miner_ping_guard import MinerPingGuard
+from tests.test_idle_monitoring import solar, SUNSET
+from solar_mining.power_measurement import PowerSample
+from solar_mining.miner_ping_guard import MinerPingGuard
 
 
 class SolarPollingTests(unittest.TestCase):

@@ -6,7 +6,7 @@ import unittest
 from datetime import timedelta
 from unittest.mock import Mock, patch
 
-import simulate_decisions
+from tools import simulate_decisions
 
 solar = simulate_decisions.solar
 ADDRESS = '0xaedac36dcfc956864fcc03ec2ef256facaefd991'
@@ -57,7 +57,7 @@ class MiningPoolTests(unittest.TestCase):
         self.assertEqual(solar._format_hashrate(70.06e12), '70.06 TH/s')
 
     def test_recorded_v5_response_returns_real_pearlpow_rate(self):
-        fixture = Path(__file__).parent / 'tests/fixtures/unmineable_v5_workers.json'
+        fixture = Path(__file__).parent / 'fixtures/unmineable_v5_workers.json'
         payload = json.loads(fixture.read_text())
         account = Mock(json=Mock(return_value={'success': True, 'data': {'uuid': 'test-account'}}))
         workers = Mock(json=Mock(return_value=payload))
@@ -72,7 +72,7 @@ class MiningPoolTests(unittest.TestCase):
             self.assertEqual(solar._build_snapshot_payload()['hashrate_text'], '235.19 TH/s')
 
     def test_recorded_response_without_pearlpow_is_unknown_not_zero(self):
-        fixture = Path(__file__).parent / 'tests/fixtures/unmineable_v5_workers.json'
+        fixture = Path(__file__).parent / 'fixtures/unmineable_v5_workers.json'
         payload = json.loads(fixture.read_text())
         del payload['data']['pearlpow']
         self.assertIsNone(solar._extract_hashrate_from_wallet_payload(payload))

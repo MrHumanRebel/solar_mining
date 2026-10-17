@@ -7,7 +7,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 from unittest.mock import Mock, patch
 from urllib.request import urlopen
-from simulate_decisions import solar
+from tools.simulate_decisions import solar
 
 
 class WebDisconnectTests(unittest.TestCase):

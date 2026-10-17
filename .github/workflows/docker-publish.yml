@@ -36,6 +36,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: dockerfile
           push: true
           tags: ghcr.io/${{ steps.lowercase_repo.outputs.repo }}:latest
           platforms: linux/arm64

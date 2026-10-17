@@ -5,9 +5,9 @@ import io
 import unittest
 from unittest.mock import Mock, patch
 
-import simulate_decisions
-from power_measurement import PowerSample
-from miner_ping_guard import MinerPingGuard
+from tools import simulate_decisions
+from solar_mining.power_measurement import PowerSample
+from solar_mining.miner_ping_guard import MinerPingGuard
 
 solar = simulate_decisions.solar
 SUNSET = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
