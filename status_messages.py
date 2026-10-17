@@ -52,10 +52,15 @@ def status(snapshot,now,quote_used=None,quote_limit=None):
            '', '🔋 Élő bridge / futásterv',
            str(hints.get('decision_summary') or 'Még nincs friss vezérlési döntés.'),
            f"Bridge: {number(budget.get('required_bridge_wh'),' Wh')} szükséges / {number(budget.get('available_bridge_wh'),' Wh')} elérhető (a szükséges már tartalmazza a biztonsági ráhagyást)",
+           f"Bridge időtartama: {number(budget.get('bridge_duration_minutes'),' perc',1)} · csak a mostantól a tartós PV-fedezetig tartó hiány",
+           f"Indítás: {number(budget.get('startup_energy_wh'),' Wh')} · teljes indulási keret ráhagyással: {number(budget.get('required_start_energy_wh'),' Wh')}",
+           f"Háztartási terhelési feltételezés: {number(budget.get('household_load_w'),' W')} · napnyugtai SOC bányászat nélkül: {number(budget.get('household_only_end_soc'),'%')}",
            f"Heti SOC-görbe szerinti bridge: {number(budget.get('historical_bridge_wh'),' Wh')} · csak kiegészítő becslés",
            f"Tartós PV-fedezet: {stamp(budget.get('cover_time'))} · tervezett leállás: {stamp(budget.get('planned_stop'))}",
            f"Minimum / záró SOC: {number(budget.get('minimum_soc'),'%')} / {number(budget.get('end_soc'),'%')}",
            f"Háztartási éjszakai energiatartalék: {number(budget.get('reserve_soc'),'%')}"]
+    if budget.get('bridge_status')=='no_sustained_cover':
+        lines.append('Nincs előre jelzett tartós PV-fedezet: bridge Wh nem számítható, a napi hiányt nem írjuk ide.')
     if budget and not budget.get('safe'):
         lines.append('Az előrejelzés elutasított futási forgatókönyv, nem jóváhagyott indítás.')
     lines += [f"Délutáni STOP: {cutoff.get('hour',14):02}:00 után, PV ≤ {number(cutoff.get('pv_w',50),' W')} és akku < {number(cutoff.get('soc',90),'%')}",

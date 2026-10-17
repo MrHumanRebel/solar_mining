@@ -253,6 +253,8 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
             return 'solar_friendly'
         if cloud is not None and cloud>=85:
             return 'solar_weak'
+        if 'few clouds' in c or ('cloud' in c and cloud is not None and cloud<=30):
+            return 'solar_friendly'
         if 'cloud' in c or 'overcast' in c:
             return 'mixed'
         return 'unknown'
@@ -323,10 +325,26 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
     # enough to recharge. Re-evaluate it at each scheduled live measurement.
     minimum_stop=now+timedelta(minutes=min_run_minutes)
     candidates=[row[1] for row in steps if minimum_stop<=row[1]<=stop]
+    # Bridge is ONLY the physical battery drawdown from now to sustained cover.
+    # Never substitute the entire remaining day's deficit when cover is absent.
+    bridge_deficit=None
+    if cover is not None:
+        energy=lowest=initial
+        for at,end,expected,household,_ in steps:
+            if at>=cover:
+                break
+            net=(expected-household-miner_w)*(end-at).total_seconds()/3600
+            energy=min(capacity_wh,energy+(net*.9 if net>=0 else net/.9))
+            lowest=min(lowest,energy)
+        bridge_deficit=max(0,initial-lowest)
+    startup=0 if running else startup_wh
+    required_bridge=None if bridge_deficit is None else bridge_deficit*bridge_safety_factor
+    required_start=None if bridge_deficit is None else (bridge_deficit+startup)*bridge_safety_factor
+
     def simulate(until):
-        energy=initial-(0 if running else startup_wh)
+        # A household-only counterfactual does not start the miner.
+        energy=initial-(startup if until>now else 0)
         minimum=energy
-        bridge_min=energy
         produced=consumed=0.0
         full_at=None
         for at,end,expected,household,_ in steps:
@@ -335,38 +353,36 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
             net=(expected-demand)*dt
             energy=min(capacity_wh,energy+(net*.9 if net>=0 else net/.9))
             minimum=min(minimum,energy)
-            if cover is None or at<cover:
-                bridge_min=min(bridge_min,energy)
             if full_at is None and energy>=capacity_wh*.995:
                 full_at=end.isoformat()
             produced+=expected*dt
             consumed+=demand*dt
-        bridge=max(0,initial-bridge_min)
-        return energy,minimum,bridge,produced,consumed,full_at
-    historical_bridge_wh=0.0
-    if cover and profile.get('curve'):
+        return energy,minimum,produced,consumed,full_at
+    # Unlabelled historical SOC includes old household/miner activity. It is
+    # reference information, never an extra Wh cost added to today's bridge.
+    historical_bridge_wh=None
+    if cover is not None and profile.get('curve'):
         start_soc=curve_value(profile,now.hour*60+now.minute,'soc_pct')
         cover_soc=curve_value(profile,cover.hour*60+cover.minute,'soc_pct')
         if start_soc is not None and cover_soc is not None:
             historical_bridge_wh=max(0,start_soc-cover_soc)/100*capacity_wh
-    use_soc_guidance=not running and now.hour<12 and weather_at(cover or now)!='solar_friendly'
+    household_only=simulate(now)
     chosen=None
     reason='insufficient_time_for_minimum_run'
-    result=simulate(now)  # Household-only outlook if no useful run fits.
+    result=household_only  # No minimum-duration candidate may fit before stop.
     for until in reversed(candidates):
         result_candidate=simulate(until)
-        ending,minimum,bridge,*_=result_candidate
-        if use_soc_guidance:
-            bridge=max(bridge,historical_bridge_wh)
+        ending,minimum,*_=result_candidate
         if target_wh>capacity_wh:
             reason='overnight_reserve_exceeds_battery_capacity'
+        elif required_start is not None and required_start>max(0,initial-floor_wh):
+            reason='insufficient_battery_bridge'
+        elif (not running and now.hour<12 and (cover is None or cover>=until)):
+            reason='no_sustained_solar_cover_for_morning_start'
+        elif household_only[1]<floor_wh or household_only[0]<target_wh:
+            reason='household_only_refill_not_feasible'
         elif minimum<floor_wh:
             reason='battery_floor_would_be_crossed'
-        elif (not running and now.hour<12 and
-              (cover is None or cover>=until)):
-            reason='no_sustained_solar_cover_for_morning_start'
-        elif bridge*bridge_safety_factor>max(0,initial-floor_wh):
-            reason='insufficient_battery_bridge'
         elif ending<target_wh:
             reason='night_household_reserve_not_recovered'
         else:
@@ -376,7 +392,7 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
             break
         # Expose the useful minimum-run scenario when all candidates fail.
         result=result_candidate
-    ending,minimum,bridge,produced,consumed,full_at=result
+    ending,minimum,produced,consumed,full_at=result
     return {'safe':chosen is not None,'reason':reason,'coverage':min(1,profile.get('days',0)/14),
             'end_soc':round(max(0,min(100,ending/capacity_wh*100)),2),
             'minimum_soc':round(max(0,min(100,minimum/capacity_wh*100)),2),
@@ -384,9 +400,17 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
             'required_reserve_wh':round(target_wh,1),
             'night_household_wh':round(night_wh,1),'reserve_shortfall_wh':round(max(0,target_wh-ending),1),
             'planned_stop':chosen.isoformat() if chosen else None,
-            'projection_mode':'approved_run' if chosen else 'rejected_minimum_run',
+            'projection_mode':'approved_run' if chosen else ('rejected_minimum_run' if candidates else 'household_only'),
             'cover_time':cover.isoformat() if cover else None,'full_charge_time':full_at,
             'expected_pv_wh':round(produced,1),'expected_load_wh':round(consumed,1),
             'available_bridge_wh':round(max(0,initial-floor_wh),1),
-            'required_bridge_wh':round(max(bridge,historical_bridge_wh if use_soc_guidance else 0)*bridge_safety_factor,1),
-            'historical_bridge_wh':round(historical_bridge_wh,1)}
+            'bridge_status':'covered_now' if cover==now else ('until_cover' if cover else 'no_sustained_cover'),
+            'bridge_duration_minutes':round((cover-now).total_seconds()/60,1) if cover else None,
+            'bridge_deficit_wh':round(bridge_deficit,1) if bridge_deficit is not None else None,
+            'required_bridge_wh':round(required_bridge,1) if required_bridge is not None else None,
+            'startup_energy_wh':round(startup,1),
+            'required_start_energy_wh':round(required_start,1) if required_start is not None else None,
+            'household_only_end_soc':round(max(0,min(100,household_only[0]/capacity_wh*100)),2),
+            'household_only_minimum_soc':round(max(0,min(100,household_only[1]/capacity_wh*100)),2),
+            'household_load_w':round(house_now,1),
+            'historical_bridge_wh':round(historical_bridge_wh,1) if historical_bridge_wh is not None else None}

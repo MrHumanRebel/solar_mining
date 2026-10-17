@@ -30,9 +30,27 @@ marked; longer gaps and unobserved edges stay missing. The plots show means,
 The current week's PV curve supplies W versus clock time, typical production
 start, peak, energy and miner-only cover time. The SOC curve supplies charge
 start and a typical bridge discharge estimate, anchored to today's measured
-battery capacity. It can increase caution under uncertain weather, but cannot
-create available energy or override live readings. Historical consumption is
+battery capacity. Its SOC change is advisory: those unlabelled old household/miner loads are
+not an additional Wh charge against today's bridge, and cannot create available
+energy or override live readings. Historical consumption is
 for display only; it is never treated as household-only load or miner identity.
+
+Bridge Wh is the maximum net battery drawdown **from now until sustained solar
+cover of household + miner**, accounting for PV contribution and discharge losses.
+It is independent of evening demand or the chosen run end. If sustained cover is
+not forecast, bridge Wh is unavailable; the remaining day's deficit is never
+reported as a bridge. If already covered, bridge Wh is zero. Startup Wh is shown
+separately; the total start allowance is `(bridge deficit + startup) × 1.25`,
+compared with battery Wh above the default **20%** floor. The former extra 6 SOC
+points for starting have been removed. Historical SOC drop is reference-only.
+
+The full run/refill plan remains a separate check. The GUI and Telegram also
+show sunset SOC without mining and the current household-load assumption, so a
+household-only refill failure is distinguished from an unaffordable bridge.
+Current household demand is a forecast assumption re-evaluated every poll, not a
+claim that a transient oven load will last all day. Few clouds (≤30%) uses the
+sunny PV branch; timestamped rain/heavy-cloud forecasts still derate it. No extra
+API calls or physical power-button actions are introduced.
 
 The planner evaluates three stages every live control cycle:
 
@@ -192,7 +210,7 @@ skipped off the Pi. The tests use simulation defaults and mock external services
 do not launch the live main loop with production credentials for a replay.
 
 ```sh
-python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference
+python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference test_physical_bridge
 python simulate_decisions.py --history-dir solarman_json
 python simulate_decisions.py --history-dir solarman_json --date 2026-10-16
 ```
