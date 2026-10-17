@@ -6,7 +6,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 import simulate_decisions
-from miner_power_guard import MinerPowerGuard, PowerSample
+from power_measurement import PowerSample
+from miner_ping_guard import MinerPingGuard
 
 solar = simulate_decisions.solar
 SUNSET = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
@@ -14,6 +15,7 @@ SUNSET = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
 
 class IdleMonitoringTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(solar,'save_prev_state'))
         self.enterContext(patch.object(solar,'send_telegram_message_async'))
 
     def test_missing_and_invalid_display_values_are_unknown(self):
@@ -51,7 +53,7 @@ class IdleMonitoringTests(unittest.TestCase):
         future.set_result('test-token')
         minutes = [0,5,10,15,20,25,30,35,90,360]
         with patch.object(solar, 'fetch_current_data', return_value=data) as fetch, \
-             patch.object(solar, 'supervise_runtime_by_power') as guard, \
+             patch.object(solar, 'record_live_power') as guard, \
              patch.object(solar, 'save_quote_usage'), patch.object(solar, 'used_quote', 0), \
              patch.object(solar, 'is_rpi', True), patch.object(solar, 'oled', oled), \
              patch.object(solar, 'draw', Mock()), patch.dict(solar._shared_snapshot), \
@@ -74,7 +76,7 @@ class IdleMonitoringTests(unittest.TestCase):
         future.set_result('test-token')
         with patch.object(solar, 'fetch_current_data', side_effect=OSError('offline')), \
              patch.object(solar, 'save_quote_usage'), patch.object(solar, 'used_quote',0), \
-             patch.object(solar, 'supervise_runtime_by_power') as guard, \
+             patch.object(solar, 'record_live_power') as guard, \
              patch.object(solar, 'is_rpi', False), patch.dict(solar._shared_snapshot), \
              redirect_stdout(io.StringIO()):
             solar._idle_monitor_cycle(SUNSET, future, None, None)
@@ -88,49 +90,12 @@ class IdleMonitoringTests(unittest.TestCase):
             with self.subTest(payload=payload), \
                  patch.object(solar,'fetch_current_data',return_value=payload), \
                  patch.object(solar,'save_quote_usage'),patch.object(solar,'used_quote',0), \
-                 patch.object(solar,'_power_guard',MinerPowerGuard()), \
+                 patch.object(solar,'_runtime_guard',MinerPingGuard()), \
                  patch.object(solar,'is_rpi',False),patch.dict(solar._shared_snapshot), \
                  redirect_stdout(io.StringIO()):
                 solar._idle_monitor_cycle(SUNSET,future,None,None)
                 self.assertIsNone(solar._shared_snapshot['power'])
 
-    def test_post_sunset_power_guard_can_retry_failed_stop_even_with_failed_oled(self):
-        guard = MinerPowerGuard()
-        for minute in (-25,-20,-15):
-            at = SUNSET + timedelta(minutes=minute)
-            off = PowerSample(at,400,100,100,200,source="consumption:INV_O_P")
-            guard.observe(off,at,'stop')
-        guard.command_start(off,off.at+timedelta(seconds=1))
-        for minute in (-10,-5):
-            at = SUNSET + timedelta(minutes=minute)
-            guard.observe(PowerSample(at,1200,100,550,550,source="consumption:INV_O_P"),at,'production')
-        self.assertIsNotNone(guard.signature)
-        future = Future()
-        future.set_result('test-token')
-        oled = Mock(width=128,height=32)
-        oled.show.side_effect = ValueError('OLED frame rejected')
-        def fetch(token):
-            return {'collectionTime':now.timestamp(),'dataList':[
-                {'key':'LOAD_P_T','value':1200}, {'key':'S_P_T','value':50},
-                {'key':'BMS_SOC','value':90}, {'key':'INV_O_P_T','value':1200},
-                *[{'key':f'INV_O_P_L{i}','value':v} for i,v in [(1,100),(2,550),(3,550)]]
-            ]}
-        with patch.object(solar,'_power_guard',guard), \
-             patch.object(solar,'fetch_current_data',side_effect=fetch) as poll, \
-             patch.object(solar,'save_quote_usage'),patch.object(solar,'used_quote',0), \
-             patch.object(solar,'save_prev_state'),patch.object(solar,'send_telegram_message'), \
-             patch.object(solar,'_last_force_shutdown_at',None), \
-             patch.object(solar,'is_rpi',True),patch.object(solar,'GPIO_AVAILABLE',True), \
-             patch.object(solar,'press_power_button',return_value=True) as press, \
-             patch.object(solar,'oled',oled),patch.object(solar,'draw',Mock()), \
-             patch.dict(solar._shared_snapshot),redirect_stdout(io.StringIO()):
-            for minute in range(0,36,5):
-                now = SUNSET + timedelta(minutes=minute)
-                solar._idle_monitor_cycle(now,future,None,None)
-            self.assertEqual(poll.call_count,8)
-            self.assertEqual(press.call_count,2)
-            self.assertTrue(all(c.args==(16,solar.POWER_BUTTON_LONG_PRESS_SECONDS) for c in press.call_args_list))
-            self.assertEqual(solar._shared_snapshot['power'],50)
 
     def test_full_idle_loop_survives_more_than_12_missing_dht_samples(self):
         weather = ('clear sky', SUNSET-timedelta(hours=10), SUNSET, 0,
@@ -156,7 +121,7 @@ class IdleMonitoringTests(unittest.TestCase):
              patch.object(solar,'ThreadPoolExecutor',return_value=executor), \
              patch.object(solar,'_control_window_details',return_value={'active':False}), \
              patch.object(solar,'_wallet_hashrate_hs_cached',return_value=200e12), \
-             patch.object(solar,'supervise_runtime_by_power') as guard, \
+             patch.object(solar,'record_live_power') as guard, \
              patch.object(solar,'sleep_until_next_5min',side_effect=[None]*12+[StopIteration]), \
              patch.object(solar,'is_rpi',True), patch.object(solar,'oled',oled), \
              patch.object(solar,'draw',Mock()), patch.dict(solar._shared_snapshot), \

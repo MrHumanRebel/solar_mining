@@ -1,6 +1,7 @@
 import requests
 from status_messages import status as telegram_status, phases as telegram_phases
-from miner_power_guard import MinerPowerGuard, PowerSample
+from power_measurement import PowerSample
+from miner_ping_guard import MinerPingGuard, ping_host
 from history_model import load_exports, build_weekly_profiles, curve_value, week_metrics, plan as plan_energy
 import hashlib
 import json
@@ -114,8 +115,8 @@ TELEGRAM_BASE = f'https://api.telegram.org/bot{BOT_TOKEN}'
 # Locks for thread safety
 session_lock = threading.Lock()
 gpio_lock = threading.RLock()
-power_guard_lock = threading.RLock()
-_power_guard = MinerPowerGuard()
+runtime_lock = threading.RLock()
+_runtime_guard = MinerPingGuard(os.getenv('MY_MINER_IP','192.168.0.185'),os.getenv('MY_MINER_MAC','90:DE:80:BD:AD:BF'))
 _latest_power_sample = None
 _power_measurement_error = None
 _last_power_notice_key = None
@@ -698,11 +699,15 @@ def _make_miner_decision(
     weather_outlook,
     current_load=None,
 ) -> Dict[str, Any]:
-    physically_running=(_power_guard.signature is not None and _power_guard.runtime_state in
-                        ('running','stop_pending','stop_failed'))
+    with runtime_lock:
+        physical=_runtime_guard.status(now)
+        pending_stop=(_runtime_guard.shutdown_after is not None and _runtime_guard.runtime_state in
+                      ('stop_pending','stop_failed','stop_unverified'))
+    physically_running=physical['reachable'] is True
+    budget_running=True if physically_running else False if physical['state']=='off' else prev_state=='production'
     hints = _history_recommendation(now,battery_charge,current_power,sunrise,sunset,weather_outlook,
                                     inv_lt if current_load is None else current_load,
-                                    prev_state=="production" or physically_running,battery_voltage,battery_ah,current_condition,clouds)
+                                    budget_running,battery_voltage,battery_ah,current_condition,clouds)
     budget = hints['energy_budget']
     control = _control_window_details(now,sunrise,sunset,hints)
     reasons = []
@@ -741,7 +746,7 @@ def _make_miner_decision(
     if prev_state!='production' and now<sunrise and rain:
         reasons.append(rain)
     cooldown = isinstance(_last_force_shutdown_at,datetime) and (now-_last_force_shutdown_at).total_seconds()<MINER_STOP_FORCE_COOLDOWN_MINUTES*60
-    if _power_guard.runtime_state in ('stop_pending','stop_failed'):
+    if pending_stop:
         reasons.append('Shutdown not confirmed; automatic start withheld')
         hard = True
     if cooldown and prev_state!='production':
@@ -824,7 +829,7 @@ def notify_startup():
         f"Time (Europe/Budapest): {ts}\n"
         f"{_runtime_info()}"
     )
-    send_telegram_message(msg, keyboard=True)
+    send_telegram_message_async(msg, keyboard=True, mirror_web=True)
 
 def notify_shutdown(reason: str = "normal", err: Exception = None):
     ts = datetime.now(tz=budapest_tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -1100,24 +1105,9 @@ def process_message(message_text, battery, power, state, current_condition, sunr
     if message_text == "/phase":
         send_telegram_message(telegram_phases(_build_snapshot_payload()),mirror_web=False)
 
-    if message_text == "/start":
-        if is_rpi and GPIO_AVAILABLE:
-            press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
-            send_telegram_message("Crypto production started! Pressed power button.")
-        else:
-            send_telegram_message("Crypto production start requested, but GPIO is not available on this host.")
-    if message_text == "/stop":
-        if is_rpi and GPIO_AVAILABLE:
-            sent=press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-            send_telegram_message("Hosszú STOP jel elküldve; a leállás még nincs fogyasztásból igazolva." if sent else "🚨 Hosszú STOP jel küldése sikertelen; a leállás nincs igazolva.")
-        else:
-            send_telegram_message("Crypto production stop requested, but GPIO is not available on this host.")
-    if message_text == "/force_stop":
-        if is_rpi and GPIO_AVAILABLE:
-            sent=press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-            send_telegram_message(f"Hosszú STOP jel elküldve, ellenőrzésre vár ({POWER_BUTTON_LONG_PRESS_SECONDS:.0f} s)." if sent else "🚨 Hosszú STOP jel küldése sikertelen; a leállás nincs igazolva.")
-        else:
-            send_telegram_message("Force stop requested, but GPIO is not available on this host.")
+    if message_text in ('/start','/stop','/force_stop'):
+        result=_ensure_miner_started(manual=True) if message_text=='/start' else _request_miner_stop()
+        send_telegram_message(result['message'])
 
     if message_text == "/wallet":
         send_telegram_message(f"unMineable {MINING_COIN} ({MINING_ALGORITHM}, worker={MINING_WORKER or 'all'}): {_effective_wallet_address()}")
@@ -1320,19 +1310,19 @@ def press_power_button(gpio_pin, press_time):
                     GPIO.output(gpio_pin, GPIO.LOW)
                 finally:
                     GPIO.cleanup()
-        with power_guard_lock:
+        with runtime_lock:
             if press_time == POWER_BUTTON_SHORT_PRESS_SECONDS:
-                _power_guard.command_start(_latest_power_sample, datetime.now(tz=budapest_tz))
+                _runtime_guard.command_start(datetime.now(tz=budapest_tz))
             else:
                 completed=datetime.now(tz=budapest_tz)
-                _power_guard.command_stop_finished(completed,success=True)
+                _runtime_guard.command_stop_finished(completed,success=True)
                 _last_force_shutdown_at=completed
         print("Power button press completed.")
         return True
     except Exception as e:
         if press_time >= POWER_BUTTON_LONG_PRESS_SECONDS:
-            with power_guard_lock:
-                _power_guard.command_stop_finished(datetime.now(tz=budapest_tz),success=False)
+            with runtime_lock:
+                _runtime_guard.command_stop_finished(datetime.now(tz=budapest_tz),success=False)
         print(f"[Warning] GPIO press failed: {e}")
         return False
 
@@ -1432,16 +1422,17 @@ def _power_measurement_reason(data, sample, now):
     age = (now - sample.at).total_seconds()
     if age < 0:
         return f"Device timestamp is {-age:.0f} seconds in the future"
-    if age > MinerPowerGuard.MAX_SAMPLE_AGE_SECONDS:
-        return f"Device power measurement is {age:.1f} seconds old (maximum {MinerPowerGuard.MAX_SAMPLE_AGE_SECONDS} seconds)"
+    if age > PowerSample.MAX_SAMPLE_AGE_SECONDS:
+        return f"Device power measurement is {age:.1f} seconds old (maximum {PowerSample.MAX_SAMPLE_AGE_SECONDS} seconds)"
     return None
 
 
-def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[str, Any], poll_interval_seconds=300) -> None:
-    global _latest_power_sample, _last_force_shutdown_at, _power_measurement_error, _last_power_notice_key
+def record_live_power(now: datetime, expected_state: str, data: Dict[str, Any], poll_interval_seconds=300) -> None:
+    """Solarman data for display/planning only; no ping or GPIO operations."""
+    global _latest_power_sample, _power_measurement_error
     _latest_power_sample = _extract_power_sample(data, now)
     _power_measurement_error = _power_measurement_reason(data, _latest_power_sample, now)
-    if MinerPowerGuard.fresh(_latest_power_sample,now):
+    if PowerSample.fresh(_latest_power_sample,now):
         sample = _latest_power_sample
         with snapshot_lock:
             if _live_power_points and _live_power_points[-1]['source']!=sample.source:
@@ -1451,41 +1442,85 @@ def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[st
             if not _live_power_points or datetime.fromisoformat(_live_power_points[-1]['ts'])<sample.at:
                 _live_power_points.append({'ts':sample.at.isoformat(),'l1':sample.l1,'l2':sample.l2,
                                            'l3':sample.l3,'sum':sample.total,'source':sample.source})
+
+
+def _runtime_tick():
+    """ICMP-only supervision, independent of Solarman polling and power values."""
+    global _last_force_shutdown_at,_last_power_notice_key
     with gpio_lock:
-        with power_guard_lock:
-            shutdown = _power_guard.observe(_latest_power_sample, now, expected_state,
-                                           poll_interval_seconds=poll_interval_seconds)
-            reason = _power_guard.reason
-            if _power_measurement_error:
-                reason = _power_measurement_error
-        print(f"[Power guard] {reason}")
+        reachable=ping_host(_runtime_guard.address)
+        now=datetime.now(tz=budapest_tz)
+        with runtime_lock:
+            shutdown=_runtime_guard.observe(reachable,now)
         if shutdown:
-            sent = bool(is_rpi and GPIO_AVAILABLE and press_power_button(16,POWER_BUTTON_LONG_PRESS_SECONDS))
-            with power_guard_lock:
-                # A real press records completion itself. Mocked/unavailable GPIO
-                # still consumes the reserved attempt and reports failure honestly.
-                if _power_guard.shutdown_reserved:
-                    _power_guard.command_stop_finished(now,success=sent)
+            sent=bool(is_rpi and GPIO_AVAILABLE and press_power_button(16,POWER_BUTTON_LONG_PRESS_SECONDS))
+            with runtime_lock:
+                if _runtime_guard.shutdown_reserved:
+                    _runtime_guard.command_stop_finished(datetime.now(tz=budapest_tz),success=sent)
             if sent:
-                _last_force_shutdown_at = now
-                save_prev_state(prev_state,uptime)
-        with power_guard_lock:
-            physical = _power_guard.status(now)
-        unknown_stop=(physical['state']=='unknown' and expected_state=='stop' and
-                      MinerPowerGuard.fresh(_latest_power_sample,now) and _latest_power_sample.total>1000)
-        key=(physical['state'],physical['attempts'],unknown_stop)
-        if key!=_last_power_notice_key:
-            _last_power_notice_key=key
-            if physical['state'] in ('stop_pending','stop_failed','stop_unverified','off'):
-                label={'stop_pending':'⏳ Hosszú STOP jel elküldve; leállás még nincs igazolva',
-                       'stop_failed':'🚨 Leállítás nincs igazolva; kézi ellenőrzés szükséges',
-                       'stop_unverified':'⚠ Leállítás nem ellenőrizhető: nincs friss teljesítménymérés',
-                       'off':'✅ Az azonosított L2/L3 minerterhelés eltűnt'}[physical['state']]
-                if physical['state']=='stop_pending' and physical['attempts']==2:
-                    label='⚠ Az első STOP után a miner terhelése megmaradt; második hosszú STOP elküldve, ellenőrzésre vár'
-                send_telegram_message_async(f"{label}. Kísérlet: {physical['attempts']}/{physical['max_attempts']}. {physical['reason']}",mirror_web=True)
-            elif unknown_stop:
-                send_telegram_message_async('⚠ STOP kérve, de a fizikai állapot ismeretlen. Nincs azonosított saját indítás: a házfogyasztásból önmagában nem nyomunk gombot. Kézi ellenőrzés szükséges.',mirror_web=True)
+                _last_force_shutdown_at=datetime.now(tz=budapest_tz)
+                save_prev_state('stop',_last_force_shutdown_at)
+        with runtime_lock:
+            physical=_runtime_guard.status(datetime.now(tz=budapest_tz))
+    key=(physical['state'],physical['attempts'])
+    changed=key!=_last_power_notice_key
+    if changed:
+        _last_power_notice_key=key
+        text={'off':'✅ A miner IP-je két egymást követő pingellenőrzésben nem válaszolt.',
+              'stop_pending':'⏳ STOP kérve / hosszú nyomás után pinges ellenőrzésre vár.',
+              'stop_failed':'🚨 A miner továbbra is elérhető vagy a GPIO-kísérlet hibás; leállítás nincs igazolva.',
+              'stop_unverified':'⚠ Pingellenőrzési hiba; leállítás nem igazolható.'}.get(physical['state'])
+        if text:
+            send_telegram_message_async(f"{text} IP: {physical['target_ip']} · kísérlet {physical['attempts']} (nincs limit). {physical['reason']}",mirror_web=True)
+    if changed:
+        print(f"[Ping guard] {physical['target_ip']} {physical['state']}: {physical['reason']}")
+    return physical
+
+
+def _ping_monitor_loop():
+    while True:
+        try:
+            _runtime_tick()
+        except Exception as err:
+            print(f'[Ping guard] Check failed: {type(err).__name__}')
+        time.sleep(15)
+
+
+def _ensure_miner_started(manual=False):
+    """Never send a start pulse into an already ping-online/unknown target."""
+    with gpio_lock:
+        with runtime_lock:
+            if not _runtime_guard.set_desired('production',force=manual):
+                return {'ok':False,'message':'Outstanding STOP verification; automatic start withheld'}
+        first=ping_host(_runtime_guard.address)
+        if first is True:
+            with runtime_lock:
+                _runtime_guard.set_desired('production')
+                _runtime_guard.observe(True,datetime.now(tz=budapest_tz))
+            return {'ok':True,'message':'Miner already replies to ping; no start pulse sent'}
+        if first is None:
+            return {'ok':False,'message':'Ping status uncertain; start pulse withheld'}
+        if _runtime_guard.start_after and datetime.now(tz=budapest_tz)-_runtime_guard.start_after<timedelta(seconds=90):
+            return {'ok':True,'message':'Start already sent; waiting for boot ping'}
+        second=ping_host(_runtime_guard.address)
+        if second is None:
+            return {'ok':False,'message':'Ping status uncertain; start pulse withheld'}
+        with runtime_lock:
+            _runtime_guard.set_desired('production')
+            _runtime_guard.observe(first,datetime.now(tz=budapest_tz))
+            _runtime_guard.observe(second,datetime.now(tz=budapest_tz))
+        if second is True:
+            return {'ok':True,'message':'Miner already replies to ping; no start pulse sent'}
+        sent=press_power_button(16,POWER_BUTTON_SHORT_PRESS_SECONDS)
+        return {'ok':bool(sent),'message':'Start pulse sent; waiting for ping' if sent else 'Start GPIO failed'}
+
+
+def _request_miner_stop():
+    with runtime_lock:
+        _runtime_guard.set_desired('stop')
+    physical=_runtime_tick()
+    return {'ok':physical['state'] in ('stop_pending','off'),
+            'message':f"Long STOP / ping verification: {physical['state']} · {physical['reason']}"}
 
 
 def _update_pool_hashrate(now: datetime) -> None:
@@ -1530,7 +1565,9 @@ def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum, po
             data = fetch_current_data(token) or {}
     except Exception as err:
         print(f"[Safety monitoring] Solarman read unavailable: {type(err).__name__}")
-    supervise_runtime_by_power(now, "stop", data, poll_interval_seconds=poll_interval_seconds)
+    with runtime_lock:
+        _runtime_guard.set_desired('stop')
+    record_live_power(now, "stop", data, poll_interval_seconds=poll_interval_seconds)
     dl = data.get("dataList", []) if isinstance(data, dict) else []
     dl = [item for item in dl if isinstance(item, dict)] if isinstance(dl, list) else []
     readings = {
@@ -1616,7 +1653,7 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         decision = _make_miner_decision(now,prev_state or 'stop',battery_charge,current_power,
             inv_l1,inv_l2,inv_l3,inv_lt,current_condition,clouds,f1_cond,f1_clouds,f3_cond,f3_clouds,
             sunrise,sunset,{}, {},battery_voltage,battery_ah,weather_outlook,
-            current_load=(live_sample.total if MinerPowerGuard.fresh(live_sample,now) else float("nan")))
+            current_load=(live_sample.total if PowerSample.fresh(live_sample,now) else float("nan")))
         hist = decision['history_hints']
         hist = _merge_decision_into_hints(hist,decision,{
             'allow_start':decision['desired_state']=='production','reason':hist['energy_budget']['reason'],
@@ -1636,20 +1673,25 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         print(f"Battery charge: {battery_charge}% | PV: {current_power}W | Internal: {internal_power}W")
         print(f"Inverter output per phase: L1={int(inv_l1)}W, L2={int(inv_l2)}W, L3={int(inv_l3)}W, Total={int(inv_lt)}W")
 
+        with runtime_lock:
+            if not _runtime_guard.set_desired(state):
+                state='stop'
+                hist['decision_summary']='STOP: outstanding ping shutdown verification'
+        start_result=None
+        if state == "production" and is_rpi:
+            start_result=_ensure_miner_started()
         if state == "production" and prev_state != "production":
             _last_production_start_at = now
             print("Crypto production ready!")
-            if is_rpi and _power_guard.runtime_state not in ('running','starting'):
-                press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
             live=_build_snapshot_payload()
             live.update(state=state,battery=battery_charge,power=current_power,historical_hints=hist,
                         inv_l1=inv_l1,inv_l2=inv_l2,inv_l3=inv_l3,inv_lt=inv_lt)
-            send_telegram_message_async('▶ Bányagép indítási jel elküldve.\n'+telegram_status(live,now),mirror_web=True)
+            send_telegram_message_async('▶ '+(start_result['message'] if start_result else 'RUN döntés; GPIO-jel nem lett küldve ezen a gépen.')+'\n'+telegram_status(live,now),mirror_web=True)
         elif state == "stop" and prev_state != "stop":
             _last_production_start_at = None
             live=_build_snapshot_payload()
             live.update(state=state,battery=battery_charge,power=current_power,historical_hints=hist)
-            send_telegram_message_async('⏹ Leállítás kérve; azonosított minerterhelésnél hosszú gombnyomás és fogyasztási visszaellenőrzés következik. A gép még nincs leálltnak igazolva.\n'+telegram_status(live,now),mirror_web=True)
+            send_telegram_message_async('⏹ Leállítás kérve; pinggel elérhető minernél hosszú gombnyomás és pinges visszaellenőrzés következik. A gép még nincs leálltnak igazolva.\n'+telegram_status(live,now),mirror_web=True)
 
         if state != prev_state:
             prev_state = state
@@ -1677,20 +1719,13 @@ def _miner_action(action: str) -> Dict[str, Any]:
     now = datetime.now(tz=budapest_tz).isoformat()
     if action not in {"start", "stop", "force_stop"}:
         return {"ok": False, "message": "invalid action", "ts": now}
-    duration = POWER_BUTTON_SHORT_PRESS_SECONDS if action == "start" else POWER_BUTTON_LONG_PRESS_SECONDS
-
-    if not is_rpi:
-        msg = "GPIO unavailable (not Raspberry Pi runtime)"
-        _push_web_notification(f"❌ {action}: {msg}", level="error")
-        return {"ok": False, "message": msg, "ts": now}
-
+    if not (is_rpi and GPIO_AVAILABLE):
+        return {'ok':False,'message':'GPIO unavailable','ts':now}
     try:
-        if not press_power_button(16, duration):
-            raise RuntimeError("GPIO command was not sent")
-        msg = f"{action} signal sent ({duration}s)"
-        _push_web_notification(f"✅ GUI action: {msg}", level="success")
-        send_telegram_message_async(f"GUI action: {msg}", max_retries=4, keyboard=True, mirror_web=False)
-        return {"ok": True, "message": msg, "ts": now}
+        result=_ensure_miner_started(manual=True) if action=='start' else _request_miner_stop()
+        _push_web_notification(result['message'],level='info' if result['ok'] else 'error')
+        return {**result,'ts':now}
+
     except Exception as err:
         err_msg = str(err)
         _push_web_notification(f"❌ {action}: {err_msg}", level="error")
@@ -1828,7 +1863,7 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 <dialog id="datePicker" class="date-picker" aria-label="Dátum kiválasztása"><div class="calendar-nav"><button type="button" id="calendarPrevious" aria-label="Előző hónap">‹</button><select id="calendarYear" aria-label="Év"></select><select id="calendarMonth" aria-label="Hónap"></select><button type="button" id="calendarNext" aria-label="Következő hónap">›</button><button type="button" id="calendarClose" aria-label="Naptár bezárása">×</button></div><div class="calendar-grid calendar-week"><span>H</span><span>K</span><span>Sze</span><span>Cs</span><span>P</span><span>Szo</span><span>V</span></div><div id="calendarDays" class="calendar-grid"></div></dialog>
 <div class="charts"><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-solar-panel"></i> <span id="powerChartTitle"></span></div><div id="powerChartSub" class="chart-sub"></div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-bolt"></i> <span id="consumptionChartTitle"></span></div><div id="consumptionChartSub" class="chart-sub"></div></div><canvas id="consumptionChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> <span id="batteryChartTitle"></span></div><div id="batteryChartSub" class="chart-sub"></div></div><canvas id="batteryChart"></canvas></div></div></div><script>
 let currentLang=localStorage.getItem('solar-lang')||'en',currentRange={},lastData,charts={},rangeInitialized=false;
-const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Power safety',decision:'Decision',minimum:'Minimum SOC during planned run/refill',end:'SOC at sunset after planned mining stop',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Week reference coverage',floor:'Protected SOC floor',reserve:'Household night reserve',planned:'Planned mining stop',cover:'Sustained solar cover',bridge:'PV deficit to cover / available battery (margin included)',startup:'Startup energy / total start budget',bridgeTime:'Time to sustained cover',houseOnly:'Sunset SOC without mining',houseLoad:'Household load assumed in forecast',noCover:'No sustained cover forecast; bridge unavailable',uncertainPV:'Not estimable from curtailed PV',bufferPV:'Delivered-PV scenario energy',bufferMinimum:'Worst-case SOC at stop (zero PV)',bufferBudget:'Bounded run budget / battery above reserve',bufferMode:'Near-full battery · bounded surplus run',bufferNote:'Zero export: measured PV may follow load when the battery is full. This short run is funded from battery energy above 90%, even assuming zero PV; the sunset SOC cannot be reliably inferred from curtailed PV. Reassess every 5 minutes.',source:'Provided solarman_json history · live phase plots use RAM only',load:'Consumption',measured:'Selected power measurement',collected:'Device collection time',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Fogyasztási védelem',decision:'Döntés',minimum:'Minimum SOC a tervezett futás/visszatöltés alatt',end:'Napnyugtai SOC a tervezett leállítás után',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Heti referencia lefedettsége',floor:'Védett SOC minimum',reserve:'Éjszakai háztartási tartalék',planned:'Tervezett bányászleállítás',cover:'Tartós napenergia-fedezet',bridge:'PV-hiány fedezetig / elérhető akku (ráhagyással)',startup:'Indítási energia / teljes indítási keret',bridgeTime:'Idő a tartós solar fedezetig',houseOnly:'Napnyugtai SOC bányászat nélkül',houseLoad:'Háztartási terhelés a becslésben',noCover:'Nincs előre jelzett tartós fedezet; bridge nem számítható',uncertainPV:'Visszafogott PV-ből nem becsülhető',bufferPV:'Leadott PV szerinti forgatókönyv',bufferMinimum:'Legrosszabb SOC leálláskor (PV nélkül)',bufferBudget:'Rövid futás kerete / tartalék feletti akku',bufferMode:'Közel tele akku · korlátozott többletfutás',bufferNote:'Nincs visszatáplálás: tele akkunál a mért PV követheti a terhelést. Ezt a rövid futást a 90% feletti akkukeret fedezi, akár nulla PV mellett; a napnyugtai SOC a visszafogott PV-ből nem becsülhető megbízhatóan. Újraszámítás 5 percenként.',source:'Megadott solarman_json előzmények · élő fázisgörbék csak RAM-ban',load:'Fogyasztás',measured:'Kiválasztott teljesítménymérés',collected:'Eszköz mérési ideje',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
+const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Miner ping verification',decision:'Decision',minimum:'Minimum SOC during planned run/refill',end:'SOC at sunset after planned mining stop',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Week reference coverage',floor:'Protected SOC floor',reserve:'Household night reserve',planned:'Planned mining stop',cover:'Sustained solar cover',bridge:'PV deficit to cover / available battery (margin included)',startup:'Startup energy / total start budget',bridgeTime:'Time to sustained cover',houseOnly:'Sunset SOC without mining',houseLoad:'Household load assumed in forecast',noCover:'No sustained cover forecast; bridge unavailable',uncertainPV:'Not estimable from curtailed PV',bufferPV:'Delivered-PV scenario energy',bufferMinimum:'Worst-case SOC at stop (zero PV)',bufferBudget:'Bounded run budget / battery above reserve',bufferMode:'Near-full battery · bounded surplus run',bufferNote:'Zero export: measured PV may follow load when the battery is full. This short run is funded from battery energy above 90%, even assuming zero PV; the sunset SOC cannot be reliably inferred from curtailed PV. Reassess every 5 minutes.',source:'Provided solarman_json history · live phase plots use RAM only',load:'Consumption',measured:'Selected power measurement',collected:'Device collection time',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Miner pinges ellenőrzés',decision:'Döntés',minimum:'Minimum SOC a tervezett futás/visszatöltés alatt',end:'Napnyugtai SOC a tervezett leállítás után',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Heti referencia lefedettsége',floor:'Védett SOC minimum',reserve:'Éjszakai háztartási tartalék',planned:'Tervezett bányászleállítás',cover:'Tartós napenergia-fedezet',bridge:'PV-hiány fedezetig / elérhető akku (ráhagyással)',startup:'Indítási energia / teljes indítási keret',bridgeTime:'Idő a tartós solar fedezetig',houseOnly:'Napnyugtai SOC bányászat nélkül',houseLoad:'Háztartási terhelés a becslésben',noCover:'Nincs előre jelzett tartós fedezet; bridge nem számítható',uncertainPV:'Visszafogott PV-ből nem becsülhető',bufferPV:'Leadott PV szerinti forgatókönyv',bufferMinimum:'Legrosszabb SOC leálláskor (PV nélkül)',bufferBudget:'Rövid futás kerete / tartalék feletti akku',bufferMode:'Közel tele akku · korlátozott többletfutás',bufferNote:'Nincs visszatáplálás: tele akkunál a mért PV követheti a terhelést. Ezt a rövid futást a 90% feletti akkukeret fedezi, akár nulla PV mellett; a napnyugtai SOC a visszafogott PV-ből nem becsülhető megbízhatóan. Újraszámítás 5 percenként.',source:'Megadott solarman_json előzmények · élő fázisgörbék csak RAM-ban',load:'Fogyasztás',measured:'Kiválasztott teljesítménymérés',collected:'Eszköz mérési ideje',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
 const t=k=>words[currentLang][k]||k;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,u='',digits=0)=>v==null||!Number.isFinite(Number(v))?'—':Number(v).toFixed(digits)+u;
@@ -1911,7 +1946,7 @@ function render(d){lastData=d;
  for(const [id,[key,i]] of Object.entries(texts))document.getElementById(id).innerHTML=icon(i)+' '+esc(t(key));
  document.getElementById('lblFrom').textContent=t('from');document.getElementById('lblTo').textContent=t('to');document.getElementById('notifTitle').innerHTML=icon('fa-bell')+' '+t('notices');
  const physical=d.runtime?.state||'unknown';
- const states={hu:{running:'futás észlelve',starting:'indítás ellenőrzésre vár',off:'minerterhelés eltűnt',stop_pending:'leállítás ellenőrzésre vár',stop_failed:'LEÁLLÍTÁS NINCS IGAZOLVA',stop_unverified:'leállítás nem ellenőrizhető',unknown:'fizikai állapot ismeretlen'},en:{running:'running detected',starting:'start unconfirmed',off:'mining load absent',stop_pending:'shutdown pending verification',stop_failed:'SHUTDOWN UNCONFIRMED',stop_unverified:'shutdown unverifiable',unknown:'physical state unknown'}};
+ const states={hu:{running:'ping elérhető',starting:'indítás ellenőrzésre vár',off:'ping nem elérhető',stop_pending:'leállítás ellenőrzésre vár',stop_failed:'LEÁLLÍTÁS NINCS IGAZOLVA',stop_unverified:'leállítás nem ellenőrizhető',unknown:'fizikai állapot ismeretlen'},en:{running:'ping reachable',starting:'start unconfirmed',off:'ping unreachable',stop_pending:'shutdown pending verification',stop_failed:'SHUTDOWN UNCONFIRMED',stop_unverified:'shutdown unverifiable',unknown:'physical state unknown'}};
  const state=(states[currentLang]||states.en)[physical]||t('unknown');
  let metrics=card(t('state'),state,'fa-toggle-on',['stop_failed','stop_unverified'].includes(physical)?'runtime-alarm':'')+card(t('battery'),num(d.battery,'%'),'fa-battery-half')+card(t('pv'),num(d.power,' W'),'fa-solar-panel');
  metrics+=`<div class="card"><div class="k">${icon('fa-gauge-high')} ${t('hash')}</div><div class="v">${esc(d.hashrate_text||'N/A')}</div><div class="pool-meta"><a class="pool-link" href="https://unmineable.com/address/${encodeURIComponent(d.wallet_address)}?coin=USDT" target="_blank" rel="noopener noreferrer">unMineable · USDT ${icon('fa-arrow-up-right-from-square')}</a><span class="pool-note">${t('lag')}</span></div></div>`;
@@ -1922,7 +1957,7 @@ function render(d){lastData=d;
  const budget=b?card(t(buffered?'bufferMinimum':'minimum'),num(buffered?b.worst_case_stop_soc:b.minimum_soc,'%'),'fa-battery-quarter','hint-card')+card(t('end'),buffered?t('uncertainPV'):num(b.end_soc,'%'),'fa-battery-full','hint-card')+card(t(buffered?'bufferPV':'pvwh'),num(b.expected_pv_wh,' Wh'),'fa-solar-panel','hint-card')+card(t('loadwh'),num(b.expected_load_wh,' Wh'),'fa-bolt','hint-card')+card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+card(t('cover'),dateText(b.cover_time),'fa-sun','hint-card')+card(t('planned'),dateText(b.planned_stop),'fa-clock','hint-card')+card(t('bridge'),(b.required_bridge_wh==null?t('noCover'):num(b.required_bridge_wh,' Wh'))+' / '+num(b.available_bridge_wh,' Wh'),'fa-battery-half','hint-card')+card(t('startup'),num(b.startup_energy_wh,' Wh')+' / '+num(b.required_start_energy_wh,' Wh'),'fa-power-off','hint-card')+card(t('bridgeTime'),num(b.bridge_duration_minutes,' min',1),'fa-clock','hint-card')+card(t('houseOnly'),buffered?t('uncertainPV'):num(b.household_only_end_soc,'%'),'fa-house','hint-card')+card(t('houseLoad'),num(b.household_load_w,' W'),'fa-bolt','hint-card'):card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+`<div class="hint-card decision-card">${esc(d.monitoring_mode==='idle_safety'?t('idle'):t('waiting'))}</div>`;
  const bufferInfo=buffered?card(t('bufferBudget'),num(b.required_surplus_wh,' Wh')+' / '+num(b.available_surplus_wh,' Wh'),'fa-battery-half','hint-card')+`<p class="hint-sub">${esc(t('bufferNote'))}</p>`:'';
  const phase=[1,2,3].map(i=>card('INV L'+i,num(d['inv_l'+i],' W'),'fa-bolt','hint-card')).join('')+card(t('inverter'),num(d.inv_lt,' W'),'fa-gauge-high','hint-card')+card(t('temp'),num(d.garage_temp,' °C',1),'fa-temperature-half','hint-card')+card(t('hum'),num(d.garage_hum,'%'),'fa-droplet','hint-card');
- document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${buffered?t('bufferMode'):t('plan')}${b&&!b.safe?(currentLang==='hu'?' · elutasított futás előrejelzése':' · rejected-run forecast'):''}</h3><div class="hints-grid">${budget}${bufferInfo}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div><div class="hint-sub">${currentLang==='hu'?'Kívánt állapot':'Requested state'}: ${esc(d.state||'unknown')} · ${currentLang==='hu'?'Hosszú STOP kísérletek':'Long STOP attempts'}: ${d.runtime?.attempts||0}/${d.runtime?.max_attempts||2}</div>${meter?`<div class="hint-sub">${t('measured')}: ${num(meter.total,' W')} · L1 ${num(meter.l1,' W')} / L2 ${num(meter.l2,' W')} / L3 ${num(meter.l3,' W')}</div><div class="hint-sub">${t('collected')}: ${esc(dateText(meter.at))}</div>`:''}<div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):String(d.power_measurement_source||'').startsWith('consumption')?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
+ document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${buffered?t('bufferMode'):t('plan')}${b&&!b.safe?(currentLang==='hu'?' · elutasított futás előrejelzése':' · rejected-run forecast'):''}</h3><div class="hints-grid">${budget}${bufferInfo}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div><div class="hint-sub">Ping: ${esc(d.runtime?.target_ip||'192.168.0.185')} · ${esc(dateText(d.runtime?.checked_at))}</div><div class="hint-sub">${currentLang==='hu'?'Kívánt állapot':'Requested state'}: ${esc(d.runtime?.desired_state&&d.runtime.desired_state!=='unknown'?d.runtime.desired_state:d.state||'unknown')} · ${currentLang==='hu'?'Hosszú STOP kísérletek':'Long STOP attempts'}: ${d.runtime?.attempts||0}/${d.runtime?.max_attempts??'∞'}</div>${meter?`<div class="hint-sub">${t('measured')}: ${num(meter.total,' W')} · L1 ${num(meter.l1,' W')} / L2 ${num(meter.l2,' W')} / L3 ${num(meter.l3,' W')}</div><div class="hint-sub">${t('collected')}: ${esc(dateText(meter.at))}</div>`:''}<div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):String(d.power_measurement_source||'').startsWith('consumption')?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
  const notices=Array.isArray(d.notifications)?d.notifications:[];
  document.getElementById('notifList').innerHTML=notices.length?notices.slice(0,5).map(n=>`<div class="notice-item ${['info','warn','error','success'].includes(n.level)?n.level:'info'}"><div class="notice-meta">${esc(dateText(n.ts))}</div><div>${esc(String(n.message||'').replace(/(\d{4})-(\d{2})-(\d{2})(T| )?/g,(_,y,m,day,sep)=>`${y}.${m}.${day}.${sep?' ':''}`))}</div></div>`).join(''):`<div class="notice-empty">${t('empty')}</div>`;
  const coverage=document.getElementById('historyCoverage');coverage.className='panel history-coverage'+(d.history_count?'':' empty');coverage.textContent=(currentLang==='hu'?'Betöltött előzmények: ':'Loaded history: ')+huDate(d.history_available_from)+' – '+huDate(d.history_available_to)+' · '+d.history_files+' JSON · '+d.history_total_count+' '+t('samples')+(d.history_count?'':(currentLang==='hu'?' · A kiválasztott időszakhoz nincs betöltött mérés. Ellenőrizd az előzménykönyvtárat.':' · No loaded measurements in the selected period. Check the history directory.'));
@@ -1995,8 +2030,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
             filtered_hist.append(item)
 
     filtered_hist.sort(key=lambda x: str(x.get("ts", "")))
-    with power_guard_lock:
-        runtime=_power_guard.status(now)
+    with runtime_lock:
+        runtime=_runtime_guard.status(now)
 
     return {
         "battery": snap.get("battery", 0),
@@ -2015,14 +2050,15 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "hashrate_hs": snap.get("hashrate_hs"),
         "hashrate_mhs": snap.get("hashrate_mhs"),
         "hashrate_text": _format_hashrate(snap.get("hashrate_hs")),
-        "power_guard_reason": _power_measurement_error or _power_guard.reason,
+        "power_guard_reason": runtime['reason'],
+        "power_measurement_error":_power_measurement_error,
         "power_measurement_source": _latest_power_sample.source if _latest_power_sample else None,
         "power_measurement": ({"total": _latest_power_sample.total,
                                "l1": _latest_power_sample.l1,
                                "l2": _latest_power_sample.l2,
                                "l3": _latest_power_sample.l3,
                                "at": _latest_power_sample.at.isoformat(),
-                               "fresh": MinerPowerGuard.fresh(_latest_power_sample, now)}
+                               "fresh": PowerSample.fresh(_latest_power_sample, now)}
                               if _latest_power_sample else None),
         "monitoring_mode": snap.get("monitoring_mode", "production_window"),
         "solarman_polled_at": snap.get("solarman_polled_at"),
@@ -2183,6 +2219,10 @@ def main_loop():
         historical_profile = build_historical_profile(HISTORY_DIR)
 
 
+    prev_state,uptime=load_prev_state()
+    with runtime_lock:
+        _runtime_guard.set_desired(prev_state)
+    threading.Thread(target=_ping_monitor_loop,name='miner-ping-monitor',daemon=True).start()
     used_quote = load_quote_usage()
     (current_condition, sunrise, sunset, clouds,
      f1_cond, f1_clouds, f1_ts,
@@ -2317,7 +2357,7 @@ def main_loop():
                     raw_data = fetch_current_data(token)
                 data = raw_data or {}
                 if not _has_solarman_payload(data):
-                    supervise_runtime_by_power(now,state or 'unknown',{},poll_interval_seconds=solar_interval)
+                    record_live_power(now,state or 'unknown',{},poll_interval_seconds=solar_interval)
                     print('[History model] Live data unavailable; keeping controller state without new GPIO decisions.')
                     sleep_until_next_5min(offset_seconds=60)
                     continue
@@ -2328,7 +2368,7 @@ def main_loop():
                     data, WEATHER_API, LOCATION_LAT, LOCATION_LON
                 )
                 # Hardware supervision uses only this fresh API response.
-                supervise_runtime_by_power(now, state or "unknown", raw_data or {}, poll_interval_seconds=solar_interval)
+                record_live_power(now, state or "unknown", raw_data or {}, poll_interval_seconds=solar_interval)
 
                 # update shared snapshot for telegram thread
                 with snapshot_lock:
@@ -2380,6 +2420,8 @@ def main_loop():
              f3_cond, f3_clouds, f3_ts, weather_outlook) = get_current_weather(WEATHER_API, LOCATION_LAT, LOCATION_LON)
 
             state = "stop"
+            with runtime_lock:
+                _runtime_guard.set_desired('stop')
             if prev_state != "stop":
                 prev_state = state
                 uptime = now

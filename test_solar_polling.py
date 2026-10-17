@@ -3,7 +3,8 @@ import unittest
 from unittest.mock import patch
 
 from test_idle_monitoring import solar, SUNSET
-from miner_power_guard import MinerPowerGuard, PowerSample
+from power_measurement import PowerSample
+from miner_ping_guard import MinerPingGuard
 
 
 class SolarPollingTests(unittest.TestCase):
@@ -52,29 +53,7 @@ class SolarPollingTests(unittest.TestCase):
             self.assertEqual(solar._solarman_poll_slot(stop+timedelta(minutes=30),dawn,stop)[0],300)
             self.assertEqual(solar._solarman_poll_slot(SUNSET,dawn,stop)[0],1800)
 
-    def test_half_hour_guard_stops_on_first_fresh_match_without_reusing_old_data(self):
-        guard=MinerPowerGuard()
-        for minute in (0,30,60):
-            at=SUNSET+timedelta(minutes=minute)
-            off=PowerSample(at,400,100,100,200)
-            guard.observe(off,at,'stop',poll_interval_seconds=1800)
-        guard.command_start(off,off.at+timedelta(seconds=1))
-        self.assertIsNotNone(guard.started)
-        for minute in (90,120):
-            at=SUNSET+timedelta(minutes=minute)
-            guard.observe(PowerSample(at,1200,100,550,550),at,'production',poll_interval_seconds=1800)
-        self.assertIsNotNone(guard.signature)
-        results=[]
-        for minute in (150,180,210):
-            at=SUNSET+timedelta(minutes=minute)
-            results.append(guard.observe(PowerSample(at,1200,100,550,550),at,'stop',poll_interval_seconds=1800))
-        self.assertEqual(results,[True,True,False])
 
-    def test_half_hour_cadence_does_not_make_half_hour_old_samples_fresh(self):
-        guard=MinerPowerGuard()
-        sample=PowerSample(SUNSET,1200,100,550,550)
-        self.assertFalse(guard.observe(sample,SUNSET+timedelta(minutes=30),'stop',poll_interval_seconds=1800))
-        self.assertIsNone(guard.last_at)
 
 
 if __name__=='__main__':

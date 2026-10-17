@@ -4,8 +4,8 @@ import unittest
 from unittest.mock import patch
 from history_model import LOCAL, plan
 from simulate_decisions import solar
-from miner_power_guard import MinerPowerGuard
-from test_miner_power_guard import armed_guard, sample
+from power_measurement import PowerSample
+from power_test_helpers import sample
 from status_messages import status
 
 
@@ -94,28 +94,15 @@ class CadenceTests(unittest.TestCase):
     def test_six_minute_upload_plus_request_jitter_is_fresh_consistently(self):
         s=sample(0)
         now=s.at+timedelta(seconds=360.9)
-        self.assertTrue(MinerPowerGuard.fresh(s,now))
+        self.assertTrue(PowerSample.fresh(s,now))
         self.assertIsNone(solar._power_measurement_reason({},s,now))
         for age in (420.1,600):
             now=s.at+timedelta(seconds=age)
-            self.assertFalse(MinerPowerGuard.fresh(s,now))
+            self.assertFalse(PowerSample.fresh(s,now))
             self.assertIn('maximum 420',solar._power_measurement_reason({},s,now))
-        self.assertFalse(MinerPowerGuard.fresh(s,s.at-timedelta(seconds=1)))
+        self.assertFalse(PowerSample.fresh(s,s.at-timedelta(seconds=1)))
 
-    def test_one_cached_upload_does_not_destroy_identified_phase_signature(self):
-        guard=armed_guard()
-        cached=sample(20)
-        self.assertFalse(guard.observe(cached,cached.at+timedelta(seconds=360.9),'stop'))
-        self.assertIsNotNone(guard.signature)
-        fresh=sample(30)
-        self.assertTrue(guard.observe(fresh,fresh.at,'stop'))
-        self.assertFalse(guard.observe(fresh,fresh.at,'stop'))
 
-    def test_longer_gap_still_disarms_instead_of_reusing_identity(self):
-        guard=armed_guard()
-        fresh=sample(35)
-        self.assertFalse(guard.observe(fresh,fresh.at,'stop'))
-        self.assertIsNone(guard.signature)
 
 
 class ReportedNearFullTests(unittest.TestCase):
