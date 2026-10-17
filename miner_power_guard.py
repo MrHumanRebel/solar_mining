@@ -100,7 +100,10 @@ class MinerPowerGuard:
             if (now - self.started).total_seconds() > self.learning_timeout_seconds:
                 self.disarm("No identifiable two-phase mining load after start")
                 return False
-            # 3x <=150 W GPUs on one phase; 2x GPUs + CPU on the other.
+            # OC samples report ~546–548 W for all five GPUs (~98–125 W each).
+            # The existing split bounds include ~350–380 W AC per phase for
+            # 3 GPUs versus 2 GPUs + Ryzen/board/fans, with PSU losses.
+            # Retain headroom for variation; learn the actual per-run rise.
             # Either L2/L3 assignment is accepted; only a bounded paired rise
             # after our start can arm the guard (not a sustained oven load).
             valid_split = ((250 <= delta[1] <= 550 and 200 <= delta[2] <= 650)

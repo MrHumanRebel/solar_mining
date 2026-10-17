@@ -41,6 +41,7 @@ def status(snapshot,now,quote_used=None,quote_limit=None):
     lines=[f"☀ Solar Mining · {stamp(now)}",
            f"Állapot: {snapshot.get('state','ismeretlen')} · PV: {number(snapshot.get('power'),' W')} · Akku: {number(snapshot.get('battery'),'%')}",
            f"Időjárás: {snapshot.get('current_condition','—')}",
+           f"Teljes miner tervezési fogyasztása: {number(snapshot.get('miner_power_w'),' W')} (becslés, nem konnektoros mérés)",
            f"Pool hashráta: {snapshot.get('hashrate_text') or '—'} (késhet; csak kijelzés)",
            '',phases(snapshot),'',
            f"📈 {week.get('week','—')}. heti referencia · évek: {', '.join(map(str,week.get('years',[]))) or '—'}",

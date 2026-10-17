@@ -56,7 +56,9 @@ MINING_WORKER = os.getenv("MY_MINING_WORKER", "solarminer").strip()
 HISTORY_DIR = os.getenv('MY_HISTORY_DIR', 'solarman_json')
 BATTERY_CAPACITY_AH = float(os.getenv("MY_BATTERY_CAPACITY_AH", "200"))
 BATTERY_NOMINAL_V = float(os.getenv("MY_BATTERY_NOMINAL_V", "55.2"))
-MINER_POWER_W = float(os.getenv("MY_MINER_POWER_W", "1050"))
+# OC GPUs report ~548 W DC; board/CPU/RAM/SSD/fans + PSU losses need headroom.
+# 750 W is a conservative whole-rig AC estimate, not a wall-meter reading.
+MINER_POWER_W = float(os.getenv("MY_MINER_POWER_W", "750"))
 BATTERY_FLOOR_SOC = float(os.getenv("MY_BATTERY_FLOOR_SOC", "20"))
 HIGH_SOC_STOP_SOC = float(os.getenv("MY_HIGH_SOC_STOP_SOC", "90"))
 AFTERNOON_PV_STOP_W = float(os.getenv("MY_AFTERNOON_PV_STOP_W", "50"))
@@ -1986,6 +1988,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "weekly_reference": _weekly_reference(now),
         "live_power": live_power,
         "live_power_window_hours":24,
+        "miner_power_w":MINER_POWER_W,
         "afternoon_cutoff":{"hour":HARD_AFTERNOON_STOP_HOUR,"soc":HARD_AFTERNOON_STOP_SOC,"pv_w":AFTERNOON_PV_STOP_W},
         "history_source": "solarman_json",
         "history_selected_from": start_ts.date().isoformat(),

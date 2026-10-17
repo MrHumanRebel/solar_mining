@@ -79,7 +79,16 @@ presses based on household load.
 
 Daytime demand comes from the current measured consumption and the configured
 rig allowance, counted once. `MY_MINER_POWER_W` is the whole-rig power
-allowance (default 1050 W), including GPUs, CPU and PSU losses. Historical daytime consumption may already include
+allowance (default **750 W**), including GPUs, CPU and PSU losses.
+The supplied OC screenshots report 545.4–548.0 W for the five GPUs. For the
+Ryzen 3 3100, motherboard, 8 GB RAM, M.2 SSD and eight fans, allow roughly
+80–120 W combined beyond GPU readings. At an assumed 90% PSU efficiency that
+means about 695–742 W AC; 750 W is a conservative planning estimate, not a
+measured wall load. Set `MY_MINER_POWER_W` to a measured whole-rig AC value when
+available; an existing explicit `.env` override takes precedence over this default.
+This same allowance drives bridge/refill, cover times and running-load subtraction.
+It does not change the physical guard's >1000 W total threshold or replace its
+witnessed L2/L3 signature. Historical daytime consumption may already include
 the miner and is never added to it again. While running, subtracting the rig
 allowance to estimate the household-only refill period is an explicit load
 estimate, not evidence about historical appliance states.
