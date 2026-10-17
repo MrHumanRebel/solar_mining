@@ -30,6 +30,36 @@ def armed_guard(swap=False):
 
 
 class PowerGuardTests(unittest.TestCase):
+    def test_oc_rig_720w_paired_rise_is_identified_in_both_phase_assignments(self):
+        for swap in (False,True):
+            with self.subTest(swap=swap):
+                guard=MinerPowerGuard()
+                for minute in (0,5,10):
+                    off=sample(minute,400,100,100,200)
+                    guard.observe(off,off.at,'stop')
+                guard.command_start(off,off.at+timedelta(seconds=1))
+                l2,l3=(350,370) if swap else (370,350)
+                for minute in (15,20):
+                    run=sample(minute,1120,100,100+l2,200+l3)
+                    self.assertFalse(guard.observe(run,run.at,'production'))
+                self.assertEqual(guard.signature,(l2,l3))
+                stop=sample(25,1120,100,100+l2,200+l3)
+                self.assertTrue(guard.observe(stop,stop.at,'stop'))
+                self.assertFalse(guard.observe(stop,stop.at,'stop'))
+
+    def test_oc_rig_does_not_lower_existing_1000w_shutdown_threshold(self):
+        guard=MinerPowerGuard()
+        for minute in (0,5,10):
+            off=sample(minute,200,20,80,100)
+            guard.observe(off,off.at,'stop')
+        guard.command_start(off,off.at+timedelta(seconds=1))
+        for minute in (15,20):
+            run=sample(minute,920,20,450,450)
+            guard.observe(run,run.at,'production')
+        self.assertIsNotNone(guard.signature)
+        stop=sample(25,920,20,450,450)
+        self.assertFalse(guard.observe(stop,stop.at,'stop'))
+
     def test_known_stopped_rig_load_never_arms_without_observed_start(self):
         rows=json.loads((Path(__file__).parent/'tests/fixtures/stopped_rig_oct16.json').read_text())
         guard=MinerPowerGuard()
