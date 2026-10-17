@@ -11,34 +11,80 @@ startup; it never updates them or creates a replacement measurement archive.
 There is no `solarminer_json` recorder, telemetry backup, persisted live-data
 cache, or learning from controller-generated recordings.
 
-The model validates exported PV, total consumption and SOC, normalizes export
-UTC offsets to Europe/Budapest, and combines duplicate timestamps by median.
-Future records are excluded. Invalid records are counted and skipped.
+The model uses every nonduplicate timestamp from every available export, including
+both the host and bundled directories. UTC offsets are normalized to
+Europe/Budapest. Conflicting readings use the median of **distinct** values per
+channel, so copying a file cannot overweight it. A bad SOC value does not discard
+otherwise valid PV/consumption at that timestamp. Invalid fields are counted;
+source files and raw chart measurements are never modified.
 
-For the current month and neighboring months it builds hourly lower-quartile
-PV and upper-quartile total-consumption profiles. Missing months can borrow
-nearby seasons (up to two months away) with an additional PV discount; opposite
-seasons cannot substitute. At least three historical days and coverage of each
-forecast hour are required. Historical consumption includes the whole household;
-the exports do not identify the miner, individual appliances or phase loads.
+Historical control references are grouped by **ISO calendar week across all
+available years**, without borrowing neighboring weeks or months. Each day first
+contributes a median per 15-minute slot; those daily values are averaged with
+equal day weights. Five-point checks replace isolated PV/SOC excursions only
+when two nearby readings on each side agree (within a total 20-minute window).
+Sustained clouds remain. Internal gaps of at most one hour are interpolated and
+marked; longer gaps and unobserved edges stay missing. The plots show means,
+25–75% bands, contributing days, years and corrected-outlier counts.
 
-Every live control cycle evaluates a candidate mining run in five-minute energy
-steps through the existing production-stop window (90 minutes before actual
-sunset). Demand is the greater of historical aggregate demand and current total
-consumption plus the rig allowance when starting. It does not add the miner to
-historical aggregate load again. PV forecasts are reduced by uncertain weather
-and weak current production, never boosted above the historical baseline.
+The current week's PV curve supplies W versus clock time, typical production
+start, peak, energy and miner-only cover time. The SOC curve supplies charge
+start and a typical bridge discharge estimate, anchored to today's measured
+battery capacity. It can increase caution under uncertain weather, but cannot
+create available energy or override live readings. Historical consumption is
+for display only; it is never treated as household-only load or miner identity.
 
-The energy budget includes startup energy, charge/discharge losses, battery
-capacity from measured/configured Ah × V, battery saturation, the protected SOC
-floor and evening reserve. A start needs enough time for the minimum run and a
-budget that protects both reserves. A running rig receives a STOP decision when
-the budget fails. Missing history, invalid or stale live consumption prevents
-new starts. No saved JSON substitutes for a failed API response.
+The planner evaluates three stages every live control cycle:
 
-The model is a conservative estimate, not a guarantee of future sunshine or
-household demand. The simulator below exercises scenarios; it cannot reconstruct
-counterfactual battery behavior or establish physical miner states.
+1. Bridge from the current PV output to sustained solar cover, allowing a start
+   before PV fully covers the rig and household. Available battery energy above
+   the protected SOC floor must cover the deficit, startup energy and a 25%
+   bridge margin. A new morning start needs sustained solar cover before its
+   planned stop; the available Wh determine whether the bridge is affordable. A running rig or an afternoon start can use a finite battery budget
+   without waiting for another solar peak, provided the night reserve is safe.
+2. Choose a finite mining run (at least the minimum run duration for a new
+   start), ending no later than the existing production stop, 90 minutes before
+   astronomical sunset. Search for an earlier stop when needed; do not assume
+   the miner must run all day to be allowed to start.
+3. Forecast household-only demand and battery refill after the planned stop,
+   through actual sunset. Production preserves a default 90% sunset household
+   reserve (`MY_HARD_AFTERNOON_STOP_SOC`). This target can cause an earlier
+   mining stop when the measured SOC is below full charge; it does not require
+   100% SOC to start. No historical consumption is extrapolated into night load.
+
+Independently, from 14:00 onward, if PV disappears (default ≤50 W) and measured
+SOC is **below 90%**, immediately request STOP. Defaults are exposed as
+`MY_HARD_AFTERNOON_STOP_HOUR`, `MY_AFTERNOON_PV_STOP_W` and
+`MY_HARD_AFTERNOON_STOP_SOC`. The physical power guard must still identify the
+running miner before pressing its button; the rule does not authorize blind
+presses based on household load.
+
+Daytime demand comes from the current measured consumption and the configured
+rig allowance, counted once. `MY_MINER_POWER_W` is the whole-rig power
+allowance (default 1050 W), including GPUs, CPU and PSU losses. Historical daytime consumption may already include
+the miner and is never added to it again. While running, subtracting the rig
+allowance to estimate the household-only refill period is an explicit load
+estimate, not evidence about historical appliance states.
+
+The existing free three-hour weather forecast is retained with its timestamps
+and applied to the matching part of the day. Clear, mixed and wet forecasts use
+different weekly PV quantiles. Current measured PV constrains the immediate
+bridge; its influence fades over one hour instead of multiplying down the whole
+day's forecast. No additional Solarman or weather requests are introduced.
+
+The dashboard labels the minimum SOC and sunset SOC for the finite proposed
+run/refill scenario, shows solar-cover time, planned mining stop, required versus
+available bridge energy and protected evening reserve. If a start is rejected,
+the projections are explicitly labelled as a rejected-run scenario; missing
+inputs are unavailable rather than artificial zeros. A zero can still mean an
+unsafe candidate would actually exhaust the battery. STOP reasons identify the
+failed bridge, solar cover, missing coverage or night-reserve condition.
+
+The energy model includes battery capacity from Ah × V, battery saturation,
+startup cost and charge/discharge losses. It remains an estimate: future clouds
+and household demand can differ. It is recalculated at each live sample, while
+the separate power guard controls whether a physical shutdown is authorized.
+Missing or stale API data never substitutes a saved JSON measurement.
 
 ## Hardware shutdown and API cadence
 
@@ -74,10 +120,36 @@ updates do not trigger extra Solarman polling.
 
 ## Dashboard
 
+Two separate current-week reference plots have fixed 00:00–24:00 axes: PV in W
+and battery SOC in %. They always show this calendar week's cross-year curve,
+independent of the history date filter. Four additional live plots show actual
+L1, L2, L3 and SUM in W over the last 24 hours. The supplied exports contain no
+historical phase columns: these plots use a bounded 288-point RAM buffer,
+cleared on restart or meter-source changes, **never saved to JSON**. Fresh device
+timestamps are deduplicated. Historical SUM remains date-filterable alongside
+historical PV and SOC; no historical phases are fabricated.
+
+Telegram `/now` and automatic run/stop messages use the same live plan and weekly
+references as the GUI, including bridge Wh, cover/stop time, projected SOC,
+evening reserve and the afternoon cutoff. `/phase` shows the selected true
+meter phases and device time. Pool rate is explicitly display-only and may lag.
+Neither command triggers an extra Solarman request.
+
 Live metrics, pool hashrate (also while idle), the decision and energy budget are
 shown separately from the supplied historical charts. Historical PV, consumption
 and SOC come solely from the exports; historical miner states and phases are
-not invented. `/api/history/download` returns the normalized supplied history
+not invented. Dates always use Hungarian order (`YYYY.MM.DD.`) and
+Europe/Budapest time, even under an English/US browser locale. Both the input
+and calendar icon open the calendar dialog; the calendar uses Hungarian month
+names and Monday-first weekdays. API range queries accept ISO `YYYY-MM-DD` or
+Hungarian dates and reject malformed/inverted ranges instead of silently
+replacing them. Empty selections show the actual loaded date coverage.
+
+The image keeps its complete exports in `/app/bundled_solarman_json`, outside
+the host mount at `/app/solarman_json`. The loader reads and deduplicates both,
+so an older 11-file host directory cannot hide the newer bundled exports. The
+bundled history is refreshed by updating the image; no data is downloaded or
+recorded at runtime. `/api/history/download` returns the normalized supplied history
 without saving it. The old telemetry download endpoint has been removed.
 
 ## Run on Raspberry Pi
@@ -120,7 +192,7 @@ skipped off the Pi. The tests use simulation defaults and mock external services
 do not launch the live main loop with production credentials for a replay.
 
 ```sh
-python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields
+python -m unittest -q test_history_model test_solar_polling test_idle_monitoring test_miner_power_guard test_mining_pool test_solarman_power_fields test_bridge_planning test_web_disconnect test_weekly_reference
 python simulate_decisions.py --history-dir solarman_json
 python simulate_decisions.py --history-dir solarman_json --date 2026-10-16
 ```
