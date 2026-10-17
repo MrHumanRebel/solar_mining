@@ -38,6 +38,7 @@ def status(snapshot,now,quote_used=None,quote_limit=None):
     week=snapshot.get('weekly_reference') or {}
     metrics=week.get('metrics') or {}
     cutoff=snapshot.get('afternoon_cutoff') or {}
+    buffered=budget.get('projection_mode')=='surplus_buffer_run'
     lines=[f"☀ Solar Mining · {stamp(now)}",
            f"Állapot: {snapshot.get('state','ismeretlen')} · PV: {number(snapshot.get('power'),' W')} · Akku: {number(snapshot.get('battery'),'%')}",
            f"Időjárás: {snapshot.get('current_condition','—')}",
@@ -55,11 +56,15 @@ def status(snapshot,now,quote_used=None,quote_limit=None):
            f"Bridge: {number(budget.get('required_bridge_wh'),' Wh')} szükséges / {number(budget.get('available_bridge_wh'),' Wh')} elérhető (a szükséges már tartalmazza a biztonsági ráhagyást)",
            f"Bridge időtartama: {number(budget.get('bridge_duration_minutes'),' perc',1)} · csak a mostantól a tartós PV-fedezetig tartó hiány",
            f"Indítás: {number(budget.get('startup_energy_wh'),' Wh')} · teljes indulási keret ráhagyással: {number(budget.get('required_start_energy_wh'),' Wh')}",
-           f"Háztartási terhelési feltételezés: {number(budget.get('household_load_w'),' W')} · napnyugtai SOC bányászat nélkül: {number(budget.get('household_only_end_soc'),'%')}",
+           f"Háztartási terhelési feltételezés: {number(budget.get('household_load_w'),' W')} · napnyugtai SOC bányászat nélkül: {'visszafogott PV-ből nem becsülhető' if buffered else number(budget.get('household_only_end_soc'),'%')}",
            f"Heti SOC-görbe szerinti bridge: {number(budget.get('historical_bridge_wh'),' Wh')} · csak kiegészítő becslés",
            f"Tartós PV-fedezet: {stamp(budget.get('cover_time'))} · tervezett leállás: {stamp(budget.get('planned_stop'))}",
-           f"Minimum / záró SOC: {number(budget.get('minimum_soc'),'%')} / {number(budget.get('end_soc'),'%')}",
+           (f"Futás alatti minimum SOC: {number(budget.get('run_minimum_soc'),'%')} · napnyugtai SOC: visszafogott PV-ből nem becsülhető" if buffered else f"Minimum / záró SOC: {number(budget.get('minimum_soc'),'%')} / {number(budget.get('end_soc'),'%')}"),
            f"Háztartási éjszakai energiatartalék: {number(budget.get('reserve_soc'),'%')}"]
+    if budget.get('projection_mode')=='surplus_buffer_run':
+        lines += [f"Közel tele akku: korlátozott többletfutás, védett futásvégi SOC {number(budget.get('surplus_reserve_soc'),'%')}.",
+                  f"Nulla PV-vel számolt futásvégi SOC: {number(budget.get('worst_case_stop_soc'),'%')} · keret {number(budget.get('required_surplus_wh'),' Wh')} / {number(budget.get('available_surplus_wh'),' Wh')}",
+                  'Nincs visszatáplálás: tele akkunál a mért PV terhelésfüggő. A napnyugtai becslés külön, nem garantált tartalék; újraszámítás 5 percenként.']
     if budget.get('bridge_status')=='no_sustained_cover':
         lines.append('Nincs előre jelzett tartós PV-fedezet: bridge Wh nem számítható, a napi hiányt nem írjuk ide.')
     if budget and not budget.get('safe'):

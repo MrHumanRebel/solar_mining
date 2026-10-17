@@ -222,8 +222,9 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
     profile=profile or {'days':0,'hours':{}}
     valid = (
              all(isinstance(v,(int,float)) and math.isfinite(v) for v in
-                 (soc,pv,load,capacity_wh,miner_w,startup_wh,floor_soc)) and
-             capacity_wh>0 and miner_w>=0 and startup_wh>=0 and
+                 (soc,pv,load,capacity_wh,miner_w,startup_wh,floor_soc,bridge_safety_factor,min_run_minutes)) and
+             capacity_wh>0 and miner_w>=0 and startup_wh>=0 and bridge_safety_factor>=1 and min_run_minutes>0 and
+             (reserve_soc is None or (isinstance(reserve_soc,(int,float)) and math.isfinite(reserve_soc) and reserve_soc>=0)) and
              0<=floor_soc<=100 and 0<=soc<=100 and pv>=0 and load>=0 and now<sunset)
     empty = {'safe':False,'reason':'insufficient_history_or_live_data','coverage':0,
              'end_soc':None,'minimum_soc':None,'missing_hours':True,
@@ -344,20 +345,26 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
     def simulate(until):
         # A household-only counterfactual does not start the miner.
         energy=initial-(startup if until>now else 0)
-        minimum=energy
+        minimum=run_minimum=run_end=energy
         produced=consumed=0.0
         full_at=None
         for at,end,expected,household,_ in steps:
-            demand=household+(miner_w if at<until else 0)
-            dt=(end-at).total_seconds()/3600
-            net=(expected-demand)*dt
-            energy=min(capacity_wh,energy+(net*.9 if net>=0 else net/.9))
-            minimum=min(minimum,energy)
-            if full_at is None and energy>=capacity_wh*.995:
-                full_at=end.isoformat()
-            produced+=expected*dt
-            consumed+=demand*dt
-        return energy,minimum,produced,consumed,full_at
+            # Split a five-minute step at an exact proposed stop (e.g. 18 min).
+            boundaries=[at]+([until] if at<until<end else [])+[end]
+            for begin,finish in zip(boundaries,boundaries[1:]):
+                demand=household+(miner_w if begin<until else 0)
+                dt=(finish-begin).total_seconds()/3600
+                net=(expected-demand)*dt
+                energy=min(capacity_wh,energy+(net*.9 if net>=0 else net/.9))
+                minimum=min(minimum,energy)
+                if begin<until:
+                    run_minimum=min(run_minimum,energy)
+                    run_end=energy
+                if full_at is None and energy>=capacity_wh*.995:
+                    full_at=finish.isoformat()
+                produced+=expected*dt
+                consumed+=demand*dt
+        return energy,minimum,produced,consumed,full_at,run_minimum,run_end
     # Unlabelled historical SOC includes old household/miner activity. It is
     # reference information, never an extra Wh cost added to today's bridge.
     historical_bridge_wh=None
@@ -392,7 +399,35 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
             break
         # Expose the useful minimum-run scenario when all candidates fail.
         result=result_candidate
-    ending,minimum,produced,consumed,full_at=result
+    surplus_floor_soc=max(90,floor_soc,reserve_soc or 0)
+    surplus_available=max(0,initial-capacity_wh*surplus_floor_soc/100)
+    surplus_required=None
+    # At near-full charge, today's export may be load-limited, not the panels'
+    # potential. Do not invent extra PV or let a distant household forecast
+    # veto every short run. Spend ONLY the energy already above the evening
+    # reserve, budgeting zero PV for the whole bounded window plus margin.
+    # A 95/90 start/continue band avoids repeated starts near the reserve.
+    surplus_eligible=(chosen is None and reserve_soc is not None and target_wh<=capacity_wh
+        and now.hour>=12 and now<stop and (running or soc>=max(95,surplus_floor_soc+5))
+        and soc>surplus_floor_soc and kind(current_condition,clouds)=='solar_friendly')
+    if surplus_eligible:
+        latest=min(stop,now+timedelta(minutes=30))
+        windows=sorted({minimum_stop,*[r[1] for r in steps if minimum_stop<=r[1]<=latest]},reverse=True)
+        for until in windows:
+            if not minimum_stop<=until<=latest:
+                continue
+            # A directly timestamped adverse forecast inside this short run
+            # blocks it; tomorrow's rain cannot veto today's charged buffer.
+            if any(now<=at<=until and risk=='solar_weak' for at,risk in weather_points):
+                continue
+            required=(startup+(house_now+miner_w)*(until-now).total_seconds()/3600/.9)*bridge_safety_factor
+            if required<=surplus_available:
+                chosen=until
+                result=simulate(until)
+                reason='bounded_solar_surplus_run'
+                surplus_required=required
+                break
+    ending,minimum,produced,consumed,full_at,run_minimum,run_end=result
     return {'safe':chosen is not None,'reason':reason,'coverage':min(1,profile.get('days',0)/14),
             'end_soc':round(max(0,min(100,ending/capacity_wh*100)),2),
             'minimum_soc':round(max(0,min(100,minimum/capacity_wh*100)),2),
@@ -400,7 +435,16 @@ def plan(profile, now, sunset, soc, pv, load, running, capacity_wh, miner_w,
             'required_reserve_wh':round(target_wh,1),
             'night_household_wh':round(night_wh,1),'reserve_shortfall_wh':round(max(0,target_wh-ending),1),
             'planned_stop':chosen.isoformat() if chosen else None,
-            'projection_mode':'approved_run' if chosen else ('rejected_minimum_run' if candidates else 'household_only'),
+            'projection_mode':('surplus_buffer_run' if surplus_required is not None else 'approved_run') if chosen else ('rejected_minimum_run' if candidates else 'household_only'),
+            'surplus_reserve_soc':surplus_floor_soc,
+            'run_minimum_soc':round(max(0,min(100,run_minimum/capacity_wh*100)),2),
+            'run_end_soc':round(max(0,min(100,run_end/capacity_wh*100)),2),
+            'pv_curtailed_possible':soc>=95 and pv<=load+max(200,.1*load),
+            'available_surplus_wh':round(surplus_available,1),
+            'required_surplus_wh':round(surplus_required,1) if surplus_required is not None else None,
+            'worst_case_stop_soc':round((initial-(surplus_required/bridge_safety_factor))/capacity_wh*100,2) if surplus_required is not None else None,
+            'sunset_reserve_met':ending>=target_wh,
+            'sunset_projection_uncertain':surplus_required is not None,
             'cover_time':cover.isoformat() if cover else None,'full_charge_time':full_at,
             'expected_pv_wh':round(produced,1),'expected_load_wh':round(consumed,1),
             'available_bridge_wh':round(max(0,initial-floor_wh),1),
