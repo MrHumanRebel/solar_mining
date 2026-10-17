@@ -12,6 +12,7 @@ from simulate_decisions import solar
 
 class HistoryModelTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(solar,'send_telegram_message_async'))
         self.now = datetime(2026, 6, 10, 10, tzinfo=LOCAL)
         self.sunset = self.now.replace(hour=18)
         self.profile = {'days': 30, 'hours': {h: {'pv_p25': 3000, 'load_p75': 500,

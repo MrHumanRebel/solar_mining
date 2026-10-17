@@ -71,8 +71,8 @@ PV_COVERAGE_RATIO_START = float(os.getenv("MY_PV_COVERAGE_RATIO_START", "0.75"))
 MIN_RUN_MINUTES = int(os.getenv("MY_MIN_RUN_MINUTES", "18"))
 MIN_RESTART_DELAY_MINUTES = int(os.getenv("MY_MIN_RESTART_DELAY_MINUTES", "10"))
 MINER_STOP_FORCE_COOLDOWN_MINUTES = max(1, int(os.getenv("MY_MINER_STOP_FORCE_COOLDOWN_MINUTES", "20")))
-POWER_BUTTON_SHORT_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_SHORT_PRESS_SECONDS", "0.55"))
-POWER_BUTTON_LONG_PRESS_SECONDS = float(os.getenv("MY_POWER_BUTTON_LONG_PRESS_SECONDS", "10"))
+POWER_BUTTON_SHORT_PRESS_SECONDS = min(1.0,max(0.1,float(os.getenv("MY_POWER_BUTTON_SHORT_PRESS_SECONDS", "0.55"))))
+POWER_BUTTON_LONG_PRESS_SECONDS = max(10.0,float(os.getenv("MY_POWER_BUTTON_LONG_PRESS_SECONDS", "10")))
 
 PRE_SUNRISE_CONTROL_MINUTES = int(os.getenv("MY_PRE_SUNRISE_CONTROL_MINUTES", "120"))
 DAWN_ZERO_PV_MAX_W = float(os.getenv("MY_DAWN_ZERO_PV_MAX_W", "80"))
@@ -118,6 +118,7 @@ power_guard_lock = threading.RLock()
 _power_guard = MinerPowerGuard()
 _latest_power_sample = None
 _power_measurement_error = None
+_last_power_notice_key = None
 _live_power_points = deque(maxlen=288)  # Display only; rolling 24 h in RAM, never a JSON archive.
 _weather_daylight = None
 snapshot_lock = threading.Lock()
@@ -697,9 +698,11 @@ def _make_miner_decision(
     weather_outlook,
     current_load=None,
 ) -> Dict[str, Any]:
+    physically_running=(_power_guard.signature is not None and _power_guard.runtime_state in
+                        ('running','stop_pending','stop_failed'))
     hints = _history_recommendation(now,battery_charge,current_power,sunrise,sunset,weather_outlook,
                                     inv_lt if current_load is None else current_load,
-                                    prev_state=="production",battery_voltage,battery_ah,current_condition,clouds)
+                                    prev_state=="production" or physically_running,battery_voltage,battery_ah,current_condition,clouds)
     budget = hints['energy_budget']
     control = _control_window_details(now,sunrise,sunset,hints)
     reasons = []
@@ -738,6 +741,9 @@ def _make_miner_decision(
     if prev_state!='production' and now<sunrise and rain:
         reasons.append(rain)
     cooldown = isinstance(_last_force_shutdown_at,datetime) and (now-_last_force_shutdown_at).total_seconds()<MINER_STOP_FORCE_COOLDOWN_MINUTES*60
+    if _power_guard.runtime_state in ('stop_pending','stop_failed'):
+        reasons.append('Shutdown not confirmed; automatic start withheld')
+        hard = True
     if cooldown and prev_state!='production':
         reasons.append('Shutdown cooldown')
     desired = 'stop' if reasons else 'production'
@@ -1102,14 +1108,14 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             send_telegram_message("Crypto production start requested, but GPIO is not available on this host.")
     if message_text == "/stop":
         if is_rpi and GPIO_AVAILABLE:
-            press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-            send_telegram_message("Crypto production stopped! Pressed power button with long press.")
+            sent=press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
+            send_telegram_message("Hosszú STOP jel elküldve; a leállás még nincs fogyasztásból igazolva." if sent else "🚨 Hosszú STOP jel küldése sikertelen; a leállás nincs igazolva.")
         else:
             send_telegram_message("Crypto production stop requested, but GPIO is not available on this host.")
     if message_text == "/force_stop":
         if is_rpi and GPIO_AVAILABLE:
-            press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
-            send_telegram_message(f"Crypto production force stopped! Pressed power button for {POWER_BUTTON_LONG_PRESS_SECONDS:.0f} seconds.")
+            sent=press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS)
+            send_telegram_message(f"Hosszú STOP jel elküldve, ellenőrzésre vár ({POWER_BUTTON_LONG_PRESS_SECONDS:.0f} s)." if sent else "🚨 Hosszú STOP jel küldése sikertelen; a leállás nincs igazolva.")
         else:
             send_telegram_message("Force stop requested, but GPIO is not available on this host.")
 
@@ -1297,6 +1303,7 @@ def get_current_weather(api_key, location_lat, location_lon):
     )
 
 def press_power_button(gpio_pin, press_time):
+    global _last_force_shutdown_at
     if not (is_rpi and GPIO_AVAILABLE):
         print(f"[Info] GPIO not available. Skipping power button press ({gpio_pin}, {press_time}s).")
         return False
@@ -1304,19 +1311,28 @@ def press_power_button(gpio_pin, press_time):
     try:
         with gpio_lock:
             GPIO.setmode(GPIO.BCM)
-            GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
-            GPIO.output(gpio_pin, GPIO.HIGH)
-            time.sleep(press_time)
-            GPIO.output(gpio_pin, GPIO.LOW)
-            GPIO.cleanup()
+            try:
+                GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
+                GPIO.output(gpio_pin, GPIO.HIGH)
+                time.sleep(press_time)
+            finally:
+                try:
+                    GPIO.output(gpio_pin, GPIO.LOW)
+                finally:
+                    GPIO.cleanup()
         with power_guard_lock:
             if press_time == POWER_BUTTON_SHORT_PRESS_SECONDS:
                 _power_guard.command_start(_latest_power_sample, datetime.now(tz=budapest_tz))
             else:
-                _power_guard.disarm("Shutdown command sent; repeat presses disabled")
+                completed=datetime.now(tz=budapest_tz)
+                _power_guard.command_stop_finished(completed,success=True)
+                _last_force_shutdown_at=completed
         print("Power button press completed.")
         return True
     except Exception as e:
+        if press_time >= POWER_BUTTON_LONG_PRESS_SECONDS:
+            with power_guard_lock:
+                _power_guard.command_stop_finished(datetime.now(tz=budapest_tz),success=False)
         print(f"[Warning] GPIO press failed: {e}")
         return False
 
@@ -1422,7 +1438,7 @@ def _power_measurement_reason(data, sample, now):
 
 
 def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[str, Any], poll_interval_seconds=300) -> None:
-    global _latest_power_sample, _last_force_shutdown_at, _power_measurement_error
+    global _latest_power_sample, _last_force_shutdown_at, _power_measurement_error, _last_power_notice_key
     _latest_power_sample = _extract_power_sample(data, now)
     _power_measurement_error = _power_measurement_reason(data, _latest_power_sample, now)
     if MinerPowerGuard.fresh(_latest_power_sample,now):
@@ -1443,11 +1459,33 @@ def supervise_runtime_by_power(now: datetime, expected_state: str, data: Dict[st
             if _power_measurement_error:
                 reason = _power_measurement_error
         print(f"[Power guard] {reason}")
-        if shutdown and is_rpi and GPIO_AVAILABLE:
-            if press_power_button(16, POWER_BUTTON_LONG_PRESS_SECONDS):
+        if shutdown:
+            sent = bool(is_rpi and GPIO_AVAILABLE and press_power_button(16,POWER_BUTTON_LONG_PRESS_SECONDS))
+            with power_guard_lock:
+                # A real press records completion itself. Mocked/unavailable GPIO
+                # still consumes the reserved attempt and reports failure honestly.
+                if _power_guard.shutdown_reserved:
+                    _power_guard.command_stop_finished(now,success=sent)
+            if sent:
                 _last_force_shutdown_at = now
-                save_prev_state(prev_state, uptime)
-                send_telegram_message("⚠ STOP: friss L2/L3 fogyasztási minta egyezik az azonosított bányagéppel, SUM > 1000 W. Egyetlen kényszerleállító jel elküldve.")
+                save_prev_state(prev_state,uptime)
+        with power_guard_lock:
+            physical = _power_guard.status(now)
+        unknown_stop=(physical['state']=='unknown' and expected_state=='stop' and
+                      MinerPowerGuard.fresh(_latest_power_sample,now) and _latest_power_sample.total>1000)
+        key=(physical['state'],physical['attempts'],unknown_stop)
+        if key!=_last_power_notice_key:
+            _last_power_notice_key=key
+            if physical['state'] in ('stop_pending','stop_failed','stop_unverified','off'):
+                label={'stop_pending':'⏳ Hosszú STOP jel elküldve; leállás még nincs igazolva',
+                       'stop_failed':'🚨 Leállítás nincs igazolva; kézi ellenőrzés szükséges',
+                       'stop_unverified':'⚠ Leállítás nem ellenőrizhető: nincs friss teljesítménymérés',
+                       'off':'✅ Az azonosított L2/L3 minerterhelés eltűnt'}[physical['state']]
+                if physical['state']=='stop_pending' and physical['attempts']==2:
+                    label='⚠ Az első STOP után a miner terhelése megmaradt; második hosszú STOP elküldve, ellenőrzésre vár'
+                send_telegram_message_async(f"{label}. Kísérlet: {physical['attempts']}/{physical['max_attempts']}. {physical['reason']}",mirror_web=True)
+            elif unknown_stop:
+                send_telegram_message_async('⚠ STOP kérve, de a fizikai állapot ismeretlen. Nincs azonosított saját indítás: a házfogyasztásból önmagában nem nyomunk gombot. Kézi ellenőrzés szükséges.',mirror_web=True)
 
 
 def _update_pool_hashrate(now: datetime) -> None:
@@ -1601,17 +1639,17 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
         if state == "production" and prev_state != "production":
             _last_production_start_at = now
             print("Crypto production ready!")
-            if is_rpi:
+            if is_rpi and _power_guard.runtime_state not in ('running','starting'):
                 press_power_button(16, POWER_BUTTON_SHORT_PRESS_SECONDS)
             live=_build_snapshot_payload()
             live.update(state=state,battery=battery_charge,power=current_power,historical_hints=hist,
                         inv_l1=inv_l1,inv_l2=inv_l2,inv_l3=inv_l3,inv_lt=inv_lt)
-            send_telegram_message('▶ Bányagép indítási jel elküldve.\n'+telegram_status(live,now))
+            send_telegram_message_async('▶ Bányagép indítási jel elküldve.\n'+telegram_status(live,now),mirror_web=True)
         elif state == "stop" and prev_state != "stop":
             _last_production_start_at = None
             live=_build_snapshot_payload()
             live.update(state=state,battery=battery_charge,power=current_power,historical_hints=hist)
-            send_telegram_message('⏹ STOP döntés; a fizikai leállítást a friss fogyasztási minta ellenőrzi.\n'+telegram_status(live,now))
+            send_telegram_message_async('⏹ Leállítás kérve; azonosított minerterhelésnél hosszú gombnyomás és fogyasztási visszaellenőrzés következik. A gép még nincs leálltnak igazolva.\n'+telegram_status(live,now),mirror_web=True)
 
         if state != prev_state:
             prev_state = state
@@ -1687,6 +1725,7 @@ DASHBOARD_HTML = r"""
 [data-theme="light"]{--bg:#eef3ff;--bg2:#d9e8ff;--card:rgba(255,255,255,.85);--txt:#111827;--muted:#4b5563;--input:#ffffff;--border:rgba(17,24,39,.15)}
 *{box-sizing:border-box}
 body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(--txt);font-family:Inter,system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+.runtime-alarm .v{color:#f87171}
 .wrap{padding:10px 18px 16px;max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
 .logo-wrap{display:flex;justify-content:center;padding-top:0;margin:-8px 0 -14px;line-height:0}
 .logo{display:block;max-width:min(300px,72vw);height:auto;filter:drop-shadow(0 8px 18px rgba(0,0,0,.28));}
@@ -1871,8 +1910,10 @@ function render(d){lastData=d;
  const texts={downloadHistory:['download','fa-download'],applyRange:['apply','fa-filter'],shortcutDay:['day','fa-clock'],shortcutWeek:['week','fa-calendar-week'],shortcutMonth:['month','fa-calendar-days'],btnStart:['start','fa-play'],btnStop:['stop','fa-stop'],btnForce:['force','fa-power-off']};
  for(const [id,[key,i]] of Object.entries(texts))document.getElementById(id).innerHTML=icon(i)+' '+esc(t(key));
  document.getElementById('lblFrom').textContent=t('from');document.getElementById('lblTo').textContent=t('to');document.getElementById('notifTitle').innerHTML=icon('fa-bell')+' '+t('notices');
- const state=d.state==='production'?(currentLang==='hu'?'termelés':'production'):d.state==='stop'?(currentLang==='hu'?'leállítva':'stopped'):t('unknown');
- let metrics=card(t('state'),state,'fa-toggle-on')+card(t('battery'),num(d.battery,'%'),'fa-battery-half')+card(t('pv'),num(d.power,' W'),'fa-solar-panel');
+ const physical=d.runtime?.state||'unknown';
+ const states={hu:{running:'futás észlelve',starting:'indítás ellenőrzésre vár',off:'minerterhelés eltűnt',stop_pending:'leállítás ellenőrzésre vár',stop_failed:'LEÁLLÍTÁS NINCS IGAZOLVA',stop_unverified:'leállítás nem ellenőrizhető',unknown:'fizikai állapot ismeretlen'},en:{running:'running detected',starting:'start unconfirmed',off:'mining load absent',stop_pending:'shutdown pending verification',stop_failed:'SHUTDOWN UNCONFIRMED',stop_unverified:'shutdown unverifiable',unknown:'physical state unknown'}};
+ const state=(states[currentLang]||states.en)[physical]||t('unknown');
+ let metrics=card(t('state'),state,'fa-toggle-on',['stop_failed','stop_unverified'].includes(physical)?'runtime-alarm':'')+card(t('battery'),num(d.battery,'%'),'fa-battery-half')+card(t('pv'),num(d.power,' W'),'fa-solar-panel');
  metrics+=`<div class="card"><div class="k">${icon('fa-gauge-high')} ${t('hash')}</div><div class="v">${esc(d.hashrate_text||'N/A')}</div><div class="pool-meta"><a class="pool-link" href="https://unmineable.com/address/${encodeURIComponent(d.wallet_address)}?coin=USDT" target="_blank" rel="noopener noreferrer">unMineable · USDT ${icon('fa-arrow-up-right-from-square')}</a><span class="pool-note">${t('lag')}</span></div></div>`;
  metrics+=card(t('weather'),d.current_condition||t('unknown'),'fa-cloud-sun')+card(t('sunrise'),(d.sunrise||'').slice(11,16)||'—','fa-sun')+card(t('sunset'),(d.sunset||'').slice(11,16)||'—','fa-moon')+card(t('clouds'),num(d.clouds,'%'),'fa-cloud')+card(t('history'),num(d.history_count),'fa-clock-rotate-left');
  document.getElementById('metrics').innerHTML=metrics;
@@ -1881,7 +1922,7 @@ function render(d){lastData=d;
  const budget=b?card(t(buffered?'bufferMinimum':'minimum'),num(buffered?b.worst_case_stop_soc:b.minimum_soc,'%'),'fa-battery-quarter','hint-card')+card(t('end'),buffered?t('uncertainPV'):num(b.end_soc,'%'),'fa-battery-full','hint-card')+card(t(buffered?'bufferPV':'pvwh'),num(b.expected_pv_wh,' Wh'),'fa-solar-panel','hint-card')+card(t('loadwh'),num(b.expected_load_wh,' Wh'),'fa-bolt','hint-card')+card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+card(t('cover'),dateText(b.cover_time),'fa-sun','hint-card')+card(t('planned'),dateText(b.planned_stop),'fa-clock','hint-card')+card(t('bridge'),(b.required_bridge_wh==null?t('noCover'):num(b.required_bridge_wh,' Wh'))+' / '+num(b.available_bridge_wh,' Wh'),'fa-battery-half','hint-card')+card(t('startup'),num(b.startup_energy_wh,' Wh')+' / '+num(b.required_start_energy_wh,' Wh'),'fa-power-off','hint-card')+card(t('bridgeTime'),num(b.bridge_duration_minutes,' min',1),'fa-clock','hint-card')+card(t('houseOnly'),buffered?t('uncertainPV'):num(b.household_only_end_soc,'%'),'fa-house','hint-card')+card(t('houseLoad'),num(b.household_load_w,' W'),'fa-bolt','hint-card'):card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+`<div class="hint-card decision-card">${esc(d.monitoring_mode==='idle_safety'?t('idle'):t('waiting'))}</div>`;
  const bufferInfo=buffered?card(t('bufferBudget'),num(b.required_surplus_wh,' Wh')+' / '+num(b.available_surplus_wh,' Wh'),'fa-battery-half','hint-card')+`<p class="hint-sub">${esc(t('bufferNote'))}</p>`:'';
  const phase=[1,2,3].map(i=>card('INV L'+i,num(d['inv_l'+i],' W'),'fa-bolt','hint-card')).join('')+card(t('inverter'),num(d.inv_lt,' W'),'fa-gauge-high','hint-card')+card(t('temp'),num(d.garage_temp,' °C',1),'fa-temperature-half','hint-card')+card(t('hum'),num(d.garage_hum,'%'),'fa-droplet','hint-card');
- document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${buffered?t('bufferMode'):t('plan')}${b&&!b.safe?(currentLang==='hu'?' · elutasított futás előrejelzése':' · rejected-run forecast'):''}</h3><div class="hints-grid">${budget}${bufferInfo}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div>${meter?`<div class="hint-sub">${t('measured')}: ${num(meter.total,' W')} · L1 ${num(meter.l1,' W')} / L2 ${num(meter.l2,' W')} / L3 ${num(meter.l3,' W')}</div><div class="hint-sub">${t('collected')}: ${esc(dateText(meter.at))}</div>`:''}<div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):String(d.power_measurement_source||'').startsWith('consumption')?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
+ document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${buffered?t('bufferMode'):t('plan')}${b&&!b.safe?(currentLang==='hu'?' · elutasított futás előrejelzése':' · rejected-run forecast'):''}</h3><div class="hints-grid">${budget}${bufferInfo}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div><div class="hint-sub">${currentLang==='hu'?'Kívánt állapot':'Requested state'}: ${esc(d.state||'unknown')} · ${currentLang==='hu'?'Hosszú STOP kísérletek':'Long STOP attempts'}: ${d.runtime?.attempts||0}/${d.runtime?.max_attempts||2}</div>${meter?`<div class="hint-sub">${t('measured')}: ${num(meter.total,' W')} · L1 ${num(meter.l1,' W')} / L2 ${num(meter.l2,' W')} / L3 ${num(meter.l3,' W')}</div><div class="hint-sub">${t('collected')}: ${esc(dateText(meter.at))}</div>`:''}<div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):String(d.power_measurement_source||'').startsWith('consumption')?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
  const notices=Array.isArray(d.notifications)?d.notifications:[];
  document.getElementById('notifList').innerHTML=notices.length?notices.slice(0,5).map(n=>`<div class="notice-item ${['info','warn','error','success'].includes(n.level)?n.level:'info'}"><div class="notice-meta">${esc(dateText(n.ts))}</div><div>${esc(String(n.message||'').replace(/(\d{4})-(\d{2})-(\d{2})(T| )?/g,(_,y,m,day,sep)=>`${y}.${m}.${day}.${sep?' ':''}`))}</div></div>`).join(''):`<div class="notice-empty">${t('empty')}</div>`;
  const coverage=document.getElementById('historyCoverage');coverage.className='panel history-coverage'+(d.history_count?'':' empty');coverage.textContent=(currentLang==='hu'?'Betöltött előzmények: ':'Loaded history: ')+huDate(d.history_available_from)+' – '+huDate(d.history_available_to)+' · '+d.history_files+' JSON · '+d.history_total_count+' '+t('samples')+(d.history_count?'':(currentLang==='hu'?' · A kiválasztott időszakhoz nincs betöltött mérés. Ellenőrizd az előzménykönyvtárat.':' · No loaded measurements in the selected period. Check the history directory.'));
@@ -1954,6 +1995,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
             filtered_hist.append(item)
 
     filtered_hist.sort(key=lambda x: str(x.get("ts", "")))
+    with power_guard_lock:
+        runtime=_power_guard.status(now)
 
     return {
         "battery": snap.get("battery", 0),
@@ -1965,6 +2008,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "garage_temp": snap.get("garage_temp"),
         "garage_hum": snap.get("garage_hum"),
         "state": snap.get("state", "unknown"),
+        "runtime": runtime,
         "current_condition": snap.get("current_condition", "unknown"),
         "weather_icon": _weather_icon(snap.get("current_condition", "")),
         "clouds": snap.get("clouds", 0),

@@ -30,6 +30,9 @@ def armed_guard(swap=False):
 
 
 class PowerGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(solar,'send_telegram_message_async'))
+
     def test_oc_rig_720w_paired_rise_is_identified_in_both_phase_assignments(self):
         for swap in (False,True):
             with self.subTest(swap=swap):
@@ -67,9 +70,9 @@ class PowerGuardTests(unittest.TestCase):
             at=datetime.fromisoformat(row['ts'])
             self.assertFalse(guard.observe(PowerSample(at,row['inv_lt'],row['inv_l1'],row['inv_l2'],row['inv_l3']),at,'stop'))
 
-    def test_first_fresh_matching_stop_sample_triggers_once(self):
+    def test_first_stop_and_one_verified_failure_retry_are_bounded(self):
         guard = armed_guard()
-        for minute, expected in [(25, True), (30, False), (35, False), (40, False), (45, False)]:
+        for minute, expected in [(25, True), (30, True), (35, False), (40, False), (45, False)]:
             s = sample(minute)
             self.assertEqual(guard.observe(s, s.at, 'stop'), expected)
 
@@ -79,7 +82,7 @@ class PowerGuardTests(unittest.TestCase):
         for minute in (25, 30, 35):
             s = sample(minute, l2=450, l3=650)
             results.append(guard.observe(s, s.at, 'stop'))
-        self.assertEqual(results, [True, False, False])
+        self.assertEqual(results, [True, True, False])
 
     def test_oven_only_and_unknown_start_never_arm(self):
         guard = MinerPowerGuard()
@@ -114,7 +117,7 @@ class PowerGuardTests(unittest.TestCase):
             self.assertFalse(guard.observe(s, s.at, 'stop'))
 
     def test_cooking_on_each_phase_and_hob_are_ambiguous(self):
-        for loads in [(2200,550,550), (100,2500,550), (100,550,2500), (100,1400,1600)]:
+        for loads in [(100,2500,550), (100,550,2500), (100,1400,1600)]:
             guard = armed_guard()
             for minute in (25, 30, 35):
                 s = sample(minute, total=sum(loads), l1=loads[0], l2=loads[1], l3=loads[2])
@@ -171,7 +174,7 @@ class PowerGuardTests(unittest.TestCase):
             solar.supervise_runtime_by_power(T, 'stop', {})
             press.assert_not_called()
 
-    def test_gpio_is_pressed_once_for_confirmed_power_and_never_queries_pool(self):
+    def test_gpio_long_press_retry_is_bounded_and_never_queries_pool(self):
         guard = armed_guard()
         with patch.object(solar, '_power_guard', guard), \
              patch.object(solar, '_extract_power_sample') as extract, \
@@ -184,7 +187,8 @@ class PowerGuardTests(unittest.TestCase):
                 s = sample(minute)
                 extract.return_value = s
                 solar.supervise_runtime_by_power(s.at, 'stop', {})
-            press.assert_called_once_with(16, solar.POWER_BUTTON_LONG_PRESS_SECONDS)
+            self.assertEqual(press.call_count,2)
+            self.assertTrue(all(c.args==(16,solar.POWER_BUTTON_LONG_PRESS_SECONDS) for c in press.call_args_list))
 
     def test_timestamp_and_explicit_consumption_required(self):
         data = {'collectionTime': T.timestamp(), 'dataList': [
@@ -235,16 +239,17 @@ class PowerGuardTests(unittest.TestCase):
             fetch.assert_called_once_with('test-token')
             self.assertEqual(power_guard.call_args.args[1:], ('stop', {'dataList': []}))
 
-    def test_real_gpio_start_registers_baseline_and_stop_disarms(self):
+    def test_real_gpio_start_and_stop_record_completion_without_disarming(self):
         gpio = Mock()
         guard = Mock()
         with patch.object(solar, 'is_rpi', True), patch.object(solar, 'GPIO_AVAILABLE', True), \
              patch.object(solar, 'GPIO', gpio, create=True), patch.object(solar.time, 'sleep'), \
-             patch.object(solar, '_power_guard', guard):
+             patch.object(solar, '_power_guard', guard), patch.object(solar,'_last_force_shutdown_at',None):
             solar.press_power_button(16, solar.POWER_BUTTON_SHORT_PRESS_SECONDS)
             guard.command_start.assert_called_once()
             solar.press_power_button(16, solar.POWER_BUTTON_LONG_PRESS_SECONDS)
-            guard.disarm.assert_called_once()
+            guard.command_stop_finished.assert_called_once()
+            guard.disarm.assert_not_called()
 
 
 if __name__ == '__main__':

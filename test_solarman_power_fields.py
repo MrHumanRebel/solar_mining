@@ -23,6 +23,11 @@ def payload(unit='W', total=1200, phases=(100,550,550)):
 
 
 class SolarmanPowerFieldTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(solar,'send_telegram_message'))
+        self.enterContext(patch.object(solar,'send_telegram_message_async'))
+        self.enterContext(patch.object(solar,'_last_power_notice_key',None))
+
     def test_reported_deye_schema_pairs_consumption_with_lpp_not_backup_load(self):
         data=json.loads((Path(__file__).parent/'tests/fixtures/solarman_deye_power.json').read_text())
         now=datetime.fromtimestamp(data['collectionTime'],timezone.utc)+timedelta(seconds=60)
@@ -158,7 +163,7 @@ class SolarmanPowerFieldTests(unittest.TestCase):
         reading=replace(sample(25),source='inverter_output')
         self.assertTrue(guard.observe(reading,reading.at,'stop'))
         reading=replace(sample(30),source='inverter_output')
-        self.assertFalse(guard.observe(reading,reading.at,'stop'))
+        self.assertTrue(guard.observe(reading,reading.at,'stop'))
 
     def test_field_diagnostics_stay_out_of_dashboard_status(self):
         with patch.object(solar,'_power_guard',solar.MinerPowerGuard()):
