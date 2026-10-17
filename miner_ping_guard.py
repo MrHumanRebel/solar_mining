@@ -16,7 +16,6 @@ def ping_host(address):
 
 
 class MinerPingGuard:
-    MAX_SHUTDOWN_ATTEMPTS=2
     def __init__(self,address='192.168.0.185',mac='90:DE:80:BD:AD:BF'):
         self.address=str(ipaddress.IPv4Address(address))
         self.mac=mac
@@ -100,14 +99,10 @@ class MinerPingGuard:
             self.runtime_state='stop_pending'
             self.reason='Waiting 30 seconds after long STOP before considering retry'
             return False
-        if self.shutdown_attempts>=self.MAX_SHUTDOWN_ATTEMPTS:
-            self.runtime_state='stop_failed'
-            self.reason='Target still replies after two long STOP attempts; manual inspection required'
-            return False
         self.shutdown_attempts+=1
         self.shutdown_reserved=True
         self.runtime_state='stop_pending'
-        self.reason=f'Ping-online STOP authorized ({self.shutdown_attempts}/2)'
+        self.reason=f'Ping-online STOP authorized (attempt {self.shutdown_attempts}; retry until unreachable)'
         return True
 
     def status(self,now):
@@ -115,7 +110,7 @@ class MinerPingGuard:
         return {'state':self.runtime_state if fresh else 'unknown','desired_state':self.desired_state,'reachable':self.reachable if fresh else None,
                 'target_ip':self.address,'expected_mac':self.mac,'verification':'icmp_ping',
                 'checked_at':self.checked_at.isoformat() if self.checked_at else None,
-                'attempts':self.shutdown_attempts,'max_attempts':2,
+                'attempts':self.shutdown_attempts,'max_attempts':None,
                 'last_command_at':self.shutdown_after.isoformat() if self.shutdown_after else None,
                 'confirmed_off_at':self.confirmed_off_at.isoformat() if self.confirmed_off_at else None,
                 'reason':self.reason if fresh else 'Ping status unavailable or older than 60 seconds'}

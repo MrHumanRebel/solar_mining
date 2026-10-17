@@ -45,7 +45,7 @@ def status(snapshot,now,quote_used=None,quote_limit=None):
                     'stop_unverified':'leállítás nem ellenőrizhető','off':'ping nem elérhető'}.get(physical,physical)
     lines=[f"☀ Solar Mining · {stamp(now)}",
            f"Kívánt állapot: {((snapshot.get('runtime') or {}).get('desired_state') if (snapshot.get('runtime') or {}).get('desired_state') in ('stop','production') else snapshot.get('state','ismeretlen'))} · PV: {number(snapshot.get('power'),' W')} · Akku: {number(snapshot.get('battery'),'%')}",
-           f"Fizikai állapot: {physical_label} · STOP kísérletek: {(snapshot.get('runtime') or {}).get('attempts',0)}/2",
+           f"Fizikai állapot: {physical_label} · STOP kísérletek: {(snapshot.get('runtime') or {}).get('attempts',0)} (nincs limit)",
            f"Ping cél: {(snapshot.get('runtime') or {}).get('target_ip','192.168.0.185')} · ellenőrzés: {stamp((snapshot.get('runtime') or {}).get('checked_at'))}",
            f"Időjárás: {snapshot.get('current_condition','—')}",
            f"Teljes miner tervezési fogyasztása: {number(snapshot.get('miner_power_w'),' W')} (becslés, nem konnektoros mérés)",
