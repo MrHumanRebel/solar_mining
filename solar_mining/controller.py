@@ -1534,13 +1534,12 @@ def _update_pool_hashrate(now: datetime) -> None:
 
 
 def _solarman_poll_slot(now, sunrise_dt, sunset_dt):
-    """One Solarman attempt per 5-minute daylight / 30-minute night slot.
+    """Poll every 5 minutes inside the displayed window, otherwise every 30.
 
-    Use astronomical sunrise/sunset, independently of the earlier production
-    stop and pre-dawn control offsets. If weather is unavailable, use the
-    existing supplied bounds rather than guessing a daylight window.
+    The supplied bounds already include the configured control offsets.
+    Do not override the displayed stop time with the later astronomical sunset.
     """
-    dawn, dusk = _weather_daylight or (sunrise_dt, sunset_dt)
+    dawn, dusk = sunrise_dt, sunset_dt
     daylight = isinstance(dawn, datetime) and isinstance(dusk, datetime) and dawn <= now < dusk
     interval = 300 if daylight else 1800
     return interval, int(now.timestamp()) // interval
