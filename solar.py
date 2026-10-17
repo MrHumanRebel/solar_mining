@@ -120,16 +120,16 @@ snapshot_lock = threading.Lock()
 
 # Shared snapshot for Telegram thread
 _shared_snapshot = {
-    "battery": 0, "power": 0, "state": "init", "current_condition": "unknown",
-    "sunrise": datetime.now(tz=budapest_tz), "sunset": datetime.now(tz=budapest_tz),
-    "clouds": 0, "garage_temp": 0, "garage_hum": 0,
+    "battery": None, "power": None, "state": "init", "current_condition": "unknown",
+    "sunrise": None, "sunset": None,
+    "clouds": None, "garage_temp": None, "garage_hum": None,
     "hashrate_hs": None, "hashrate_mhs": None,
-    "inv_l1": 0, "inv_l2": 0, "inv_l3": 0, "inv_lt": 0,
+    "inv_l1": None, "inv_l2": None, "inv_l3": None, "inv_lt": None,
     "historical_hints": {
         "month_quality": "neutral",
         "early_start_soc": 55,
         "min_stop_soc": 20,
-        "late_day_reserve_soc": 80,
+        "late_day_reserve_soc": None,
         "should_preserve_battery": False,
         "headroom_good": False,
         "start_guard_allow": False,
@@ -164,7 +164,7 @@ def _idle_historical_hints() -> Dict[str, Any]:
         "month_quality": "neutral",
         "early_start_soc": 0,
         "min_stop_soc": BATTERY_FLOOR_SOC,
-        "late_day_reserve_soc": HARD_AFTERNOON_STOP_SOC,
+        "late_day_reserve_soc": None,
         "should_preserve_battery": False,
         "headroom_good": False,
         "start_guard_allow": False,
@@ -298,6 +298,12 @@ def _summarize_free_weather_outlook(forecast_payload: Dict[str, Any], now: Optio
         "bad_ratio_5d": round(bad_ratio, 3),
         "score_5d": round(score_5d, 3),
         "samples_5d": int(total),
+        "forecast": [
+            {"ts": datetime.fromtimestamp(e['dt'],tz=budapest_tz).isoformat(),
+             "condition": ((e.get('weather') or [{}])[0] or {}).get('description','unknown'),
+             "clouds": (e.get('clouds') or {}).get('all')}
+            for e in entries if isinstance(e,dict) and isinstance(e.get('dt'),(int,float))
+        ],
     }
 
 _last_force_shutdown_at: Optional[datetime] = None
@@ -579,22 +585,40 @@ def _effective_battery_capacity_wh(battery_voltage: float, battery_ah: float) ->
     ah = battery_ah if battery_ah > 0 else BATTERY_CAPACITY_AH
     return max(100.0, ah * v)
 
-def build_historical_profile(history_dir: str = "solarman_json", before=None) -> Dict[str, Any]:
-    dataset = load_exports(history_dir, before=before or datetime.now(tz=budapest_tz))
+def build_historical_profile(history_dir: str = "solarman_json", before=None, bundled_dir=None) -> Dict[str, Any]:
+    bundled = Path(bundled_dir) if bundled_dir is not None else Path(__file__).resolve().parent / 'bundled_solarman_json'
+    directories = [history_dir] + ([bundled] if bundled.is_dir() else [])
+    dataset = load_exports(directories, before=before or datetime.now(tz=budapest_tz))
+    dataset['directories'] = [str(Path(d).resolve()) for d in directories]
     dataset["months"] = {month: seasonal_profile(dataset["rows"],month) for month in range(1,13)}
     print(f"[History] Read-only exports: {dataset['files']} files, {dataset['unique_timestamps']} measurements, {dataset['invalid_rows']} invalid rows")
+    if dataset['rows']:
+        first,last = dataset['rows'][0]['ts'][:10],dataset['rows'][-1]['ts'][:10]
+        print(f"[History] Coverage: {first} to {last} | read-only directories: {len(directories)}")
     return dataset
 
 
 def _history_recommendation(now, battery_charge, current_power, sunrise_dt, sunset_dt,
                             weather_outlook=None, current_load=0.0, running=False,
-                            battery_voltage=BATTERY_NOMINAL_V, battery_ah=BATTERY_CAPACITY_AH):
+                            battery_voltage=BATTERY_NOMINAL_V, battery_ah=BATTERY_CAPACITY_AH,
+                            current_condition="unknown", clouds=None):
     profile = ((historical_profile or {}).get("months") or {}).get(now.month,{})
     weather = (weather_outlook or {}).get("summary_5d","unknown")
     floor = BATTERY_FLOOR_SOC if running else BATTERY_FLOOR_SOC + MIN_DAWN_BRIDGE_SOC_BUFFER
-    budget = plan_energy(profile,now,sunset_dt,battery_charge,current_power,current_load,running,
+    daylight = _weather_daylight
+    if daylight and any(at.date()!=now.date() for at in daylight):
+        daylight = None
+    dawn, dusk = daylight or (sunrise_dt, sunset_dt)
+    if dusk < sunset_dt:
+        dusk = sunset_dt
+    budget = plan_energy(profile,now,dusk,battery_charge,current_power,current_load,running,
                          _effective_battery_capacity_wh(battery_voltage,battery_ah),MINER_POWER_W,
-                         floor,HARD_AFTERNOON_STOP_SOC,weather,STARTUP_ENERGY_PENALTY_WH)
+                         floor,None,weather,STARTUP_ENERGY_PENALTY_WH,
+                         forecast=(weather_outlook or {}).get('forecast',[]),
+                         current_condition=current_condition,clouds=clouds,
+                         production_stop=sunset_dt,next_sunrise=dawn+timedelta(days=1),
+                         min_run_minutes=5 if running else MIN_RUN_MINUTES,bridge_safety_factor=BRIDGE_START_SAFETY_FACTOR,
+                         reserve_floor_soc=BATTERY_FLOOR_SOC)
     hours = profile.get("hours",{})
     midday = statistics.mean([hours[h]['pv_p25'] for h in range(10,15) if h in hours]) if any(h in hours for h in range(10,15)) else 0
     quality = "strong" if midday>=2300 else ("weak" if midday<1650 else "neutral")
@@ -603,7 +627,7 @@ def _history_recommendation(now, battery_charge, current_power, sunrise_dt, suns
         "history_days":profile.get('days',0), "history_coverage":budget['coverage'],
         "history_interpolated":profile.get('interpolated',False), "energy_budget":budget,
         "month_quality":quality,"early_start_soc":floor,"min_stop_soc":BATTERY_FLOOR_SOC,
-        "late_day_reserve_soc":HARD_AFTERNOON_STOP_SOC,
+        "late_day_reserve_soc":budget.get("reserve_soc"),
         "should_preserve_battery":not budget['safe'],"headroom_good":budget['safe'],
         "hourly_prod_mean":{str(h):v['pv_p25'] for h,v in hours.items()},
         "weather_risk_5d":weather,"weather_sunny_ratio_5d":(weather_outlook or {}).get('sunny_ratio_5d',0),
@@ -669,7 +693,7 @@ def _make_miner_decision(
 ) -> Dict[str, Any]:
     hints = _history_recommendation(now,battery_charge,current_power,sunrise,sunset,weather_outlook,
                                     inv_lt if current_load is None else current_load,
-                                    prev_state=="production",battery_voltage,battery_ah)
+                                    prev_state=="production",battery_voltage,battery_ah,current_condition,clouds)
     budget = hints['energy_budget']
     control = _control_window_details(now,sunrise,sunset,hints)
     reasons = []
@@ -684,7 +708,19 @@ def _make_miner_decision(
         reasons.append('Phase/total inverter limit')
         hard = True
     if not budget['safe']:
-        reasons.append('Historical energy budget cannot protect battery and evening reserve')
+        explanations = {
+            'insufficient_history_or_live_data':'Missing seasonal history or valid live measurements',
+            'missing_daytime_history':'Missing hourly daytime history',
+            'missing_overnight_history':'Missing hourly household history for the night reserve',
+            'invalid_overnight_time_window':'Missing or inconsistent sunset/next-sunrise times',
+            'overnight_reserve_exceeds_battery_capacity':'Estimated household night demand exceeds usable battery capacity',
+            'battery_floor_would_be_crossed':'Battery bridge would cross the protected SOC floor',
+            'no_sustained_solar_cover_for_morning_start':'No sustained solar cover forecast before the proposed morning run ends',
+            'insufficient_battery_bridge':'Available battery bridge is smaller than the forecast deficit plus safety margin',
+            'night_household_reserve_not_recovered':'Even an early mining stop would not recover the household night reserve',
+            'insufficient_time_for_minimum_run':'Not enough production time remains for a useful mining run',
+        }
+        reasons.append(explanations.get(budget['reason'],budget['reason']))
     if prev_state!='production' and (sunset-now).total_seconds()<MIN_RUN_MINUTES*60:
         reasons.append('Insufficient time for minimum run before stop window')
     rain = _dawn_weather_block_reason(current_condition,f1_cond,f1_clouds,f3_cond,f3_clouds,weather_outlook or {})
@@ -699,7 +735,7 @@ def _make_miner_decision(
     metrics = {
         'available_bridge_wh':budget.get('available_bridge_wh',0),
         'required_bridge_wh':budget.get('required_bridge_wh',0),
-        'bridge_safety_factor':1.0,'startup_energy_penalty_wh':STARTUP_ENERGY_PENALTY_WH,
+        'bridge_safety_factor':BRIDGE_START_SAFETY_FACTOR,'startup_energy_penalty_wh':STARTUP_ENERGY_PENALTY_WH,
         'predicted_first_miner_cover_time':budget.get('cover_time'),
         'predicted_full_charge_time':budget.get('full_charge_time'),
         'predicted_refill_confidence':budget['coverage'],
@@ -707,8 +743,8 @@ def _make_miner_decision(
         'dawn_weather_block':bool(rain),'dawn_weather_block_reason':rain,
     }
     return {'desired_state':desired,'decision_state':desired,
-            'decision_summary':('STOP: '+'; '.join(reasons)) if reasons else 'RUN: history-based energy budget protects reserve',
-            'start_rule_hits':[] if reasons else ['Seasonal PV/load budget covers battery reserve'],
+            'decision_summary':('STOP: '+'; '.join(reasons)) if reasons else 'RUN: battery bridge, finite mining run and overnight household reserve covered',
+            'start_rule_hits':[] if reasons else [budget['reason']],
             'stop_rule_hits':reasons,'hard_stop':hard,'soft_stop':desired=='stop' and not hard,
             'confidence':budget['coverage'],'start_score':budget['coverage'] if desired=='production' else 0,
             'stop_score':1 if desired=='stop' else 0,'zero_pv_bridge_start':desired=='production' and current_power<=DAWN_ZERO_PV_MAX_W,
@@ -1128,8 +1164,8 @@ def process_message(message_text, battery, power, state, current_condition, sunr
             f"• Hashrate: {hashrate_text}\n"
             f"• Weather: {current_condition}\n"
             f"• Clouds: {clouds}%\n"
-            f"• Sunrise: {sunrise.strftime('%H:%M')}\n"
-            f"• Sunset: {sunset.strftime('%H:%M')}\n\n"
+            f"• Sunrise: {sunrise.strftime('%H:%M') if isinstance(sunrise,datetime) else 'N/A'}\n"
+            f"• Sunset: {sunset.strftime('%H:%M') if isinstance(sunset,datetime) else 'N/A'}\n\n"
             f"🏠 Environment\n"
             f"• Garage temperature: {garage_temp}C\n"
             f"• Garage humidity: {garage_hum}%\n\n"
@@ -1778,7 +1814,7 @@ def _weather_icon(condition: str) -> str:
 DASHBOARD_HTML = r"""
 
 <!doctype html>
-<html lang="en"><head>
+<html lang="hu"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Solar Mining Control</title>
 <link rel="icon" type="image/png" href="/solarmining_logo.png" />
@@ -1813,11 +1849,11 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 .field label{font-size:.82rem;color:var(--muted)}
 .field input,.btn{border-radius:10px;border:1px solid var(--border);padding:10px 12px;font-size:.95rem}
 .field input{background:var(--input);color:var(--txt)}
-input[type="date"]{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.04));border:1px solid rgba(148,163,184,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 8px 18px rgba(2,6,23,.22);font-weight:700;letter-spacing:.02em;color:var(--txt);min-height:42px;color-scheme:dark;padding-right:36px}
-[data-theme="light"] input[type="date"]{background:linear-gradient(180deg,#ffffff,#eef4ff);border-color:rgba(71,85,105,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 6px 14px rgba(15,23,42,.08);color-scheme:light}
-input[type="date"]:hover{border-color:rgba(96,165,250,.75)}
-input[type="date"]:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25),0 10px 22px rgba(59,130,246,.2)}
-input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
+.field-date input{appearance:none;-webkit-appearance:none;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.04));border:1px solid rgba(148,163,184,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 8px 18px rgba(2,6,23,.22);font-weight:700;letter-spacing:.02em;color:var(--txt);min-height:42px;color-scheme:dark;padding-right:36px}
+[data-theme="light"] .field-date input{background:linear-gradient(180deg,#ffffff,#eef4ff);border-color:rgba(71,85,105,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 6px 14px rgba(15,23,42,.08);color-scheme:light}
+.field-date input:hover{border-color:rgba(96,165,250,.75)}
+.field-date input:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25),0 10px 22px rgba(59,130,246,.2)}
+.field-date input::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
 .field-date{position:relative}
 .field-date .calendar-icon{position:absolute;right:12px;bottom:12px;color:rgba(226,232,240,.95);font-size:.92rem;pointer-events:none;text-shadow:0 1px 2px rgba(2,6,23,.65)}
 [data-theme="light"] .field-date .calendar-icon{color:#334155;text-shadow:none}
@@ -1867,6 +1903,8 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
 .pool-link,.pool-link:visited{display:inline-flex;align-items:center;gap:7px;color:var(--txt);text-decoration:none;border:1px solid var(--border,#46516b);border-radius:999px;padding:5px 10px;font-size:12px;font-weight:600;line-height:1.4}
 .pool-link:hover,.pool-link:focus-visible{color:#e8b957;border-color:#e8b957;outline-offset:3px}
 .pool-note{font-size:11px;opacity:.7}
+
+.calendar-trigger{position:absolute;right:8px;bottom:5px;background:transparent;border:0;color:var(--txt);padding:8px;cursor:pointer;font-size:17px}.field-date input{padding-right:46px;cursor:pointer}.date-picker{color:var(--txt);background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;width:min(380px,calc(100vw - 24px));max-height:90vh;overflow:auto;background-color:#182438}.date-picker::backdrop{background:rgba(0,0,0,.65)}[data-theme="light"] .date-picker{background:#fff}.calendar-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:14px}.calendar-nav button,.calendar-nav select,.calendar-day{background:var(--input);color:var(--txt);border:1px solid var(--border);border-radius:8px;padding:8px;cursor:pointer}.calendar-nav select{min-width:0;flex:1}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;text-align:center}.calendar-day{min-height:38px}.calendar-day:hover,.calendar-day.selected{background:#398853;color:#fff}.calendar-week{color:var(--muted);font-size:12px;padding-bottom:8px}.history-coverage{color:var(--muted);font-size:13px;line-height:1.6}.history-coverage.empty{border-color:#d8a340;color:#efc779}
 </style></head>
 <body data-theme="dark"><div class="wrap">
 <div class="logo-wrap"><img class="logo" src="/solarmining_logo.png" alt="Solar Mining logo" /></div>
@@ -1875,8 +1913,8 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
 <div class="grid metrics-grid" id="metrics"></div>
 <div class="panel hints-panel"><div class="hints-wrap" id="historyHints"></div></div>
 <div class="panel toolbar"><div class="filters">
-<div class="field field-date"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="date" /><i class="fa-solid fa-calendar-days calendar-icon"></i></div>
-<div class="field field-date"><label id="lblTo" for="toDate">To</label><input id="toDate" type="date" /><i class="fa-solid fa-calendar-days calendar-icon"></i></div>
+<div class="field field-date"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="text" readonly placeholder="ÉÉÉÉ.HH.NN." aria-label="fromDate" /><button type="button" class="calendar-trigger" data-calendar="fromDate" aria-label="Naptár megnyitása"><i class="fa-solid fa-calendar-days" aria-hidden="true"></i></button></div>
+<div class="field field-date"><label id="lblTo" for="toDate">To</label><input id="toDate" type="text" readonly placeholder="ÉÉÉÉ.HH.NN." aria-label="toDate" /><button type="button" class="calendar-trigger" data-calendar="toDate" aria-label="Naptár megnyitása"><i class="fa-solid fa-calendar-days" aria-hidden="true"></i></button></div>
 <div class="actions"><div class="range-shortcuts"><button class="btn ghost" id="shortcutDay"><i class="fa-solid fa-clock"></i> Last Day</button><button class="btn ghost" id="shortcutWeek"><i class="fa-solid fa-calendar-week"></i> Last Week</button><button class="btn ghost" id="shortcutMonth"><i class="fa-solid fa-calendar-days"></i> Last Month</button></div><button class="btn ok" id="applyRange"><i class="fa-solid fa-filter"></i> Apply range</button></div>
 </div><div class="actions toolbar-actions">
 <button id="btnStart" class="btn ok" onclick="act('start')"><i class="fa-solid fa-play"></i> Start miner</button>
@@ -1885,17 +1923,56 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:0;cursor:pointer}
 </div></div>
 <div id="actionResult" class="k"></div>
 <div class="panel notice-panel"><div class="notice-head"><div id="notifTitle" class="chart-title"><i class="fa-solid fa-bell"></i> Notifications</div></div><div id="notifList" class="notice-list"></div></div>
+<div class="panel history-coverage" id="historyCoverage" role="status"></div>
+<dialog id="datePicker" class="date-picker" aria-label="Dátum kiválasztása"><div class="calendar-nav"><button type="button" id="calendarPrevious" aria-label="Előző hónap">‹</button><select id="calendarYear" aria-label="Év"></select><select id="calendarMonth" aria-label="Hónap"></select><button type="button" id="calendarNext" aria-label="Következő hónap">›</button><button type="button" id="calendarClose" aria-label="Naptár bezárása">×</button></div><div class="calendar-grid calendar-week"><span>H</span><span>K</span><span>Sze</span><span>Cs</span><span>P</span><span>Szo</span><span>V</span></div><div id="calendarDays" class="calendar-grid"></div></dialog>
 <div class="charts"><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-solar-panel"></i> <span id="powerChartTitle"></span></div><div id="powerChartSub" class="chart-sub"></div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-bolt"></i> <span id="consumptionChartTitle"></span></div><div id="consumptionChartSub" class="chart-sub"></div></div><canvas id="consumptionChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> <span id="batteryChartTitle"></span></div><div id="batteryChartSub" class="chart-sub"></div></div><canvas id="batteryChart"></canvas></div></div></div><script>
-let currentLang=localStorage.getItem('solar-lang')||'en',currentRange={},lastData,charts={};
-const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Power safety',decision:'Decision',minimum:'Projected minimum SOC',end:'Projected ending SOC',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Seasonal coverage',floor:'Protected SOC floor',reserve:'Evening reserve',source:'Provided solarman_json history · live readings are not recorded',load:'Consumption',measured:'Selected power measurement',collected:'Device collection time',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Fogyasztási védelem',decision:'Döntés',minimum:'Becsült minimum SOC',end:'Becsült záró SOC',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Szezonális lefedettség',floor:'Védett SOC minimum',reserve:'Esti tartalék',source:'Megadott solarman_json előzmények · élő mérést nem rögzítünk',load:'Fogyasztás',measured:'Kiválasztott teljesítménymérés',collected:'Eszköz mérési ideje',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
+let currentLang=localStorage.getItem('solar-lang')||'en',currentRange={},lastData,charts={},rangeInitialized=false;
+const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Power safety',decision:'Decision',minimum:'Minimum SOC during planned run/refill',end:'SOC at sunset after planned mining stop',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Seasonal coverage',floor:'Protected SOC floor',reserve:'Household night reserve',planned:'Planned mining stop',cover:'Sustained solar cover',bridge:'Required / available bridge',source:'Provided solarman_json history · live readings are not recorded',load:'Consumption',measured:'Selected power measurement',collected:'Device collection time',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Fogyasztási védelem',decision:'Döntés',minimum:'Minimum SOC a tervezett futás/visszatöltés alatt',end:'Napnyugtai SOC a tervezett leállítás után',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Szezonális lefedettség',floor:'Védett SOC minimum',reserve:'Éjszakai háztartási tartalék',planned:'Tervezett bányászleállítás',cover:'Tartós napenergia-fedezet',bridge:'Szükséges / elérhető áthidaló energia',source:'Megadott solarman_json előzmények · élő mérést nem rögzítünk',load:'Fogyasztás',measured:'Kiválasztott teljesítménymérés',collected:'Eszköz mérési ideje',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
 const t=k=>words[currentLang][k]||k;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,u='',digits=0)=>v==null||!Number.isFinite(Number(v))?'—':Number(v).toFixed(digits)+u;
 const icon=(name)=>`<i class="fa-solid ${name}" aria-hidden="true"></i>`;
 const card=(label,value,i='fa-circle-info',kind='card')=>`<div class="${kind}"><div class="${kind==='card'?'k':'hint-title'}">${icon(i)} ${esc(label)}</div><div class="${kind==='card'?'v':'hint-value'}">${esc(value)}</div></div>`;
-function dateText(v){return v?new Date(v).toLocaleString(currentLang==='hu'?'hu-HU':'en-GB'):'—';}
+const huDate=iso=>iso?iso.slice(0,10).replaceAll('-','.')+'.':'—';
+const dateText=v=>v?new Intl.DateTimeFormat('hu-HU',{timeZone:'Europe/Budapest',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}).format(new Date(v)):'—';
+let calendarTarget,calendarYear,calendarMonth,activePull;
+const monthsHU=['január','február','március','április','május','június','július','augusztus','szeptember','október','november','december'];
+function setDateValue(id,iso){const el=document.getElementById(id);el.dataset.iso=iso||'';el.value=iso?huDate(iso):'';}
+function openCalendar(id){
+ calendarTarget=id;
+ const iso=document.getElementById(id).dataset.iso||lastData?.history_available_to||new Date().toISOString().slice(0,10);
+ calendarYear=Number(iso.slice(0,4));calendarMonth=Number(iso.slice(5,7))-1;
+ renderCalendar();document.getElementById('datePicker').showModal();
+}
+function renderCalendar(){
+ const selected=document.getElementById(calendarTarget).dataset.iso;
+ const minYear=Math.min(Number((lastData?.history_available_from||'2025').slice(0,4)),calendarYear);
+ const maxYear=Math.max(new Date().getFullYear(),Number((lastData?.history_available_to||'2026').slice(0,4)),calendarYear);
+ document.getElementById('calendarYear').innerHTML=Array.from({length:maxYear-minYear+1},(_,i)=>`<option value="${minYear+i}" ${minYear+i===calendarYear?'selected':''}>${minYear+i}</option>`).join('');
+ document.getElementById('calendarMonth').innerHTML=monthsHU.map((m,i)=>`<option value="${i}" ${i===calendarMonth?'selected':''}>${m}</option>`).join('');
+ const offset=(new Date(Date.UTC(calendarYear,calendarMonth,1)).getUTCDay()+6)%7;
+ const count=new Date(Date.UTC(calendarYear,calendarMonth+1,0)).getUTCDate();
+ const cells=Array.from({length:offset},()=>'<span></span>');
+ for(let day=1;day<=count;day++){
+  const iso=`${calendarYear}-${String(calendarMonth+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+  cells.push(`<button type="button" class="calendar-day ${selected===iso?'selected':''}" data-date="${iso}" aria-label="${huDate(iso)}" ${selected===iso?'aria-current="date"':''}>${day}</button>`);
+ }
+ document.getElementById('calendarDays').innerHTML=cells.join('');
+ for(const button of document.querySelectorAll('.calendar-day'))button.onclick=()=>{setDateValue(calendarTarget,button.dataset.date);rangeInitialized=true;document.getElementById('datePicker').close();};
+}
+for(const id of ['fromDate','toDate']){
+ const el=document.getElementById(id);el.onclick=()=>openCalendar(id);el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openCalendar(id);}};
+ document.querySelector(`[data-calendar="${id}"]`).onclick=()=>openCalendar(id);
+}
+document.getElementById('calendarClose').onclick=()=>document.getElementById('datePicker').close();
+document.getElementById('calendarMonth').onchange=e=>{calendarMonth=Number(e.target.value);renderCalendar();};
+document.getElementById('calendarYear').onchange=e=>{calendarYear=Number(e.target.value);renderCalendar();};
+function shiftMonth(delta){const d=new Date(Date.UTC(calendarYear,calendarMonth+delta,1));calendarYear=d.getUTCFullYear();calendarMonth=d.getUTCMonth();renderCalendar();}
+document.getElementById('calendarPrevious').onclick=()=>shiftMonth(-1);document.getElementById('calendarNext').onclick=()=>shiftMonth(1);
+
 function render(d){lastData=d;
- document.documentElement.lang=currentLang;
+ document.documentElement.lang='hu';
+ if(!rangeInitialized){setDateValue('fromDate',d.history_selected_from);setDateValue('toDate',d.history_selected_to);rangeInitialized=true;}
  document.getElementById('dashTitle').innerHTML=icon('fa-solar-panel')+' '+t('title');
  document.getElementById('lang').innerHTML=icon('fa-earth-europe')+' '+(currentLang==='en'?'HU':'EN');
  const texts={downloadHistory:['download','fa-download'],applyRange:['apply','fa-filter'],shortcutDay:['day','fa-clock'],shortcutWeek:['week','fa-calendar-week'],shortcutMonth:['month','fa-calendar-days'],btnStart:['start','fa-play'],btnStop:['stop','fa-stop'],btnForce:['force','fa-power-off']};
@@ -1907,11 +1984,12 @@ function render(d){lastData=d;
  metrics+=card(t('weather'),d.current_condition||t('unknown'),'fa-cloud-sun')+card(t('sunrise'),(d.sunrise||'').slice(11,16)||'—','fa-sun')+card(t('sunset'),(d.sunset||'').slice(11,16)||'—','fa-moon')+card(t('clouds'),num(d.clouds,'%'),'fa-cloud')+card(t('history'),num(d.history_count),'fa-clock-rotate-left');
  document.getElementById('metrics').innerHTML=metrics;
  const hints=d.historical_hints||{},b=hints.energy_budget,meter=d.power_measurement;
- const budget=b?card(t('minimum'),num(b.minimum_soc,'%'),'fa-battery-quarter','hint-card')+card(t('end'),num(b.end_soc,'%'),'fa-battery-full','hint-card')+card(t('pvwh'),num(b.expected_pv_wh,' Wh'),'fa-solar-panel','hint-card')+card(t('loadwh'),num(b.expected_load_wh,' Wh'),'fa-bolt','hint-card')+card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card'):card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+`<div class="hint-card decision-card">${esc(d.monitoring_mode==='idle_safety'?t('idle'):t('waiting'))}</div>`;
+ const budget=b?card(t('minimum'),num(b.minimum_soc,'%'),'fa-battery-quarter','hint-card')+card(t('end'),num(b.end_soc,'%'),'fa-battery-full','hint-card')+card(t('pvwh'),num(b.expected_pv_wh,' Wh'),'fa-solar-panel','hint-card')+card(t('loadwh'),num(b.expected_load_wh,' Wh'),'fa-bolt','hint-card')+card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+card(t('cover'),dateText(b.cover_time),'fa-sun','hint-card')+card(t('planned'),dateText(b.planned_stop),'fa-clock','hint-card')+card(t('bridge'),num(b.required_bridge_wh,' Wh')+' / '+num(b.available_bridge_wh,' Wh'),'fa-battery-half','hint-card'):card(t('floor'),num(hints.min_stop_soc,'%'),'fa-shield-heart','hint-card')+card(t('reserve'),num(hints.late_day_reserve_soc,'%'),'fa-moon','hint-card')+`<div class="hint-card decision-card">${esc(d.monitoring_mode==='idle_safety'?t('idle'):t('waiting'))}</div>`;
  const phase=[1,2,3].map(i=>card('INV L'+i,num(d['inv_l'+i],' W'),'fa-bolt','hint-card')).join('')+card(t('inverter'),num(d.inv_lt,' W'),'fa-gauge-high','hint-card')+card(t('temp'),num(d.garage_temp,' °C',1),'fa-temperature-half','hint-card')+card(t('hum'),num(d.garage_hum,'%'),'fa-droplet','hint-card');
- document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${t('plan')}</h3><div class="hints-grid">${budget}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div>${meter?`<div class="hint-sub">${t('measured')}: ${num(meter.total,' W')} · L1 ${num(meter.l1,' W')} / L2 ${num(meter.l2,' W')} / L3 ${num(meter.l3,' W')}</div><div class="hint-sub">${t('collected')}: ${esc(dateText(meter.at))}</div>`:''}<div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):String(d.power_measurement_source||'').startsWith('consumption')?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
+ document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${t('plan')}${b&&!b.safe?(currentLang==='hu'?' · elutasított futás előrejelzése':' · rejected-run forecast'):''}</h3><div class="hints-grid">${budget}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div>${meter?`<div class="hint-sub">${t('measured')}: ${num(meter.total,' W')} · L1 ${num(meter.l1,' W')} / L2 ${num(meter.l2,' W')} / L3 ${num(meter.l3,' W')}</div><div class="hint-sub">${t('collected')}: ${esc(dateText(meter.at))}</div>`:''}<div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):String(d.power_measurement_source||'').startsWith('consumption')?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
  const notices=Array.isArray(d.notifications)?d.notifications:[];
- document.getElementById('notifList').innerHTML=notices.length?notices.slice(0,5).map(n=>`<div class="notice-item ${['info','warn','error','success'].includes(n.level)?n.level:'info'}"><div class="notice-meta">${esc(dateText(n.ts))}</div><div>${esc(n.message)}</div></div>`).join(''):`<div class="notice-empty">${t('empty')}</div>`;
+ document.getElementById('notifList').innerHTML=notices.length?notices.slice(0,5).map(n=>`<div class="notice-item ${['info','warn','error','success'].includes(n.level)?n.level:'info'}"><div class="notice-meta">${esc(dateText(n.ts))}</div><div>${esc(String(n.message||'').replace(/(\d{4})-(\d{2})-(\d{2})(T| )?/g,(_,y,m,day,sep)=>`${y}.${m}.${day}.${sep?' ':''}`))}</div></div>`).join(''):`<div class="notice-empty">${t('empty')}</div>`;
+ const coverage=document.getElementById('historyCoverage');coverage.className='panel history-coverage'+(d.history_count?'':' empty');coverage.textContent=(currentLang==='hu'?'Betöltött előzmények: ':'Loaded history: ')+huDate(d.history_available_from)+' – '+huDate(d.history_available_to)+' · '+d.history_files+' JSON · '+d.history_total_count+' '+t('samples')+(d.history_count?'':(currentLang==='hu'?' · A kiválasztott időszakhoz nincs betöltött mérés. Ellenőrizd az előzménykönyvtárat.':' · No loaded measurements in the selected period. Check the history directory.'));
  const h=d.history||[],step=Math.max(1,Math.ceil(h.length/2000)),rows=h.filter((_,i)=>i%step===0);
  for(const [id,key,title,color,unit] of [['powerChart','power',t('pv'),'#4ade80','W'],['consumptionChart','consumption',t('load'),'#60a5fa','W'],['batteryChart','battery',t('battery'),'#a78bfa','%']]){
   document.getElementById(id+'Title').textContent=title;document.getElementById(id+'Sub').textContent=`solarman_json · ${rows.length}/${h.length} ${t('samples')}`;
@@ -1919,11 +1997,12 @@ function render(d){lastData=d;
   charts[id].data={labels:rows.map(r=>dateText(r.ts)),datasets:[{label:title+' ('+unit+')',data:rows.map(r=>r[key]),borderColor:color,backgroundColor:color,pointRadius:0,pointHoverRadius:5,borderWidth:2,tension:.2}]};charts[id].update();
  }
 }
-async function pull(){try{const r=await fetch('/api/snapshot?'+new URLSearchParams(currentRange));if(!r.ok)throw Error('HTTP '+r.status);render(await r.json());}catch(e){showActionResult(String(e),'err');}}
+async function pull(){if(activePull)activePull.abort();const controller=new AbortController();activePull=controller;try{const r=await fetch('/api/snapshot?'+new URLSearchParams(currentRange),{signal:controller.signal});const data=await r.json();if(!r.ok)throw Error(data.error||'HTTP '+r.status);if(!controller.signal.aborted)render(data);}catch(e){if(e.name!=='AbortError')showActionResult(String(e),'err');}}
+
 function showActionResult(message,level='warn'){const el=document.getElementById('actionResult');el.className='k show '+level;el.textContent=message;}
 async function act(action){const buttons=['btnStart','btnStop','btnForce'].map(id=>document.getElementById(id));buttons.forEach(b=>b.disabled=true);try{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});const d=await r.json();showActionResult(d.message,d.ok?'ok':'err');}catch(e){showActionResult(String(e),'err');}finally{buttons.forEach(b=>b.disabled=false);}}
-function setRangeDays(days){const rows=lastData?.history||[];const latest=rows.length?rows[rows.length-1].ts.slice(0,10):new Date().toISOString().slice(0,10);const to=new Date(latest+'T12:00:00Z'),from=new Date(to);from.setUTCDate(to.getUTCDate()-days);document.getElementById('fromDate').value=from.toISOString().slice(0,10);document.getElementById('toDate').value=latest;applyRange();}
-function applyRange(){currentRange={from:document.getElementById('fromDate').value,to:document.getElementById('toDate').value};pull();}
+function setRangeDays(days){rangeInitialized=true;const latest=lastData?.history_available_to||new Date().toISOString().slice(0,10);const to=new Date(latest+'T12:00:00Z'),from=new Date(to);from.setUTCDate(to.getUTCDate()-days);setDateValue('fromDate',from.toISOString().slice(0,10));setDateValue('toDate',latest);applyRange();}
+function applyRange(){currentRange={from:document.getElementById('fromDate').dataset.iso||'',to:document.getElementById('toDate').dataset.iso||''};pull();}
 document.getElementById('applyRange').onclick=applyRange;for(const [id,days] of [['shortcutDay',1],['shortcutWeek',7],['shortcutMonth',30]])document.getElementById(id).onclick=()=>setRangeDays(days);
 document.getElementById('downloadHistory').onclick=()=>{window.location.href='/api/history/download';};
 document.body.dataset.theme=localStorage.getItem('solar-theme')||'dark';document.getElementById('theme').onclick=()=>{document.body.dataset.theme=document.body.dataset.theme==='dark'?'light':'dark';localStorage.setItem('solar-theme',document.body.dataset.theme);};document.getElementById('lang').onclick=()=>{currentLang=currentLang==='en'?'hu':'en';localStorage.setItem('solar-lang',currentLang);if(lastData)render(lastData);};
@@ -1937,27 +2016,24 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
     with snapshot_lock:
         snap = dict(_shared_snapshot)
         hist = list((historical_profile or {}).get("rows",[]))
+    for key in ('battery','power','inv_lt','inv_l1','inv_l2','inv_l3','garage_temp','garage_hum','clouds'):
+        value = _safe_float(snap.get(key), None)
+        snap[key] = value if value is not None and math.isfinite(value) else None
     notices = list(web_notifications)[:5]
 
     now = datetime.now(tz=budapest_tz)
-    start_ts = None
-    end_ts = None
-    try:
-        if from_date:
-            start_ts = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=budapest_tz)
-    except ValueError:
-        start_ts = None
-    try:
-        if to_date:
-            end_ts = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=budapest_tz) + timedelta(days=1)
-    except ValueError:
-        end_ts = None
-
-    if start_ts is None or end_ts is None:
-        latest = datetime.fromisoformat(hist[-1]['ts']) if hist else now
-        end_ts = latest + timedelta(seconds=1)
-        start_ts = latest - timedelta(days=30)
-
+    def parse_date(value):
+        for pattern in ('%Y-%m-%d','%Y.%m.%d.','%Y.%m.%d'):
+            try:
+                return datetime.strptime(value,pattern).replace(tzinfo=budapest_tz)
+            except ValueError:
+                continue
+        raise ValueError('Use YYYY-MM-DD or YYYY.MM.DD. dates')
+    latest = datetime.fromisoformat(hist[-1]['ts']) if hist else now
+    start_ts = parse_date(from_date) if from_date else latest.replace(hour=0,minute=0,second=0,microsecond=0)-timedelta(days=30)
+    end_ts = parse_date(to_date)+timedelta(days=1) if to_date else latest+timedelta(seconds=1)
+    if start_ts >= end_ts:
+        raise ValueError('Start date must not be after end date')
     filtered_hist = []
     for item in hist:
         try:
@@ -2007,6 +2083,13 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "sunrise": snap.get("sunrise").isoformat() if snap.get("sunrise") else "",
         "sunset": snap.get("sunset").isoformat() if snap.get("sunset") else "",
         "history_source": "solarman_json",
+        "history_selected_from": start_ts.date().isoformat(),
+        "history_selected_to": (end_ts-timedelta(seconds=1)).date().isoformat(),
+        "history_available_from": hist[0]['ts'][:10] if hist else None,
+        "history_available_to": hist[-1]['ts'][:10] if hist else None,
+        "history_total_count": len(hist),
+        "history_files": (historical_profile or {}).get('files',0),
+        "history_directories": (historical_profile or {}).get('directories',[]),
         "history_count": len(filtered_hist),
         "history": filtered_hist,
         "historical_hints": snap.get("historical_hints", {}),
@@ -2016,11 +2099,15 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
 
 class WebHandler(BaseHTTPRequestHandler):
     def _write(self, code: int, body: bytes, ctype: str):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -2065,12 +2152,12 @@ class WebHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/snapshot":
             qs = parse_qs(parsed.query)
-            payload = json.dumps(
-                _build_snapshot_payload(
-                    qs.get("from", [None])[0],
-                    qs.get("to", [None])[0],
-                )
-            ).encode("utf-8")
+            try:
+                payload = json.dumps(_build_snapshot_payload(
+                    qs.get("from",[None])[0],qs.get("to",[None])[0])).encode("utf-8")
+            except ValueError as error:
+                self._write(400,json.dumps({'error':str(error)}).encode('utf-8'),'application/json')
+                return
             self._write(200, payload, "application/json")
             return
         if parsed.path == "/api/history/download":
@@ -2328,7 +2415,7 @@ def main_loop():
             sleep_until_next_5min(offset_seconds=60)
             print("__________________________________________________________________________________________")
         else:
-            print(f"[Safety monitoring] Outside production window: Solarman every {solar_interval // 60} minutes. (Sunset stop: {sunset.strftime('%H:%M')})")
+            print(f"[Safety monitoring] Outside production window: Solarman every {solar_interval // 60} minutes. (Sunset stop: {sunset.strftime('%H:%M') if isinstance(sunset,datetime) else 'N/A'})")
             print(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
             (current_condition, sunrise, sunset, clouds,

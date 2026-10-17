@@ -28,10 +28,10 @@ class HistoryModelTests(unittest.TestCase):
         self.assertTrue(self.budget()['safe'])
         self.assertFalse(self.budget(load=3500)['safe'])
 
-    def test_weather_and_current_solar_only_reduce_forecast(self):
+    def test_weather_derates_forecast_and_measured_pv_can_support_a_bridge(self):
         self.assertLess(self.budget(weather='solar_weak')['expected_pv_wh'], self.budget()['expected_pv_wh'])
-        self.assertFalse(self.budget(pv=0)['safe'])
-        self.assertEqual(self.budget(pv=9000)['expected_pv_wh'], self.budget()['expected_pv_wh'])
+        self.assertTrue(self.budget(pv=0)['safe'])  # Adequate battery may bridge a sunny dawn.
+        self.assertGreater(self.budget(pv=4500)['expected_pv_wh'], self.budget()['expected_pv_wh'])
 
     def test_curtailed_midday_energy_cannot_cover_late_deficit(self):
         for h in range(14, 24):
@@ -58,7 +58,9 @@ class HistoryModelTests(unittest.TestCase):
     def test_aggregate_historical_load_is_not_charged_for_rig_twice(self):
         for hour in self.profile['hours'].values():
             hour['load_p75'] = 1500
-        self.assertEqual(self.budget()['expected_load_wh'], 8*1500)
+            hour['load_p25'] = 300
+            hour['load_p50'] = 300
+        self.assertEqual(self.budget()['expected_load_wh'], 8*(300+900))
 
     def test_loader_timezone_duplicate_median_validation_cutoff_and_no_writes(self):
         row = {'Updated Time': '2026/06/10 08:00', 'Time Zone': 'UTC+00:00',
