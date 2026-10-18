@@ -31,8 +31,9 @@ Download utilities are run from the repository root with
 `solarman_json/*.json` is the **only historical measurement source**. Use the
 provided downloaded Solarman exports. The application reads these files at
 startup; it never updates them or creates a replacement measurement archive.
-There is no `solarminer_json` recorder, telemetry backup, persisted live-data
-cache, or learning from controller-generated recordings.
+There is no `solarminer_json` recorder or telemetry backup. The planner never
+learns from controller-generated recordings. A separate rolling 24-hour JSON
+exists solely for the dashboard and is never used as planning history.
 
 The model uses every nonduplicate timestamp from every available export, including
 both the host and bundled directories. UTC offsets are normalized to
@@ -211,7 +212,7 @@ GUI/API/Telegram distinguish requested state, ping reachability, command pending
 failed/unverified stop and unknown, and show the target, last check, attempts and
 confirmation time. Solar energy decisions are still evaluated on the existing
 schedule; runtime reachability supervises an outstanding STOP independently.
-There is no JSON measurement recorder or persisted power signature.
+There is no long-term measurement recorder or persisted power signature. The dashboard alone keeps a rolling 24-hour JSON file.
 
 For energy planning/display, on the supplied Deye schema, `E_Puse_t1` with explicit W/kW units is total
 instantaneous consumption. Pair it with `LPP_A/B/C` (whole-house phases), not
@@ -240,12 +241,21 @@ updates do not trigger extra Solarman polling.
 
 Two separate current-week reference plots have fixed 00:00–24:00 axes: PV in W
 and battery SOC in %. They always show this calendar week's cross-year curve,
-independent of the history date filter. Four additional live plots show actual
-L1, L2, L3 and SUM in W over the last 24 hours. The supplied exports contain no
-historical phase columns: these plots use a bounded 288-point RAM buffer,
-cleared on restart or meter-source changes, **never saved to JSON**. Fresh device
-timestamps are deduplicated. Historical SUM remains date-filterable alongside
-historical PV and SOC; no historical phases are fabricated.
+independent of the history date filter. The separate **Last 24 hours** section shows L1, L2, L3 and SUM in W,
+PV, battery SOC, temperature, humidity, miner ON/OFF (ping reachability), and
+weather. Successful scheduled Solarman responses are saved with contemporaneous
+sensor, ping and weather values in `runtime/last_24_hours.json`. Failed requests
+do not fabricate points; unknown values remain gaps. Miner state reflects ping
+reachability, not an independent physical power measurement.
+
+The JSON file is atomically replaced and pruned to the latest 24 hours on each
+update, dashboard read, and controller loop, including startup. It survives
+container recreation through the Compose `./runtime:/app/runtime` mount.
+`MY_RECENT_HISTORY_FILE` selects its location. No extra API requests are made;
+existing five-minute / thirty-minute scheduling is unchanged. Supplied exports
+remain read-only and this short display history never feeds the energy planner.
+Historical SUM remains date-filterable alongside historical PV and SOC; no
+historical phases are fabricated.
 
 Telegram `/now` and automatic run/stop messages use the same live plan and weekly
 references as the GUI, including bridge Wh, cover/stop time, projected SOC,

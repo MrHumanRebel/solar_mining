@@ -30,6 +30,7 @@ COPY solar.py ./
 COPY solar_mining ./solar_mining
 COPY assets ./assets
 COPY scripts ./scripts
+COPY runtime/last_24_hours.json ./runtime/last_24_hours.json
 # Keep bundled exports visible even when an older host directory is mounted.
 COPY solarman_json ./bundled_solarman_json
 

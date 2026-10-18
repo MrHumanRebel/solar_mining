@@ -8,3 +8,6 @@ quote_usage.json
 solarminer_json/
 telemetry_history*.json
 __pycache__/
+
+# Rolling display data (last 24 hours only)
+runtime/
