@@ -1,4 +1,5 @@
 import requests
+from .recent_history import RecentHistory
 from .status_messages import status as telegram_status, phases as telegram_phases
 from .power_measurement import PowerSample
 from .miner_ping_guard import MinerPingGuard, ping_host
@@ -56,6 +57,7 @@ MINING_ALGORITHM = os.getenv("MY_MINING_ALGORITHM", "pearlpow").strip().lower()
 MINING_WORKER = os.getenv("MY_MINING_WORKER", "solarminer").strip()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_DIR = PROJECT_ROOT / 'assets'
+_recent_history = RecentHistory(os.getenv('MY_RECENT_HISTORY_FILE', str(PROJECT_ROOT / 'runtime' / 'last_24_hours.json')))
 
 HISTORY_DIR = os.getenv('MY_HISTORY_DIR', 'solarman_json')
 BATTERY_CAPACITY_AH = float(os.getenv("MY_BATTERY_CAPACITY_AH", "200"))
@@ -1000,6 +1002,30 @@ def sleep_until_next_5min(offset_seconds=60):
     time.sleep(sleep_seconds)
 
 
+
+def _english_notification(message):
+    """Keep Telegram Hungarian; provide English UI summaries of controller notices."""
+    if '☀ Solar Mining' in message:
+        heading = message.split('☀ Solar Mining',1)[0].strip()
+        fields = re.search(r'Kívánt állapot: (.*?) · PV: (.*?) · Akku: ([^ ]+)',message)
+        if heading.startswith('⏹'):
+            heading = '⏹ STOP requested; long press and ping verification. Shutdown is not yet confirmed.'
+        elif heading.startswith('▶'):
+            heading = '▶ RUN decision; start is verified using ping.'
+        if fields:
+            return f"{heading} Requested state: {fields[1]} · PV: {fields[2]} · Battery: {fields[3]}"
+    translations = {
+        'A miner IP-je két egymást követő pingellenőrzésben nem válaszolt.':'Miner IP did not reply in two consecutive ping checks.',
+        'STOP kérve / hosszú nyomás után pinges ellenőrzésre vár.':'STOP requested; waiting for ping verification after long press.',
+        'A miner továbbra is elérhető vagy a GPIO-kísérlet hibás; leállítás nincs igazolva.':'Miner reachable or GPIO attempt failed; shutdown unconfirmed.',
+        'Pingellenőrzési hiba; leállítás nem igazolható.':'Ping check failed; shutdown cannot be confirmed.',
+        'kísérlet':'attempt', '(nincs limit)':'(unlimited)',
+    }
+    for source,target in translations.items():
+        message = message.replace(source,target)
+    return message
+
+
 def _push_web_notification(message: str, level: str = "info") -> None:
     msg = str(message or "").strip()
     if not msg:
@@ -1010,6 +1036,7 @@ def _push_web_notification(message: str, level: str = "info") -> None:
         "ts": datetime.now(tz=budapest_tz).isoformat(),
         "level": level if level in {"info", "success", "warn", "error"} else "info",
         "message": short,
+        "message_en": _english_notification(cleaned)[:240] + ("…" if len(_english_notification(cleaned))>240 else ""),
     })
 
 
@@ -1447,6 +1474,35 @@ def record_live_power(now: datetime, expected_state: str, data: Dict[str, Any], 
                                            'l3':sample.l3,'sum':sample.total,'source':sample.source})
 
 
+
+def record_recent_history(now, data):
+    """Store only successful Solarman responses and contemporaneous display data."""
+    dl = data.get('dataList') if isinstance(data, dict) else None
+    if not isinstance(dl, list) or not dl:
+        return
+    dl = [item for item in dl if isinstance(item, dict)]
+    with snapshot_lock:
+        snap = dict(_shared_snapshot)
+    with runtime_lock:
+        runtime = _runtime_guard.status(datetime.now(tz=budapest_tz))
+    sample = _extract_power_sample(data, now)
+    def finite(value):
+        value = _safe_float(value, None)
+        return value if value is not None and math.isfinite(value) else None
+    row = {'ts':now.isoformat(), 'device_time':sample.at.isoformat() if sample else None,
+           'power':finite(_find_value(dl, 'S_P_T', None)),
+           'battery':finite(_find_value(dl, 'BMS_SOC', _find_value(dl, 'B_left_cap1', None))),
+           'temperature':finite(snap.get('garage_temp')), 'humidity':finite(snap.get('garage_hum')),
+           'miner':1 if runtime['reachable'] is True else 0 if runtime['state']=='off' else None,
+           'runtime_state':runtime['state'], 'weather':snap.get('current_condition') or 'unknown',
+           'clouds':finite(snap.get('clouds')),
+           'source':sample.source if sample else None}
+    for field in ('l1','l2','l3'):
+        row[field] = finite(getattr(sample,field,None)) if PowerSample.fresh(sample,now) else None
+    row['sum'] = finite(sample.total) if PowerSample.fresh(sample,now) else None
+    _recent_history.append(row, now)
+
+
 def _runtime_tick():
     """ICMP-only supervision, independent of Solarman polling and power values."""
     global _last_force_shutdown_at,_last_power_notice_key
@@ -1586,6 +1642,7 @@ def _idle_monitor_cycle(now: datetime, token_future, garage_temp, garage_hum, po
                                  "garage_hum": garage_hum, "monitoring_mode": "idle_safety",
                                  "solarman_polled_at": now.isoformat(),
                                  "solarman_poll_interval_seconds": poll_interval_seconds})
+    record_recent_history(now, data)
     if is_rpi:
         write_to_display("monitor", readings["battery"], readings["power"], garage_temp, garage_hum)
     return data
@@ -1849,7 +1906,7 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 <div class="actions"><button id="lang" class="btn ghost"><i class="fa-solid fa-earth-europe"></i> HU</button><button id="theme" class="btn warn"><i class="fa-solid fa-circle-half-stroke"></i> Theme</button><button id="downloadHistory" class="btn ghost"><i class="fa-solid fa-download"></i> History JSON</button></div></div>
 <div class="grid metrics-grid" id="metrics"></div>
 <div class="panel hints-panel"><div class="hints-wrap" id="historyHints"></div></div>
-<section class="panel"><h3 id="weeklyTitle"></h3><p id="weeklySummary" class="history-coverage"></p><div class="charts"><div class="card chart-card"><canvas id="weeklyPvChart"></canvas></div><div class="card chart-card"><canvas id="weeklySocChart"></canvas></div></div></section><section class="panel"><h3 id="livePowerTitle"></h3><p id="livePowerNote" class="history-coverage"></p><div class="charts"><div class="card chart-card"><div class="chart-head"><div id="liveL1ChartTitle" class="chart-title"></div></div><canvas id="liveL1Chart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="liveL2ChartTitle" class="chart-title"></div></div><canvas id="liveL2Chart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="liveL3ChartTitle" class="chart-title"></div></div><canvas id="liveL3Chart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="liveSumChartTitle" class="chart-title"></div></div><canvas id="liveSumChart"></canvas></div></div></section><div class="panel history-coverage">Dátumszűrhető nyers exportok · a fenti heti referenciáktól és élő fázisplotoktól független.</div>
+<section class="panel"><h3 id="weeklyTitle"></h3><p id="weeklySummary" class="history-coverage"></p><div class="charts"><div class="card chart-card"><canvas id="weeklyPvChart"></canvas></div><div class="card chart-card"><canvas id="weeklySocChart"></canvas></div></div></section><section class="panel"><h3 id="livePowerTitle"></h3><p id="livePowerNote" class="history-coverage"></p><div class="charts"><div class="card chart-card"><div class="chart-head"><div id="liveL1ChartTitle" class="chart-title"></div></div><canvas id="liveL1Chart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="liveL2ChartTitle" class="chart-title"></div></div><canvas id="liveL2Chart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="liveL3ChartTitle" class="chart-title"></div></div><canvas id="liveL3Chart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="liveSumChartTitle" class="chart-title"></div></div><canvas id="liveSumChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="recentPvTitle" class="chart-title"></div></div><canvas id="recentPv"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="recentSocTitle" class="chart-title"></div></div><canvas id="recentSoc"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="recentTempTitle" class="chart-title"></div></div><canvas id="recentTemp"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="recentHumidityTitle" class="chart-title"></div></div><canvas id="recentHumidity"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="recentMinerTitle" class="chart-title"></div></div><canvas id="recentMiner"></canvas></div><div class="card chart-card"><div class="chart-head"><div id="recentWeatherTitle" class="chart-title"></div></div><canvas id="recentWeather"></canvas></div></div></section><div id="rawHistoryNote" class="panel history-coverage"></div>
 <div class="panel toolbar"><div class="filters">
 <div class="field field-date"><label id="lblFrom" for="fromDate">From</label><input id="fromDate" type="text" readonly placeholder="ÉÉÉÉ.HH.NN." aria-label="fromDate" /><button type="button" class="calendar-trigger" data-calendar="fromDate" aria-label="Naptár megnyitása"><i class="fa-solid fa-calendar-days" aria-hidden="true"></i></button></div>
 <div class="field field-date"><label id="lblTo" for="toDate">To</label><input id="toDate" type="text" readonly placeholder="ÉÉÉÉ.HH.NN." aria-label="toDate" /><button type="button" class="calendar-trigger" data-calendar="toDate" aria-label="Naptár megnyitása"><i class="fa-solid fa-calendar-days" aria-hidden="true"></i></button></div>
@@ -1865,7 +1922,7 @@ body{margin:0;background:linear-gradient(145deg,var(--bg),var(--bg2));color:var(
 <dialog id="datePicker" class="date-picker" aria-label="Dátum kiválasztása"><div class="calendar-nav"><button type="button" id="calendarPrevious" aria-label="Előző hónap">‹</button><select id="calendarYear" aria-label="Év"></select><select id="calendarMonth" aria-label="Hónap"></select><button type="button" id="calendarNext" aria-label="Következő hónap">›</button><button type="button" id="calendarClose" aria-label="Naptár bezárása">×</button></div><div class="calendar-grid calendar-week"><span>H</span><span>K</span><span>Sze</span><span>Cs</span><span>P</span><span>Szo</span><span>V</span></div><div id="calendarDays" class="calendar-grid"></div></dialog>
 <div class="charts"><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-solar-panel"></i> <span id="powerChartTitle"></span></div><div id="powerChartSub" class="chart-sub"></div></div><canvas id="powerChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-bolt"></i> <span id="consumptionChartTitle"></span></div><div id="consumptionChartSub" class="chart-sub"></div></div><canvas id="consumptionChart"></canvas></div><div class="card chart-card"><div class="chart-head"><div class="chart-title"><i class="fa-solid fa-battery-three-quarters"></i> <span id="batteryChartTitle"></span></div><div id="batteryChartSub" class="chart-sub"></div></div><canvas id="batteryChart"></canvas></div></div></div><script>
 let currentLang=localStorage.getItem('solar-lang')||'en',currentRange={},lastData,charts={},rangeInitialized=false;
-const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Miner ping verification',decision:'Decision',minimum:'Minimum SOC during planned run/refill',end:'SOC at sunset after planned mining stop',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Week reference coverage',floor:'Protected SOC floor',reserve:'Household night reserve',planned:'Planned mining stop',cover:'Sustained solar cover',bridge:'PV deficit to cover / available battery (margin included)',startup:'Startup energy / total start budget',bridgeTime:'Time to sustained cover',houseOnly:'Sunset SOC without mining',houseLoad:'Household load assumed in forecast',noCover:'No sustained cover forecast; bridge unavailable',uncertainPV:'Not estimable from curtailed PV',bufferPV:'Delivered-PV scenario energy',bufferMinimum:'Worst-case SOC at stop (zero PV)',bufferBudget:'Bounded run budget / battery above reserve',bufferMode:'Near-full battery · bounded surplus run',bufferNote:'Zero export: measured PV may follow load when the battery is full. This short run is funded from battery energy above 90%, even assuming zero PV; the sunset SOC cannot be reliably inferred from curtailed PV. Reassess every 5 minutes.',source:'Provided solarman_json history · live phase plots use RAM only',load:'Consumption',measured:'Selected power measurement',collected:'Device collection time',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Miner pinges ellenőrzés',decision:'Döntés',minimum:'Minimum SOC a tervezett futás/visszatöltés alatt',end:'Napnyugtai SOC a tervezett leállítás után',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Heti referencia lefedettsége',floor:'Védett SOC minimum',reserve:'Éjszakai háztartási tartalék',planned:'Tervezett bányászleállítás',cover:'Tartós napenergia-fedezet',bridge:'PV-hiány fedezetig / elérhető akku (ráhagyással)',startup:'Indítási energia / teljes indítási keret',bridgeTime:'Idő a tartós solar fedezetig',houseOnly:'Napnyugtai SOC bányászat nélkül',houseLoad:'Háztartási terhelés a becslésben',noCover:'Nincs előre jelzett tartós fedezet; bridge nem számítható',uncertainPV:'Visszafogott PV-ből nem becsülhető',bufferPV:'Leadott PV szerinti forgatókönyv',bufferMinimum:'Legrosszabb SOC leálláskor (PV nélkül)',bufferBudget:'Rövid futás kerete / tartalék feletti akku',bufferMode:'Közel tele akku · korlátozott többletfutás',bufferNote:'Nincs visszatáplálás: tele akkunál a mért PV követheti a terhelést. Ezt a rövid futást a 90% feletti akkukeret fedezi, akár nulla PV mellett; a napnyugtai SOC a visszafogott PV-ből nem becsülhető megbízhatóan. Újraszámítás 5 percenként.',source:'Megadott solarman_json előzmények · élő fázisgörbék csak RAM-ban',load:'Fogyasztás',measured:'Kiválasztott teljesítménymérés',collected:'Eszköz mérési ideje',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
+const words={en:{title:'Solar Mining Dashboard',state:'State',battery:'Battery',pv:'PV Power',hash:'Hashrate',weather:'Weather',sunrise:'Sunrise',sunset:'Sunset',clouds:'Clouds',history:'History Points',plan:'Historical energy plan',guard:'Miner ping verification',decision:'Decision',minimum:'Minimum SOC during planned run/refill',end:'SOC at sunset after planned mining stop',pvwh:'Expected PV energy',loadwh:'Expected demand',coverage:'Week reference coverage',floor:'Protected SOC floor',reserve:'Household night reserve',planned:'Planned mining stop',cover:'Sustained solar cover',bridge:'PV deficit to cover / available battery (margin included)',startup:'Startup energy / total start budget',bridgeTime:'Time to sustained cover',houseOnly:'Sunset SOC without mining',houseLoad:'Household load assumed in forecast',noCover:'No sustained cover forecast; bridge unavailable',uncertainPV:'Not estimable from curtailed PV',bufferPV:'Delivered-PV scenario energy',bufferMinimum:'Worst-case SOC at stop (zero PV)',bufferBudget:'Bounded run budget / battery above reserve',bufferMode:'Near-full battery · bounded surplus run',bufferNote:'Zero export: measured PV may follow load when the battery is full. This short run is funded from battery energy above 90%, even assuming zero PV; the sunset SOC cannot be reliably inferred from curtailed PV. Reassess every 5 minutes.',source:'Provided solarman_json history · last 24 hours saved separately',load:'Consumption',measured:'Selected power measurement',collected:'Device collection time',inverter:'Inverter output',phase:'Live phase power',environment:'Garage',temp:'Temperature',hum:'Humidity',waiting:'No current energy plan',idle:'Outside production hours',last:'Last solar reading',lag:'Pool data · may lag',download:'History JSON',from:'From',to:'To',apply:'Apply range',day:'Last day',week:'Last week',month:'Last month',start:'Start miner',stop:'Stop miner',force:'Force stop',notices:'Notifications',empty:'No notifications yet',unknown:'Unavailable',shown:'Chart samples',samples:'measurements',days:'days',no:'No',yes:'Yes',allowed:'Start allowed'},hu:{title:'Solar Mining Dashboard',state:'Állapot',battery:'Töltöttség',pv:'PV teljesítmény',hash:'Hashrate',weather:'Időjárás',sunrise:'Napkelte',sunset:'Napnyugta',clouds:'Felhőzet',history:'Előzményadatok',plan:'Történeti energiaterv',guard:'Miner pinges ellenőrzés',decision:'Döntés',minimum:'Minimum SOC a tervezett futás/visszatöltés alatt',end:'Napnyugtai SOC a tervezett leállítás után',pvwh:'Várható PV energia',loadwh:'Várható fogyasztás',coverage:'Heti referencia lefedettsége',floor:'Védett SOC minimum',reserve:'Éjszakai háztartási tartalék',planned:'Tervezett bányászleállítás',cover:'Tartós napenergia-fedezet',bridge:'PV-hiány fedezetig / elérhető akku (ráhagyással)',startup:'Indítási energia / teljes indítási keret',bridgeTime:'Idő a tartós solar fedezetig',houseOnly:'Napnyugtai SOC bányászat nélkül',houseLoad:'Háztartási terhelés a becslésben',noCover:'Nincs előre jelzett tartós fedezet; bridge nem számítható',uncertainPV:'Visszafogott PV-ből nem becsülhető',bufferPV:'Leadott PV szerinti forgatókönyv',bufferMinimum:'Legrosszabb SOC leálláskor (PV nélkül)',bufferBudget:'Rövid futás kerete / tartalék feletti akku',bufferMode:'Közel tele akku · korlátozott többletfutás',bufferNote:'Nincs visszatáplálás: tele akkunál a mért PV követheti a terhelést. Ezt a rövid futást a 90% feletti akkukeret fedezi, akár nulla PV mellett; a napnyugtai SOC a visszafogott PV-ből nem becsülhető megbízhatóan. Újraszámítás 5 percenként.',source:'Megadott solarman_json előzmények · utolsó 24 óra külön tárolva',load:'Fogyasztás',measured:'Kiválasztott teljesítménymérés',collected:'Eszköz mérési ideje',inverter:'Inverterkimenet',phase:'Élő fázisteljesítmény',environment:'Garázs',temp:'Hőmérséklet',hum:'Páratartalom',waiting:'Nincs aktuális energiaterv',idle:'Termelési időn kívül',last:'Utolsó solar mérés',lag:'Pool-adat · késhet',download:'Előzmény JSON',from:'Ettől',to:'Eddig',apply:'Szűrés alkalmazása',day:'Elmúlt nap',week:'Elmúlt hét',month:'Elmúlt hónap',start:'Bányászgép indítása',stop:'Bányászgép leállítása',force:'Kényszerleállítás',notices:'Értesítések',empty:'Még nincs értesítés',unknown:'Nem elérhető',shown:'Grafikonminták',samples:'mérés',days:'nap',no:'Nem',yes:'Igen',allowed:'Indítás engedélyezve'}};
 const t=k=>words[currentLang][k]||k;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,u='',digits=0)=>v==null||!Number.isFinite(Number(v))?'—':Number(v).toFixed(digits)+u;
@@ -1887,7 +1944,7 @@ function renderCalendar(){
  const minYear=Math.min(Number((lastData?.history_available_from||'2025').slice(0,4)),calendarYear);
  const maxYear=Math.max(new Date().getFullYear(),Number((lastData?.history_available_to||'2026').slice(0,4)),calendarYear);
  document.getElementById('calendarYear').innerHTML=Array.from({length:maxYear-minYear+1},(_,i)=>`<option value="${minYear+i}" ${minYear+i===calendarYear?'selected':''}>${minYear+i}</option>`).join('');
- document.getElementById('calendarMonth').innerHTML=monthsHU.map((m,i)=>`<option value="${i}" ${i===calendarMonth?'selected':''}>${m}</option>`).join('');
+ document.getElementById('calendarMonth').innerHTML=(currentLang==='hu'?monthsHU:['January','February','March','April','May','June','July','August','September','October','November','December']).map((m,i)=>`<option value="${i}" ${i===calendarMonth?'selected':''}>${m}</option>`).join('');
  const offset=(new Date(Date.UTC(calendarYear,calendarMonth,1)).getUTCDay()+6)%7;
  const count=new Date(Date.UTC(calendarYear,calendarMonth+1,0)).getUTCDate();
  const cells=Array.from({length:offset},()=>'<span></span>');
@@ -1925,9 +1982,9 @@ function renderReferencePlots(d){
   if(field==='pv_w')charts[id].data.datasets.push({label:'100% miner (W)',data:[{x:0,y:w.miner_power_w},{x:1440,y:w.miner_power_w}],borderColor:'#ef7777',borderDash:[6,5],borderWidth:1,pointRadius:0});
   charts[id].update();
  }
- document.getElementById('livePowerTitle').textContent=say('Measured L1 / L2 / L3 / SUM · last 24 h, RAM only','Mért L1 / L2 / L3 / SUM · utolsó 24 óra, csak RAM');
- document.getElementById('livePowerNote').textContent=say('The downloaded exports contain no historical phase columns. Real phase readings appear here after API polls; this bounded buffer is lost on restart and never saved to JSON.','A letöltött exportokban nincs történeti fázisoszlop. Az API valódi fázismérései itt jelennek meg; ez a korlátos puffer újraindításkor törlődik, JSON-ba nem mentjük.');
- const live=d.live_power||[],now=Date.now();
+ document.getElementById('livePowerTitle').textContent=say('Last 24 hours','Utolsó 24 óra');
+ document.getElementById('livePowerNote').textContent=say('Successful Solarman polls and contemporaneous sensors, ping state and weather. Saved in a rolling JSON file; older than 24 hours is automatically removed. Unknown readings remain gaps. Miner state means ping reachability.','Sikeres Solarman-lekérések, aktuális szenzorok, pingállapot és időjárás. Gördülő JSON; a 24 óránál régebbi adatok automatikusan törlődnek. Az ismeretlen mérés üres marad. A minerállapot pingelérhetőséget jelent.');
+ const live=d.recent_history||d.live_power||[],now=Date.now();
  for(const [id,field,color] of [['liveL1Chart','l1','#60a5fa'],['liveL2Chart','l2','#e8b957'],['liveL3Chart','l3','#f1788c'],['liveSumChart','sum','#68d9ab']]){
   const label=field==='sum'?'SUM':field.toUpperCase();
   document.getElementById(id+'Title').textContent=label+' (W)';
@@ -1937,11 +1994,31 @@ function renderReferencePlots(d){
   charts[id].data.datasets=[{label:source+' · '+label+' (W)',data:live.map(r=>({x:new Date(r.ts).getTime(),y:r[field]})),borderColor:color,borderWidth:2,pointRadius:live.length<3?3:0,spanGaps:false}];
   charts[id].update();
  }
+ const weatherLabels=[...new Set(live.map(r=>r.weather).filter(v=>v&&v!=='unknown'))];
+ for(const [id,field,title,unit,color] of [['recentPv','power',t('pv'),'W','#e8b957'],['recentSoc','battery',t('battery'),'%', '#a78bfa'],['recentTemp','temperature',t('temp'),'°C','#f1788c'],['recentHumidity','humidity',t('hum'),'%', '#60a5fa'],['recentMiner','miner',say('Miner ON / OFF (ping)','Miner BE / KI (ping)'),'','#68d9ab'],['recentWeather','weather',t('weather'),'','#e8b957']]){
+  document.getElementById(id+'Title').textContent=title+(unit?' ('+unit+')':'');
+  const categorical=field==='weather'||field==='miner';
+  const values=field==='weather'?weatherLabels:field==='miner'?[say('OFF','KI'),say('ON','BE')]:null;
+  if(!charts[id])charts[id]=new Chart(document.getElementById(id),{type:'line',data:{datasets:[]},options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{type:'linear',ticks:{maxTicksLimit:8,color:'#94a3b8',callback:v=>new Intl.DateTimeFormat('hu-HU',{timeZone:'Europe/Budapest',hour:'2-digit',minute:'2-digit'}).format(new Date(v))}},y:{ticks:{color:'#94a3b8'}}},plugins:{legend:{labels:{color:'#94a3b8'}}}}});
+  const y=charts[id].options.scales.y;
+  y.min=field==='temperature'?undefined:0;y.max=categorical?Math.max(1,values.length-1):['battery','humidity'].includes(field)?100:undefined;
+  y.ticks.stepSize=categorical?1:undefined;y.ticks.callback=categorical?v=>values[v]||'':v=>v;
+  charts[id].options.scales.x.min=now-24*3600000;charts[id].options.scales.x.max=now;
+  charts[id].data.datasets=[{label:title,data:live.map(r=>({x:new Date(r.ts).getTime(),y:field==='weather'?(weatherLabels.includes(r.weather)?weatherLabels.indexOf(r.weather):null):r[field]??null})),borderColor:color,borderWidth:2,pointRadius:2,stepped:categorical,spanGaps:false}];
+  charts[id].update();
+ }
 }
 
 function render(d){lastData=d;
- document.documentElement.lang='hu';
+ document.documentElement.lang=currentLang;
+ const hu=currentLang==='hu';
+ document.getElementById('rawHistoryNote').textContent=hu?'Dátumszűrhető nyers exportok · a heti referenciáktól és az utolsó 24 órától független.':'Date-filtered raw exports · independent of weekly references and the last 24 hours.';
+ document.querySelectorAll('.calendar-trigger').forEach(el=>el.setAttribute('aria-label',hu?'Naptár megnyitása':'Open calendar'));
+ document.querySelectorAll('.field-date input').forEach(el=>el.placeholder=hu?'ÉÉÉÉ.HH.NN.':'YYYY.MM.DD.');
+ for(const [id,en,huText] of [['datePicker','Choose date','Dátum kiválasztása'],['calendarPrevious','Previous month','Előző hónap'],['calendarNext','Next month','Következő hónap'],['calendarClose','Close calendar','Naptár bezárása'],['calendarYear','Year','Év'],['calendarMonth','Month','Hónap']])document.getElementById(id).setAttribute('aria-label',hu?huText:en);
+ document.querySelector('.calendar-week').innerHTML=(hu?['H','K','Sze','Cs','P','Szo','V']:['Mon','Tue','Wed','Thu','Fri','Sat','Sun']).map(day=>'<span>'+day+'</span>').join('');
  if(!rangeInitialized){setDateValue('fromDate',d.history_selected_from);setDateValue('toDate',d.history_selected_to);rangeInitialized=true;}
+ if(document.getElementById('datePicker').open)renderCalendar();
  document.getElementById('dashTitle').innerHTML=icon('fa-solar-panel')+' '+t('title');
  document.getElementById('lang').innerHTML=icon('fa-earth-europe')+' '+(currentLang==='en'?'HU':'EN');
  const texts={downloadHistory:['download','fa-download'],applyRange:['apply','fa-filter'],shortcutDay:['day','fa-clock'],shortcutWeek:['week','fa-calendar-week'],shortcutMonth:['month','fa-calendar-days'],btnStart:['start','fa-play'],btnStop:['stop','fa-stop'],btnForce:['force','fa-power-off']};
@@ -1961,7 +2038,7 @@ function render(d){lastData=d;
  const phase=[1,2,3].map(i=>card('INV L'+i,num(d['inv_l'+i],' W'),'fa-bolt','hint-card')).join('')+card(t('inverter'),num(d.inv_lt,' W'),'fa-gauge-high','hint-card')+card(t('temp'),num(d.garage_temp,' °C',1),'fa-temperature-half','hint-card')+card(t('hum'),num(d.garage_hum,'%'),'fa-droplet','hint-card');
  document.getElementById('historyHints').innerHTML=`<section class="hint-section"><h3 class="hint-section-title">${buffered?t('bufferMode'):t('plan')}${b&&!b.safe?(currentLang==='hu'?' · elutasított futás előrejelzése':' · rejected-run forecast'):''}</h3><div class="hints-grid">${budget}${bufferInfo}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-list-check')} ${t('decision')}</div><div class="hint-sub">${esc(hints.decision_summary||t('waiting'))}</div><div class="hint-sub">${t('allowed')}: ${hints.start_guard_allow?t('yes'):t('no')}</div><div class="hint-sub">${t('coverage')}: ${num((hints.history_coverage||0)*100,'%')} · ${num(hints.history_days)} ${t('days')}</div><div class="hint-sub">${esc(t('source'))}</div></div></section><section class="hint-section"><h3 class="hint-section-title">${t('phase')} · ${t('environment')}</h3><div class="hints-grid">${phase}</div><div class="hint-card decision-card"><div class="hint-title">${icon('fa-shield-heart')} ${t('guard')}</div><div class="hint-sub">${esc(d.power_guard_reason||t('unknown'))}</div><div class="hint-sub">Ping: ${esc(d.runtime?.target_ip||'192.168.0.185')} · ${esc(dateText(d.runtime?.checked_at))}</div><div class="hint-sub">${currentLang==='hu'?'Kívánt állapot':'Requested state'}: ${esc(d.runtime?.desired_state&&d.runtime.desired_state!=='unknown'?d.runtime.desired_state:d.state||'unknown')} · ${currentLang==='hu'?'Hosszú STOP kísérletek':'Long STOP attempts'}: ${d.runtime?.attempts||0}/${d.runtime?.max_attempts??'∞'}</div>${meter?`<div class="hint-sub">${t('measured')}: ${num(meter.total,' W')} · L1 ${num(meter.l1,' W')} / L2 ${num(meter.l2,' W')} / L3 ${num(meter.l3,' W')}</div><div class="hint-sub">${t('collected')}: ${esc(dateText(meter.at))}</div>`:''}<div class="hint-sub">${d.power_measurement_source==='inverter_output'?t('inverter'):String(d.power_measurement_source||'').startsWith('consumption')?t('load'):t('unknown')}</div><div class="hint-sub">${t('last')}: ${esc(dateText(d.solarman_polled_at))}</div></div></section>`;
  const notices=Array.isArray(d.notifications)?d.notifications:[];
- document.getElementById('notifList').innerHTML=notices.length?notices.slice(0,5).map(n=>`<div class="notice-item ${['info','warn','error','success'].includes(n.level)?n.level:'info'}"><div class="notice-meta">${esc(dateText(n.ts))}</div><div>${esc(String(n.message||'').replace(/(\d{4})-(\d{2})-(\d{2})(T| )?/g,(_,y,m,day,sep)=>`${y}.${m}.${day}.${sep?' ':''}`))}</div></div>`).join(''):`<div class="notice-empty">${t('empty')}</div>`;
+ document.getElementById('notifList').innerHTML=notices.length?notices.slice(0,5).map(n=>`<div class="notice-item ${['info','warn','error','success'].includes(n.level)?n.level:'info'}"><div class="notice-meta">${esc(dateText(n.ts))}</div><div>${esc(String((currentLang==='en'?n.message_en:n.message)||n.message||'').replace(/(\d{4})-(\d{2})-(\d{2})(T| )?/g,(_,y,m,day,sep)=>`${y}.${m}.${day}.${sep?' ':''}`))}</div></div>`).join(''):`<div class="notice-empty">${t('empty')}</div>`;
  const coverage=document.getElementById('historyCoverage');coverage.className='panel history-coverage'+(d.history_count?'':' empty');coverage.textContent=(currentLang==='hu'?'Betöltött előzmények: ':'Loaded history: ')+huDate(d.history_available_from)+' – '+huDate(d.history_available_to)+' · '+d.history_files+' JSON · '+d.history_total_count+' '+t('samples')+(d.history_count?'':(currentLang==='hu'?' · A kiválasztott időszakhoz nincs betöltött mérés. Ellenőrizd az előzménykönyvtárat.':' · No loaded measurements in the selected period. Check the history directory.'));
  const h=d.history||[],step=Math.max(1,Math.ceil(h.length/2000)),rows=h.filter((_,i)=>i%step===0);
  for(const [id,key,title,color,unit] of [['powerChart','power',t('pv'),'#4ade80','W'],['consumptionChart','consumption',t('load'),'#60a5fa','W'],['batteryChart','battery',t('battery'),'#a78bfa','%']]){
@@ -2031,6 +2108,7 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         if start_ts <= ts < end_ts:
             filtered_hist.append(item)
 
+    recent_history = _recent_history.snapshot(now)
     filtered_hist.sort(key=lambda x: str(x.get("ts", "")))
     with runtime_lock:
         runtime=_runtime_guard.status(now)
@@ -2073,7 +2151,8 @@ def _build_snapshot_payload(from_date: Optional[str] = None, to_date: Optional[s
         "sunrise": snap.get("sunrise").isoformat() if snap.get("sunrise") else "",
         "sunset": snap.get("sunset").isoformat() if snap.get("sunset") else "",
         "weekly_reference": _weekly_reference(now),
-        "live_power": live_power,
+        "live_power": recent_history,
+        "recent_history": recent_history,
         "live_power_window_hours":24,
         "miner_power_w":MINER_POWER_W,
         "afternoon_cutoff":{"hour":HARD_AFTERNOON_STOP_HOUR,"soc":HARD_AFTERNOON_STOP_SOC,"pv_w":AFTERNOON_PV_STOP_W},
@@ -2224,6 +2303,7 @@ def main_loop():
         historical_profile = build_historical_profile(HISTORY_DIR)
 
 
+    _recent_history.snapshot(datetime.now(tz=budapest_tz))
     prev_state,uptime=load_prev_state()
     with runtime_lock:
         _runtime_guard.set_desired(prev_state)
@@ -2255,6 +2335,7 @@ def main_loop():
 
     while True:
         now = datetime.now(tz=budapest_tz)
+        _recent_history.snapshot(now)
         solar_slot = _solarman_poll_slot(now, sunrise, sunset)
         solar_due = _solarman_poll_due(now, solar_slot, last_solar_slot, last_solar_attempt)
         solar_interval = solar_slot[0]
@@ -2386,7 +2467,7 @@ def main_loop():
                         "state": state or "unknown",
                         "current_condition": current_condition or "unknown",
                         "sunrise": sunrise, "sunset": sunset, "clouds": clouds or 0,
-                        "garage_temp": garage_temp or 0, "garage_hum": garage_hum or 0,
+                        "garage_temp": garage_temp, "garage_hum": garage_hum,
                         "inv_l1": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L1", 0.0)),
                         "inv_l2": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L2", 0.0)),
                         "inv_l3": float(_find_value((data or {}).get("dataList", []), "INV_O_P_L3", 0.0)),
@@ -2394,6 +2475,7 @@ def main_loop():
                         "historical_hints": hist_hints or {}
                     })
 
+                record_recent_history(now, raw_data)
                 if is_rpi:
                     write_to_display(
                         state_text=state,
@@ -2431,6 +2513,8 @@ def main_loop():
                 prev_state = state
                 uptime = now
                 save_prev_state(prev_state, uptime)
+            with snapshot_lock:
+                _shared_snapshot.update({"current_condition":current_condition,"clouds":clouds})
             if solar_due:
                 _idle_monitor_cycle(now, fut_token, garage_temp, garage_hum, poll_interval_seconds=solar_interval)
 

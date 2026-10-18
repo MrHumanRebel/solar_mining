@@ -24,6 +24,7 @@ services:
       - WALLET_ADDRESS=${WALLET_ADDRESS:-0xaedac36dcfc956864fcc03ec2ef256facaefd991}
       - MY_MINING_ALGORITHM=${MY_MINING_ALGORITHM:-pearlpow}
       - MY_MINING_WORKER=${MY_MINING_WORKER:-solarminer}
+      - MY_RECENT_HISTORY_FILE=/app/runtime/last_24_hours.json
       - MY_HISTORY_DIR=/app/solarman_json
       - MY_MINER_IP=${MY_MINER_IP:-192.168.0.185}
       - MY_MINER_MAC=${MY_MINER_MAC:-90:DE:80:BD:AD:BF}
@@ -40,6 +41,7 @@ services:
     ports:
       - "9000:9000"
     volumes:
+      - ./runtime:/app/runtime
       - ./scripts/wait-for-dns.sh:/app/scripts/wait-for-dns.sh
       - ./state.json:/app/state.json
       - ./quote_usage.json:/app/quote_usage.json
