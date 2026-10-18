@@ -32,13 +32,13 @@ class RecentHistory:
         rows = [valid[at] for at in sorted(valid)][-2880:]
         changed = rows != self.rows
         self.rows = rows
-        return changed
+        return changed or not self.path.exists()
 
     def _save(self):
         temporary = self.path.with_suffix('.tmp')
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(json.dumps(self.rows, ensure_ascii=False, allow_nan=False))
+            temporary.write_text(json.dumps(self.rows or {}, ensure_ascii=False, allow_nan=False))
             os.replace(temporary, self.path)
         except (OSError, ValueError) as err:
             print(f'[Last 24 hours] Could not save display history: {err}')
