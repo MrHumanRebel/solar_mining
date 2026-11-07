@@ -110,7 +110,7 @@ class ReportedNearFullTests(unittest.TestCase):
     def setUpClass(cls):
         cls.data=solar.build_historical_profile('solarman_json')
 
-    def test_both_reported_midday_readings_allow_a_bounded_run(self):
+    def test_reported_midday_short_buffer_does_not_start_under_longer_minimum(self):
         for minute,pv,load in ((26,983,1000),(31,956,960)):
             now=datetime(2026,10,17,13,minute,tzinfo=LOCAL)
             outlook={'summary_5d':'solar_weak','forecast':[{'ts':now.replace(hour=15).isoformat(),'condition':'heavy rain','clouds':100}]}
@@ -119,11 +119,15 @@ class ReportedNearFullTests(unittest.TestCase):
                 decision=solar._make_miner_decision(now,'stop',99,pv,7,614,363,984,
                     'clear sky',4,'clear sky',4,'rain',100,now.replace(hour=7),now.replace(hour=16,minute=29),
                     {},{},53.36,200,outlook,current_load=load)
-            self.assertEqual(decision['desired_state'],'production',decision)
+            # The previous 18-minute zero-PV buffer would be too short for
+            # the new default 30-minute anti-cycling minimum. It must not start
+            # then cut the machine again before the minimum useful runtime.
+            self.assertEqual(decision['desired_state'],'stop',decision)
             b=decision['history_hints']['energy_budget']
-            self.assertGreaterEqual(b['worst_case_stop_soc'],90)
-            self.assertIn('bounded run',decision['decision_summary'])
-            self.assertNotIn('overnight household reserve covered',decision['decision_summary'])
+            self.assertFalse(b['safe'])
+            self.assertIsNone(b['planned_stop'])
+            self.assertGreater(b['available_surplus_wh'],0)
+            self.assertEqual(b['reserve_soc'],90)
 
 
 if __name__=='__main__':
