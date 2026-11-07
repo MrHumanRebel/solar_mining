@@ -748,7 +748,9 @@ def _make_miner_decision(
             protected_floor_soc=BATTERY_FLOOR_SOC,
             pv_w=current_power,
             measured_load_w=(inv_lt if current_load is None else current_load),
-            surplus_margin_w=SOLAR_SURPLUS_MARGIN_W))
+            surplus_margin_w=SOLAR_SURPLUS_MARGIN_W,
+            battery_capacity_wh=_effective_battery_capacity_wh(battery_voltage,battery_ah),
+            minutes_until_stop=(sunset-now).total_seconds()/60))
     if not budget['safe'] and not solar_surplus_hold:
         explanations = {
             'insufficient_history_or_live_data':'Missing valid live measurements',
