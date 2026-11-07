@@ -129,6 +129,40 @@ inputs are unavailable rather than artificial zeros. A zero can still mean an
 unsafe candidate would actually exhaust the battery. STOP reasons identify the
 failed bridge, solar cover, missing coverage or night-reserve condition.
 
+### Avoiding daytime ON/OFF cycling
+
+The controller now distinguishes **physical safety STOPs** from a changing
+weekly/forecast-only STOP. A confirmed running rig can remain ON when *fresh*
+Solarman PV covers the measured **whole-house consumption** by at least
+`max(MY_SOLAR_SURPLUS_MARGIN_W, 15% of the load)`, and current battery SOC is
+within five percentage points of the configured evening reserve (and at least
+eight points above the protected floor). This is a continuation-only rule:
+a stopped miner still requires a complete safe start plan. It never assumes
+unmeasured potential from a zero-export inverter or forecasts future sun.
+
+When the model rejects a run without a physical safety emergency, the controller
+waits for `MY_SOFT_STOP_CONFIRM_SAMPLES` **distinct, increasing, fresh device
+timestamps** before requesting STOP. A repeated cached upload is not a new
+vote, and a safe decision resets the counter. The minimum ON time is now
+`MY_MIN_RUN_MINUTES=30` (previously 18), and the minimum OFF/restart delay is
+`MY_MIN_RESTART_DELAY_MINUTES=45` (previously 10); both can be overridden
+in `.env`. A restart preserves the existing state transition time via
+`state.json` and requires new confirmation of forecast-only stops.
+
+**Safety precedence is unchanged:** the 20% battery floor, production time
+window, inverter phase/total limits, the 14:00 low-PV / below-90%-SOC cutoff,
+invalid/impossible safety budgets, pending physical shutdown, and manual STOP
+are not delayed by forecast debounce or minimum ON duration. Ping verifies
+reachability, not physical disconnection. The measured live-surplus rule
+does not override unsafe battery inputs, inadequate evening reserve headroom,
+or missing load measurements.
+
+Settings: `MY_SOFT_STOP_CONFIRM_SAMPLES` defaults to 3 (minimum 2), and
+`MY_SOLAR_SURPLUS_MARGIN_W` defaults to 200 W. A new start must be worth
+at least the configured minimum run duration, including near-full buffered
+runs; the latter can therefore be rejected rather than start an 18-minute
+session. Existing values explicitly set in `.env` take precedence.
+
 ### Zero export and near-full batteries
 
 This installation cannot export to the grid. Once the battery is full, measured
