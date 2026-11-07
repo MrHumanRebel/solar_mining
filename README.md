@@ -73,8 +73,8 @@ show sunset SOC without mining and the current household-load assumption, so a
 household-only refill failure is distinguished from an unaffordable bridge.
 Current household demand is a forecast assumption re-evaluated every poll, not a
 claim that a transient oven load will last all day. Few clouds (≤30%) uses the
-sunny PV branch; timestamped rain/heavy-cloud forecasts still derate it. No extra
-API calls or physical power-button actions are introduced.
+sunny PV branch; timestamped rain/heavy-cloud forecasts still derate it. The
+forecast calculation itself adds no API calls or GPIO actions.
 
 The planner evaluates three stages every live control cycle:
 
@@ -119,7 +119,7 @@ The existing free three-hour weather forecast is retained with its timestamps
 and applied to the matching part of the day. Clear, mixed and wet forecasts use
 different weekly PV quantiles. Current measured PV constrains the immediate
 bridge; its influence fades over one hour instead of multiplying down the whole
-day's forecast. No additional Solarman or weather requests are introduced.
+day's forecast. The forecast model does not perform extra API requests.
 
 The dashboard labels the minimum SOC and sunset SOC for the finite proposed
 run/refill scenario, shows solar-cover time, planned mining stop, required versus
@@ -286,8 +286,9 @@ reachability, not an independent physical power measurement.
 The JSON file is atomically replaced and pruned to the latest 24 hours on each
 update, dashboard read, and controller loop, including startup. It survives
 container recreation through the Compose `./runtime:/app/runtime` mount.
-`MY_RECENT_HISTORY_FILE` selects its location. No extra API requests are made;
-existing five-minute / thirty-minute scheduling is unchanged. Supplied exports
+`MY_RECENT_HISTORY_FILE` selects its location. The history recorder makes no
+extra API requests; the five-minute daylight / thirty-minute night cadence remains,
+with daytime monitoring now continuing through astronomical sunset. Supplied exports
 remain read-only and this short display history never feeds the energy planner.
 Historical SUM remains date-filterable alongside historical PV and SOC; no
 historical phases are fabricated.
