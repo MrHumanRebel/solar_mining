@@ -25,6 +25,7 @@ class MinerPingGuard:
         self.checked_at=None
         self.shutdown_after=None
         self.shutdown_attempts=0
+        self.max_stop_attempts=2
         self.shutdown_reserved=False
         self.confirmed_off_at=None
         self.start_after=None
@@ -99,6 +100,10 @@ class MinerPingGuard:
             self.runtime_state='stop_pending'
             self.reason='Waiting 30 seconds after long STOP before considering retry'
             return False
+        if self.shutdown_attempts >= self.max_stop_attempts:
+            self.runtime_state='stop_failed'
+            self.reason='STOP retry limit reached; still ping-online; manual inspection required'
+            return False
         self.shutdown_attempts+=1
         self.shutdown_reserved=True
         self.runtime_state='stop_pending'
@@ -110,7 +115,7 @@ class MinerPingGuard:
         return {'state':self.runtime_state if fresh else 'unknown','desired_state':self.desired_state,'reachable':self.reachable if fresh else None,
                 'target_ip':self.address,'expected_mac':self.mac,'verification':'icmp_ping',
                 'checked_at':self.checked_at.isoformat() if self.checked_at else None,
-                'attempts':self.shutdown_attempts,'max_attempts':None,
+                'attempts':self.shutdown_attempts,'max_attempts':self.max_stop_attempts,
                 'last_command_at':self.shutdown_after.isoformat() if self.shutdown_after else None,
                 'confirmed_off_at':self.confirmed_off_at.isoformat() if self.confirmed_off_at else None,
                 'reason':self.reason if fresh else 'Ping status unavailable or older than 60 seconds'}
