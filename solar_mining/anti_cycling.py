@@ -20,12 +20,13 @@ FORECAST_ONLY_FAILURES = frozenset({
 
 def live_surplus_can_continue(*, requested_running, ping_reachable, plan_reason,
                               battery_soc, reserve_soc, protected_floor_soc,
-                              pv_w, measured_load_w, surplus_margin_w=200.0):
+                              pv_w, measured_load_w, surplus_margin_w=200.0,
+                              battery_capacity_wh=None, minutes_until_stop=None):
     """Allow CONTINUATION ONLY, using delivered PV and whole-house measured load.
 
     This is not a prediction of future sunlight and MUST NOT authorize a new
-    start. Require SOC close to the evening target, generous current surplus,
-    valid numbers and a ping-confirmed already running rig. The next live
+    start. Require SOC close to the evening target, enough time to refill any
+    deficit, generous current surplus, valid numbers and a ping-confirmed rig. The next live
     Solarman sample must reevaluate this decision.
     """
     if not requested_running or ping_reachable is not True or plan_reason not in FORECAST_ONLY_FAILURES:
@@ -40,7 +41,24 @@ def live_surplus_can_continue(*, requested_running, ping_reachable, plan_reason,
     if battery_soc < max(protected_floor_soc + 8, reserve_soc - 5):
         return False
     # A positive net reading with a deliberate buffer, not merely PV >= miner W.
-    return pv_w >= measured_load_w + max(surplus_margin_w, measured_load_w * .15)
+    if pv_w < measured_load_w + max(surplus_margin_w, measured_load_w * .15):
+        return False
+    if battery_soc < reserve_soc:
+        # Before the configured production cutoff, preserve enough time for
+        # charging the *remaining* evening-reserve deficit with 90% efficiency,
+        # a 25% uncertainty margin and 20 minutes of weather/polling slack.
+        if (not isinstance(battery_capacity_wh,(int,float)) or
+                not isinstance(minutes_until_stop,(int,float)) or
+                not math.isfinite(battery_capacity_wh) or
+                not math.isfinite(minutes_until_stop) or
+                battery_capacity_wh <= 0 or minutes_until_stop <= 0):
+            return False
+        deficit_wh=(reserve_soc-battery_soc)*battery_capacity_wh/100
+        surplus_w=pv_w-measured_load_w
+        refill_minutes=60*deficit_wh/(surplus_w*.9)
+        if minutes_until_stop <= refill_minutes*1.25+20:
+            return False
+    return True
 
 
 class SoftStopDebouncer:
