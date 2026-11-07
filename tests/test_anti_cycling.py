@@ -16,12 +16,19 @@ class SolarSurplusContinuationTests(unittest.TestCase):
         result=dict(requested_running=True, ping_reachable=True,
                     plan_reason='household_only_refill_not_feasible',
                     battery_soc=88, reserve_soc=90, protected_floor_soc=20,
-                    pv_w=2369, measured_load_w=1133, surplus_margin_w=200)
+                    pv_w=2369, measured_load_w=1133, surplus_margin_w=200,
+                    battery_capacity_wh=11040, minutes_until_stop=104)
         result.update(overrides)
         return result
 
     def test_reported_dashboard_solar_surplus_keeps_existing_rig_running(self):
         self.assertTrue(live_surplus_can_continue(**self.kwargs()))
+
+    def test_near_sunset_cannot_hold_when_evening_reserve_cannot_refill(self):
+        self.assertFalse(live_surplus_can_continue(**self.kwargs(minutes_until_stop=25)))
+        self.assertTrue(live_surplus_can_continue(**self.kwargs(minutes_until_stop=60)))
+        # A battery already at its evening target needs no extra refill window.
+        self.assertTrue(live_surplus_can_continue(**self.kwargs(battery_soc=92,minutes_until_stop=5)))
 
     def test_cannot_start_stopped_or_unverified_machine_from_surplus(self):
         for updates in ({'requested_running':False},{'ping_reachable':None},
@@ -31,7 +38,9 @@ class SolarSurplusContinuationTests(unittest.TestCase):
     def test_never_borrows_unprotected_battery_or_acts_without_good_data(self):
         for updates in ({'battery_soc':80},{'pv_w':1200},
                         {'measured_load_w':float('nan')},{'pv_w':float('nan')},
-                        {'reserve_soc':105},{'plan_reason':'battery_floor_would_be_crossed'},
+                        {'reserve_soc':105},{'minutes_until_stop':12},
+                        {'battery_capacity_wh':float('nan')},
+                        {'plan_reason':'battery_floor_would_be_crossed'},
                         {'plan_reason':'insufficient_history_or_live_data'},
                         {'plan_reason':'overnight_reserve_exceeds_battery_capacity'}):
             self.assertFalse(live_surplus_can_continue(**self.kwargs(**updates)))
