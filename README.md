@@ -136,7 +136,10 @@ weekly/forecast-only STOP. A confirmed running rig can remain ON when *fresh*
 Solarman PV covers the measured **whole-house consumption** by at least
 `max(MY_SOLAR_SURPLUS_MARGIN_W, 15% of the load)`, and current battery SOC is
 within five percentage points of the configured evening reserve (and at least
-eight points above the protected floor). This is a continuation-only rule:
+eight points above the protected floor). Below the reserve, the current measured
+PV headroom must still allow recovery by the mining cutoff using 90% charge
+efficiency, a 25% time margin and 20 minutes of polling/weather slack. This
+is a continuation-only rule:
 a stopped miner still requires a complete safe start plan. It never assumes
 unmeasured potential from a zero-export inverter or forecasts future sun.
 
