@@ -1556,7 +1556,7 @@ def _runtime_tick():
               'stop_failed':'🚨 A miner továbbra is elérhető vagy a GPIO-kísérlet hibás; leállítás nincs igazolva.',
               'stop_unverified':'⚠ Pingellenőrzési hiba; leállítás nem igazolható.'}.get(physical['state'])
         if text:
-            send_telegram_message_async(f"{text} IP: {physical['target_ip']} · kísérlet {physical['attempts']} (nincs limit). {physical['reason']}",mirror_web=True)
+            send_telegram_message_async(f"{text} IP: {physical['target_ip']} · kísérlet {physical['attempts']}/{physical['max_attempts']}. {physical['reason']}",mirror_web=True)
     if changed:
         print(f"[Ping guard] {physical['target_ip']} {physical['state']}: {physical['reason']}")
     return physical
@@ -1618,10 +1618,16 @@ def _update_pool_hashrate(now: datetime) -> None:
 def _solarman_poll_slot(now, sunrise_dt, sunset_dt):
     """Poll every 5 minutes inside the displayed window, otherwise every 30.
 
-    The supplied bounds already include the configured control offsets.
-    Do not override the displayed stop time with the later astronomical sunset.
+    The production window may end earlier than astronomical sunset to refill
+    batteries. That must not end the five-minute *telemetry* cadence.
     """
     dawn, dusk = sunrise_dt, sunset_dt
+    actual_daylight = _weather_daylight
+    if (isinstance(actual_daylight, tuple) and len(actual_daylight) == 2
+            and all(isinstance(t, datetime) and t.date() == now.date() for t in actual_daylight)
+            and isinstance(dawn, datetime) and isinstance(dusk, datetime)):
+        dawn = min(dawn, actual_daylight[0])
+        dusk = max(dusk, actual_daylight[1])
     daylight = isinstance(dawn, datetime) and isinstance(dusk, datetime) and dawn <= now < dusk
     interval = 300 if daylight else 1800
     return interval, int(now.timestamp()) // interval
