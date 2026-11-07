@@ -266,8 +266,9 @@ unavailable for energy planning; they do not stop the independent ping monitor.
 
 Solarman authentication and device polling run every five minutes inside the
 configured sunrise-start / sunset-stop window shown by the dashboard and logs,
-and once every 30 minutes outside it. These bounds include the existing control
-offsets; the later astronomical sunset does not extend five-minute polling. Failed
+and once every 30 minutes outside it. The configured mining stop may be
+earlier than astronomical sunset: five-minute telemetry continues until actual
+ sunset for recharge monitoring, without extending the mining window. Failed
 attempts also consume a polling slot. Dashboard refresh, sensors and pool
 updates do not trigger extra Solarman polling.
 
