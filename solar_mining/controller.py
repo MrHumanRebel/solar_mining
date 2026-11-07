@@ -3,6 +3,7 @@ from .recent_history import RecentHistory
 from .status_messages import status as telegram_status, phases as telegram_phases
 from .power_measurement import PowerSample
 from .miner_ping_guard import MinerPingGuard, ping_host
+from .anti_cycling import live_surplus_can_continue, SoftStopDebouncer
 from .history_model import load_exports, build_weekly_profiles, curve_value, week_metrics, plan as plan_energy
 import hashlib
 import json
@@ -74,8 +75,10 @@ HARD_AFTERNOON_STOP_SOC = float(os.getenv("MY_HARD_AFTERNOON_STOP_SOC", "90"))
 HARD_AFTERNOON_STOP_HOUR = int(os.getenv("MY_HARD_AFTERNOON_STOP_HOUR", "14"))
 PV_COVERAGE_RATIO_STOP = float(os.getenv("MY_PV_COVERAGE_RATIO_STOP", "0.9"))
 PV_COVERAGE_RATIO_START = float(os.getenv("MY_PV_COVERAGE_RATIO_START", "0.75"))
-MIN_RUN_MINUTES = int(os.getenv("MY_MIN_RUN_MINUTES", "18"))
-MIN_RESTART_DELAY_MINUTES = int(os.getenv("MY_MIN_RESTART_DELAY_MINUTES", "10"))
+MIN_RUN_MINUTES = int(os.getenv("MY_MIN_RUN_MINUTES", "30"))
+MIN_RESTART_DELAY_MINUTES = int(os.getenv("MY_MIN_RESTART_DELAY_MINUTES", "45"))
+SOFT_STOP_CONFIRM_SAMPLES = max(2, int(os.getenv("MY_SOFT_STOP_CONFIRM_SAMPLES", "3")))
+SOLAR_SURPLUS_MARGIN_W = max(0.0, float(os.getenv("MY_SOLAR_SURPLUS_MARGIN_W", "200")))
 MINER_STOP_FORCE_COOLDOWN_MINUTES = max(1, int(os.getenv("MY_MINER_STOP_FORCE_COOLDOWN_MINUTES", "20")))
 POWER_BUTTON_SHORT_PRESS_SECONDS = min(1.0,max(0.1,float(os.getenv("MY_POWER_BUTTON_SHORT_PRESS_SECONDS", "0.55"))))
 POWER_BUTTON_LONG_PRESS_SECONDS = max(10.0,float(os.getenv("MY_POWER_BUTTON_LONG_PRESS_SECONDS", "10")))
@@ -122,6 +125,7 @@ session_lock = threading.Lock()
 gpio_lock = threading.RLock()
 runtime_lock = threading.RLock()
 _runtime_guard = MinerPingGuard(os.getenv('MY_MINER_IP','192.168.0.185'),os.getenv('MY_MINER_MAC','90:DE:80:BD:AD:BF'))
+_soft_stop_guard = SoftStopDebouncer(SOFT_STOP_CONFIRM_SAMPLES)
 _latest_power_sample = None
 _power_measurement_error = None
 _last_power_notice_key = None
@@ -730,7 +734,24 @@ def _make_miner_decision(
             and current_power<=AFTERNOON_PV_STOP_W and battery_charge<HARD_AFTERNOON_STOP_SOC):
         reasons.append(f'Afternoon cutoff: PV ≤ {AFTERNOON_PV_STOP_W:.0f} W and battery < {HARD_AFTERNOON_STOP_SOC:.0f}%')
         hard = True
-    if not budget['safe']:
+    # The full-day weekly/forecast model can switch from safe to unsafe on
+    # adjacent 5-minute polls, even though the already running rig is being
+    # fully supplied by live PV. A measured surplus is continuation evidence,
+    # never a new-start authorization or an exemption from hard protections.
+    solar_surplus_hold = (not budget['safe'] and not hard and
+        live_surplus_can_continue(
+            requested_running=prev_state=='production',
+            ping_reachable=physical['reachable'],
+            plan_reason=budget.get('reason'),
+            battery_soc=battery_charge,
+            reserve_soc=budget.get('reserve_soc'),
+            protected_floor_soc=BATTERY_FLOOR_SOC,
+            pv_w=current_power,
+            measured_load_w=(inv_lt if current_load is None else current_load),
+            surplus_margin_w=SOLAR_SURPLUS_MARGIN_W,
+            battery_capacity_wh=_effective_battery_capacity_wh(battery_voltage,battery_ah),
+            minutes_until_stop=(sunset-now).total_seconds()/60))
+    if not budget['safe'] and not solar_surplus_hold:
         explanations = {
             'insufficient_history_or_live_data':'Missing valid live measurements',
             'missing_daytime_history':'Missing hourly daytime history',
@@ -757,8 +778,12 @@ def _make_miner_decision(
     if cooldown and prev_state!='production':
         reasons.append('Shutdown cooldown')
     desired = 'stop' if reasons else 'production'
-    # A forecast reserve violation must not wait through additional STOP samples.
-    hard = hard or (prev_state=='production' and not budget['safe'])
+    # Invalid/impossible safety projections still stop immediately; an ordinary
+    # changing forecast is a SOFT stop requiring independent confirmations.
+    if not budget['safe'] and budget.get('reason') in (
+            'insufficient_history_or_live_data', 'invalid_overnight_time_window',
+            'overnight_reserve_exceeds_battery_capacity', 'battery_floor_would_be_crossed'):
+        hard = True
     metrics = {
         'available_bridge_wh':budget.get('available_bridge_wh'),
         'required_bridge_wh':budget.get('required_bridge_wh'),
@@ -768,9 +793,12 @@ def _make_miner_decision(
         'predicted_refill_confidence':budget['coverage'],
         'active_control_window':control['active'],'control_window_reason':control['reason'],
         'dawn_weather_block':bool(rain),'dawn_weather_block_reason':rain,
+        'solar_surplus_hold':solar_surplus_hold,
     }
     return {'desired_state':desired,'decision_state':desired,
             'decision_summary':('STOP: '+'; '.join(reasons)) if reasons else (
+                'RUN: live measured PV surplus covers the already running miner and household; re-evaluate next sample'
+                if solar_surplus_hold else
                 f"RUN: near-full battery buffer; bounded run protects {budget['surplus_reserve_soc']:.0f}% at mining stop, reassess next live sample"
                 if budget['reason']=='bounded_solar_surplus_run' else
                 'RUN: battery bridge, finite mining run and overnight household reserve covered'),
@@ -1530,7 +1558,7 @@ def _runtime_tick():
               'stop_failed':'🚨 A miner továbbra is elérhető vagy a GPIO-kísérlet hibás; leállítás nincs igazolva.',
               'stop_unverified':'⚠ Pingellenőrzési hiba; leállítás nem igazolható.'}.get(physical['state'])
         if text:
-            send_telegram_message_async(f"{text} IP: {physical['target_ip']} · kísérlet {physical['attempts']} (nincs limit). {physical['reason']}",mirror_web=True)
+            send_telegram_message_async(f"{text} IP: {physical['target_ip']} · kísérlet {physical['attempts']}/{physical['max_attempts']}. {physical['reason']}",mirror_web=True)
     if changed:
         print(f"[Ping guard] {physical['target_ip']} {physical['state']}: {physical['reason']}")
     return physical
@@ -1592,10 +1620,16 @@ def _update_pool_hashrate(now: datetime) -> None:
 def _solarman_poll_slot(now, sunrise_dt, sunset_dt):
     """Poll every 5 minutes inside the displayed window, otherwise every 30.
 
-    The supplied bounds already include the configured control offsets.
-    Do not override the displayed stop time with the later astronomical sunset.
+    The production window may end earlier than astronomical sunset to refill
+    batteries. That must not end the five-minute *telemetry* cadence.
     """
     dawn, dusk = sunrise_dt, sunset_dt
+    actual_daylight = _weather_daylight
+    if (isinstance(actual_daylight, tuple) and len(actual_daylight) == 2
+            and all(isinstance(t, datetime) and t.date() == now.date() for t in actual_daylight)
+            and isinstance(dawn, datetime) and isinstance(dusk, datetime)):
+        dawn = min(dawn, actual_daylight[0])
+        dusk = max(dusk, actual_daylight[1])
     daylight = isinstance(dawn, datetime) and isinstance(dusk, datetime) and dawn <= now < dusk
     interval = 300 if daylight else 1800
     return interval, int(now.timestamp()) // interval
@@ -1679,6 +1713,7 @@ def _merge_decision_into_hints(hist: Dict[str, Any], decision: Dict[str, Any], s
         "available_bridge_wh", "required_bridge_wh", "bridge_safety_factor", "startup_energy_penalty_wh",
         "predicted_first_miner_cover_time", "predicted_full_charge_time", "predicted_refill_confidence",
         "active_control_window", "control_window_reason", "dawn_weather_block", "dawn_weather_block_reason",
+        "solar_surplus_hold",
     ):
         hist[key] = metrics.get(key)
     return hist
@@ -1718,10 +1753,28 @@ def check_crypto_production_conditions(data, weather_api_key, location_lat, loca
             'allow_start':decision['desired_state']=='production','reason':hist['energy_budget']['reason'],
             'capacity_wh':_effective_battery_capacity_wh(battery_voltage,battery_ah)})
         desired_state = decision['desired_state']
+        # Do not count the same cached Solarman timestamp as multiple adverse
+        # readings. Physical emergencies bypass both debounce and run-time lock.
+        confirmed_stop = _soft_stop_guard.observe(
+            prior_state=prev_state or 'stop', desired_state=desired_state,
+            hard_stop=decision['hard_stop'],
+            sample_at=live_sample.at if PowerSample.fresh(live_sample,now) else None)
         if decision['hard_stop']:
             state = 'stop'
+        elif desired_state == 'stop' and not confirmed_stop:
+            state = 'production'
+            hist['decision_summary'] = (
+                f"RUN HOLD: forecast-only STOP needs {SOFT_STOP_CONFIRM_SAMPLES} separate "
+                f"readings ({_soft_stop_guard.samples}/{_soft_stop_guard.confirm_samples}); "
+                + decision['decision_summary'])
         else:
-            state,_,_ = _apply_transition_guard(prev_state or 'stop',desired_state,now,confirmed=True)
+            state,blocked,guard_reason = _apply_transition_guard(
+                prev_state or 'stop',desired_state,now,confirmed=True)
+            if blocked:
+                hist['decision_summary'] = (
+                    f"{'RUN HOLD' if state=='production' else 'STOP HOLD'}: "
+                    f"{guard_reason}; " + decision['decision_summary'])
+        hist['decision_state'] = state
 
         print(
             f"[Decision] desired={desired_state} effective={state} summary={hist.get('decision_summary')} "

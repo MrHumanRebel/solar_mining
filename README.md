@@ -73,8 +73,8 @@ show sunset SOC without mining and the current household-load assumption, so a
 household-only refill failure is distinguished from an unaffordable bridge.
 Current household demand is a forecast assumption re-evaluated every poll, not a
 claim that a transient oven load will last all day. Few clouds (≤30%) uses the
-sunny PV branch; timestamped rain/heavy-cloud forecasts still derate it. No extra
-API calls or physical power-button actions are introduced.
+sunny PV branch; timestamped rain/heavy-cloud forecasts still derate it. The
+forecast calculation itself adds no API calls or GPIO actions.
 
 The planner evaluates three stages every live control cycle:
 
@@ -119,7 +119,7 @@ The existing free three-hour weather forecast is retained with its timestamps
 and applied to the matching part of the day. Clear, mixed and wet forecasts use
 different weekly PV quantiles. Current measured PV constrains the immediate
 bridge; its influence fades over one hour instead of multiplying down the whole
-day's forecast. No additional Solarman or weather requests are introduced.
+day's forecast. The forecast model does not perform extra API requests.
 
 The dashboard labels the minimum SOC and sunset SOC for the finite proposed
 run/refill scenario, shows solar-cover time, planned mining stop, required versus
@@ -128,6 +128,43 @@ the projections are explicitly labelled as a rejected-run scenario; missing
 inputs are unavailable rather than artificial zeros. A zero can still mean an
 unsafe candidate would actually exhaust the battery. STOP reasons identify the
 failed bridge, solar cover, missing coverage or night-reserve condition.
+
+### Avoiding daytime ON/OFF cycling
+
+The controller now distinguishes **physical safety STOPs** from a changing
+weekly/forecast-only STOP. A confirmed running rig can remain ON when *fresh*
+Solarman PV covers the measured **whole-house consumption** by at least
+`max(MY_SOLAR_SURPLUS_MARGIN_W, 15% of the load)`, and current battery SOC is
+within five percentage points of the configured evening reserve (and at least
+eight points above the protected floor). Below the reserve, the current measured
+PV headroom must still allow recovery by the mining cutoff using 90% charge
+efficiency, a 25% time margin and 20 minutes of polling/weather slack. This
+is a continuation-only rule:
+a stopped miner still requires a complete safe start plan. It never assumes
+unmeasured potential from a zero-export inverter or forecasts future sun.
+
+When the model rejects a run without a physical safety emergency, the controller
+waits for `MY_SOFT_STOP_CONFIRM_SAMPLES` **distinct, increasing, fresh device
+timestamps** before requesting STOP. A repeated cached upload is not a new
+vote, and a safe decision resets the counter. The minimum ON time is now
+`MY_MIN_RUN_MINUTES=30` (previously 18), and the minimum OFF/restart delay is
+`MY_MIN_RESTART_DELAY_MINUTES=45` (previously 10); both can be overridden
+in `.env`. A restart preserves the existing state transition time via
+`state.json` and requires new confirmation of forecast-only stops.
+
+**Safety precedence is unchanged:** the 20% battery floor, production time
+window, inverter phase/total limits, the 14:00 low-PV / below-90%-SOC cutoff,
+invalid/impossible safety budgets, pending physical shutdown, and manual STOP
+are not delayed by forecast debounce or minimum ON duration. Ping verifies
+reachability, not physical disconnection. The measured live-surplus rule
+does not override unsafe battery inputs, inadequate evening reserve headroom,
+or missing load measurements.
+
+Settings: `MY_SOFT_STOP_CONFIRM_SAMPLES` defaults to 3 (minimum 2), and
+`MY_SOLAR_SURPLUS_MARGIN_W` defaults to 200 W. A new start must be worth
+at least the configured minimum run duration, including near-full buffered
+runs; the latter can therefore be rejected rather than start an 18-minute
+session. Existing values explicitly set in `.env` take precedence.
 
 ### Zero export and near-full batteries
 
@@ -232,8 +269,9 @@ unavailable for energy planning; they do not stop the independent ping monitor.
 
 Solarman authentication and device polling run every five minutes inside the
 configured sunrise-start / sunset-stop window shown by the dashboard and logs,
-and once every 30 minutes outside it. These bounds include the existing control
-offsets; the later astronomical sunset does not extend five-minute polling. Failed
+and once every 30 minutes outside it. The configured mining stop may be
+earlier than astronomical sunset: five-minute telemetry continues until actual
+ sunset for recharge monitoring, without extending the mining window. Failed
 attempts also consume a polling slot. Dashboard refresh, sensors and pool
 updates do not trigger extra Solarman polling.
 
@@ -251,8 +289,9 @@ reachability, not an independent physical power measurement.
 The JSON file is atomically replaced and pruned to the latest 24 hours on each
 update, dashboard read, and controller loop, including startup. It survives
 container recreation through the Compose `./runtime:/app/runtime` mount.
-`MY_RECENT_HISTORY_FILE` selects its location. No extra API requests are made;
-existing five-minute / thirty-minute scheduling is unchanged. Supplied exports
+`MY_RECENT_HISTORY_FILE` selects its location. The history recorder makes no
+extra API requests; the five-minute daylight / thirty-minute night cadence remains,
+with daytime monitoring now continuing through astronomical sunset. Supplied exports
 remain read-only and this short display history never feeds the energy planner.
 Historical SUM remains date-filterable alongside historical PV and SOC; no
 historical phases are fabricated.
