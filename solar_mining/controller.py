@@ -43,10 +43,10 @@ CHAT_ID = os.environ['MY_CHAT_ID']
 WEATHER_API = os.environ['MY_WEATHER_API']
 LOCATION_LAT = os.environ['MY_LOCATION_LAT']
 LOCATION_LON = os.environ['MY_LOCATION_LON']
-APP_ID = os.environ['MY_APP_ID']
-APP_SECRET = os.environ['MY_APP_SECRET']
-EMAIL = os.environ['MY_EMAIL']
-PASSWORD = os.environ['MY_PASSWORD']
+APP_ID = os.getenv('MY_APP_ID', '')
+APP_SECRET = os.getenv('MY_APP_SECRET', '')
+EMAIL = os.getenv('MY_EMAIL', '')
+PASSWORD = os.getenv('MY_PASSWORD', '')
 DEVICE_SN = os.environ['MY_DEVICE_SN']
 QUOTE_LIMIT = int(os.getenv('MY_QUOTE_LIMIT', '200000'))
 QUOTE_FILE = os.environ['MY_QUOTE_FILE']
@@ -1201,47 +1201,72 @@ def sha256_hash(password):
     hashed = hashlib.sha256(password.encode('utf-8')).hexdigest()
     return hashed
 
+def _solarman_post(path, payload, headers):
+    url = f'https://globalapi.solarmanpv.com/{path}'
+    operation = path.rsplit('/', 1)[-1]
+    try:
+        response = requests.post(url, params={'appId': APP_ID, 'language': 'en'},
+                                 headers=headers, json=payload, timeout=12)
+    except requests.RequestException as err:
+        print(f"[Solarman] {operation}: request failed ({type(err).__name__})")
+        return None
+
+    status = f"HTTP {response.status_code}"
+    try:
+        data = response.json()
+    except ValueError:
+        print(f"[Solarman] {operation}: {status}, response is not JSON")
+        return None
+    if not isinstance(data, dict):
+        print(f"[Solarman] {operation}: {status}, expected a JSON object")
+        return None
+
+    code = str(data.get('code', ''))
+    api_error = re.fullmatch(r'[0-9]{7}', code) and code != '1000000'
+    if not response.ok or data.get('success') is False or api_error:
+        detail = f", API code {code}" if api_error else ""
+        print(f"[Solarman] {operation}: {status}, request rejected{detail}")
+        return None
+    return data
+
 def get_access_token():
+    credentials = {'MY_APP_ID': APP_ID, 'MY_APP_SECRET': APP_SECRET,
+                   'MY_EMAIL': EMAIL, 'MY_PASSWORD': PASSWORD}
+    missing = [name for name, value in credentials.items() if not value.strip()]
+    if missing:
+        print(f"[Solarman] token: missing configuration ({', '.join(missing)})")
+        return None
+
     print("Getting access token...")
-    url = f'https://globalapi.solarmanpv.com/account/v1.0/token?appId={APP_ID}&language=en'
     headers = {'Content-Type': 'application/json'}
     payload = {
         'appSecret': APP_SECRET,
         'email': EMAIL,
         'password': sha256_hash(PASSWORD)
     }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        token = data.get('access_token')
-        if not token:
-            print("[Warning] Access token missing in response.")
-            return None
-        print("Access token received!")
-        return token
-    except (requests.RequestException, ValueError) as e:
-        print(f"[Warning] Failed to get access token: {e}")
+    data = _solarman_post('account/v1.0/token', payload, headers)
+    if data is None:
         return None
+    token = data.get('access_token')
+    if not isinstance(token, str) or not token.strip():
+        print("[Solarman] token: access_token missing or invalid in response")
+        return None
+    print("Access token received!")
+    return token
 
 def fetch_current_data(access_token):
     print("Fetching current device data...")
-    url = f'https://globalapi.solarmanpv.com/device/v1.0/currentData?appId={APP_ID}&language=en'
     headers = {
         'Authorization': f'Bearer {access_token}',
         'Content-Type': 'application/json'
     }
     payload = {'deviceSn': DEVICE_SN}
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=12)
-        r.raise_for_status()
+    data = _solarman_post('device/v1.0/currentData', payload, headers)
+    if _has_solarman_payload(data):
         print("Current data fetched successfully.")
-        return r.json()
-    except (requests.RequestException, ValueError) as e:
-        et, sc, rsn = _extract_error_fields(e)
-        print(f"[Warning] Failed to fetch current device data: {et}"
-            f"{f' | HTTP {sc} {rsn}' if sc else ''} | {e}")
-        return {}
+    elif data is not None:
+        print("[Solarman] currentData: no device readings in response")
+    return data or {}
 
 def load_prev_state():
     global WALLET_ADDRESS, _last_production_start_at, _last_hashrate_restart_at, _last_force_shutdown_at
